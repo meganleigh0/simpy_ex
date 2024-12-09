@@ -7,46 +7,28 @@ from scipy.stats import lognorm
 avg_num_days = 20  # Example mean
 std_dev = 5        # Example standard deviation
 
-# Log-normal parameters (log-transformed)
+# Log-normal parameters
 shape = std_dev / avg_num_days  # Coefficient of variation
 scale = avg_num_days
 
-# Generate data for plotting
+# Generate quantiles and PPF values
 quantiles = np.linspace(0.01, 0.99, 500)  # Quantiles from 1% to 99%
-time_values = lognorm.ppf(quantiles, s=shape, scale=scale)
-
-# Compute confidence intervals
-lower_ci = lognorm.ppf(0.05, s=shape, scale=scale)  # 5th percentile
-upper_ci = lognorm.ppf(0.95, s=shape, scale=scale)  # 95th percentile
+ppf_values = lognorm.ppf(quantiles, s=shape, scale=scale)
 
 # Prepare data for Altair
 df = pd.DataFrame({
     'Quantiles': quantiles,
-    'Time (Days)': time_values
-})
-
-ci_df = pd.DataFrame({
-    'Quantiles': [0.05, 0.95],
-    'Time (Days)': [lower_ci, upper_ci],
-    'Label': ['Lower CI (5%)', 'Upper CI (95%)']
+    'PPF Values (Days)': ppf_values
 })
 
 # Create the Altair plot
-base = alt.Chart(df).mark_line().encode(
+ppf_plot = alt.Chart(df).mark_line(color='blue').encode(
     x=alt.X('Quantiles', title='Cumulative Probability'),
-    y=alt.Y('Time (Days)', title='Time to Produce Variants')
+    y=alt.Y('PPF Values (Days)', title='PPF (Days)')
 ).properties(
-    title='Log-Normal Distribution with Confidence Intervals'
+    title='Log-Normal Percent-Point Function (PPF)',
+    width=600,
+    height=400
 )
 
-# Add shaded confidence intervals
-ci_area = alt.Chart(df).mark_area(opacity=0.3).encode(
-    x='Quantiles',
-    y=alt.Y('Time (Days):Q', aggregate='min', title=None),
-    y2=alt.Y2(lower_ci, title=None),
-)
-
-# Add CI markers
-ci_markers = alt.Chart(ci_df).mark_rule(color='red').encode(
-    x='Quantiles:Q',
-)
+ppf_plot.interactive()
