@@ -1,51 +1,55 @@
-import numpy as np
 import pandas as pd
-import altair as alt
-from scipy.stats import lognorm
+import numpy as np
+from scipy.stats import norm
 
-def plot_ppf_with_confidence(station_name, mean, std_dev):
-    # Calculate the shape and scale parameters for the log-normal distribution
-    shape = np.sqrt(np.log(1 + (std_dev / mean)**2))
-    scale = mean / np.sqrt(1 + (std_dev / mean)**2)
-    
-    # Generate quantiles and PPF values
-    quantiles = np.linspace(0.01, 0.99, 500)  # Quantiles from 1% to 99%
-    ppf_values = lognorm.ppf(quantiles, s=shape, scale=scale)
-    
-    # Prepare the data for the main line plot
-    df = pd.DataFrame({
-        'Quantiles': quantiles,
-        'PPF Values (DAYS)': ppf_values
-    })
-    
-    # Calculate the 80% confidence interval (10th to 90th percentiles)
-    lower_bound = lognorm.ppf(0.1, s=shape, scale=scale)
-    upper_bound = lognorm.ppf(0.9, s=shape, scale=scale)
-    
-    # Prepare data for the confidence interval shading
-    shade_df = df[(df['PPF Values (DAYS)'] >= lower_bound) & (df['PPF Values (DAYS)'] <= upper_bound)]
-    
-    # Main line plot
-    line_plot = alt.Chart(df).mark_line(color='blue').encode(
-        x=alt.X('Quantiles', title='Cumulative Probability'),
-        y=alt.Y('PPF Values (DAYS)', title='PPF (Days)')
-    )
-    
-    # Shaded confidence interval
-    shaded_area = alt.Chart(shade_df).mark_area(opacity=0.3, color='lightblue').encode(
-        x=alt.X('Quantiles', title='Cumulative Probability'),
-        y=alt.Y('PPF Values (DAYS)', title='PPF (Days)')
-    )
-    
-    # Combine the line plot and shaded area
-    plot = (shaded_area + line_plot).properties(
-        title=f'{station_name} Log Normal Percent Point Function (PPF)',
-        width=600,
-        height=400
-    )
-    
-    return plot
+# --------------------------
+# Step 1: Load Data (Example)
+# --------------------------
+# Assume we have a CSV with columns:
+# STATION, AVG_HOURS, STD_HOURS representing historical average and std dev for each station
+data = {
+    'STATION': ['Station_A', 'Station_B', 'Station_C'],
+    'AVG_HOURS': [40, 50, 30],  # example averages
+    'STD_HOURS': [5, 8, 4]      # example standard deviations
+}
+df = pd.DataFrame(data)
 
-# Example usage
-plot = plot_ppf_with_confidence("Hull Station 0", mean=3, std_dev=1)
-plot.show()
+# --------------------------
+# Step 2: Define Confidence
+# --------------------------
+confidence_level = 0.95
+
+# --------------------------
+# Step 3: Calculate Required Hours per Station at 95% Confidence
+# --------------------------
+df['HOURS_95TH'] = df.apply(lambda row: norm.ppf(confidence_level, loc=row['AVG_HOURS'], scale=row['STD_HOURS']), axis=1)
+
+# --------------------------
+# Step 4: Aggregate Stations (Naive Sum for Illustration)
+# --------------------------
+total_hours_95th_naive = df['HOURS_95TH'].sum()
+
+# --------------------------
+# Step 5: Monte Carlo Simulation for More Accurate Total Estimate
+# --------------------------
+N = 10000
+sim_results = []
+for _ in range(N):
+    total = 0
+    for _, r in df.iterrows():
+        # Draw a random sample from the station's distribution
+        total += norm.rvs(loc=r['AVG_HOURS'], scale=r['STD_HOURS'])
+    sim_results.append(total)
+sim_results = np.array(sim_results)
+total_hours_95th_sim = np.percentile(sim_results, 95)
+
+# --------------------------
+# Print Results
+# --------------------------
+print("Per-Station 95th Percentile Hours:")
+print(df[['STATION', 'HOURS_95TH']])
+print(f"Naive Sum of 95th Percentile Hours: {total_hours_95th_naive:.2f} hours")
+print(f"95th Percentile of Total Hours via Simulation: {total_hours_95th_sim:.2f} hours")
+
+# You can now use these results to adjust resources (e.g., add stands or shifts)
+# by recalculating the distributions and repeating the steps above.
