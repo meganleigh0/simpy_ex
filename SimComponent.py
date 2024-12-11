@@ -51,5 +51,18 @@ print(df[['STATION', 'HOURS_95TH']])
 print(f"Naive Sum of 95th Percentile Hours: {total_hours_95th_naive:.2f} hours")
 print(f"95th Percentile of Total Hours via Simulation: {total_hours_95th_sim:.2f} hours")
 
-# You can now use these results to adjust resources (e.g., add stands or shifts)
-# by recalculating the distributions and repeating the steps above.
+
+Data-Driven Labor Hour Predictions with Confidence
+
+Problem:
+We need to understand not just the average labor hours for our production stations but also how much time might be required under less-than-ideal conditions, so we can plan staffing and shifts confidently.
+
+Approach:
+
+Use Historical Data: Start with the current average and variation in station processing times.
+Probability Analysis: Model the times as a distribution and pick a “confidence level” (e.g., 95%) to ensure we’re prepared for longer-than-average scenarios.
+Find the Required Hours: Using statistical methods, determine the hours needed so that only a 5% chance exists of exceeding that time. This helps us plan for the “worst reasonable case.”
+Adjust Resources: Experiment with adding more workstations or extending shifts to see how these changes reduce the required hours at a high confidence level.
+Benefit:
+This approach provides a data-backed, confidence-driven estimate of labor hours required, guiding resource planning and reducing the risk of production delays.
+
