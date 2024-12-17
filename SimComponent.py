@@ -1,116 +1,19 @@
-import numpy as np
 import pandas as pd
 import altair as alt
 
-def prepare_data_for_viz(results):
-    """
-    Prepare data from the simulation results dictionary into DataFrames suitable for visualization.
-    """
-    # Extract total distribution
-    total_dist = results['distributions']['total_days_distribution']
-    total_df = pd.DataFrame({
-        'simulation_id': np.arange(len(total_dist)),
-        'total_days': total_dist
-    })
+# Ensure Altair can handle large datasets if needed
+alt.data_transformers.disable_max_rows()
 
-    # Station distributions
-    station_data = []
-    for station, dist in results['distributions']['station_days_distribution'].items():
-        station_data.append(pd.DataFrame({
-            'simulation_id': np.arange(len(dist)),
-            'station': station,
-            'days': dist
-        }))
-    station_df = pd.concat(station_data, ignore_index=True)
-
-    # Plant distributions
-    plant_data = []
-    for plant, dist in results['distributions']['plant_days_distribution'].items():
-        plant_data.append(pd.DataFrame({
-            'simulation_id': np.arange(len(dist)),
-            'plant': plant,
-            'days': dist
-        }))
-    plant_df = pd.concat(plant_data, ignore_index=True)
-
-    return total_df, station_df, plant_df
-
-def create_total_distribution_chart(total_df, results):
-    """
-    Create a histogram of the total days distribution with mean and CI lines.
-    """
-    mean_days = results['total']['mean_days']
-    lower_ci, upper_ci = results['total']['confidence_interval_days']
-
-    base = alt.Chart(total_df).mark_bar(opacity=0.7).encode(
-        alt.X('total_days:Q', bin=alt.Bin(maxbins=50), title='Total Days'),
-        alt.Y('count()', title='Count of Simulations')
-    )
-
-    mean_line = alt.Chart(pd.DataFrame({'x': [mean_days]})).mark_rule(color='red').encode(x='x:Q')
-    lower_ci_line = alt.Chart(pd.DataFrame({'x': [lower_ci]})).mark_rule(color='green').encode(x='x:Q')
-    upper_ci_line = alt.Chart(pd.DataFrame({'x': [upper_ci]})).mark_rule(color='green').encode(x='x:Q')
-
-    text_mean = alt.Chart(pd.DataFrame({'x': [mean_days], 'label': [f'Mean: {mean_days:.1f}']})).mark_text(
-        align='left', dx=5, dy=-10, color='red'
-    ).encode(x='x:Q', text='label:N')
-
-    text_lower = alt.Chart(pd.DataFrame({'x': [lower_ci], 'label': [f'Lower CI: {lower_ci:.1f}']})).mark_text(
-        align='left', dx=5, dy=-10, color='green'
-    ).encode(x='x:Q', text='label:N')
-
-    text_upper = alt.Chart(pd.DataFrame({'x': [upper_ci], 'label': [f'Upper CI: {upper_ci:.1f}']})).mark_text(
-        align='left', dx=5, dy=-10, color='green'
-    ).encode(x='x:Q', text='label:N')
-
-    return (base + mean_line + lower_ci_line + upper_ci_line + text_mean + text_lower + text_upper).properties(
-        title="Total Completion Time Distribution"
-    )
-
-def create_station_chart(station_df, results):
-    """
-    Create boxplot or violin plot by station to visualize the distribution of times per station.
-    Also overlay mean and CI as text or lines.
-    """
-
-    # Create a summary table for stations
-    station_summary = []
-    for station, val in results['stations'].items():
-        station_summary.append({
-            'station': station,
-            'mean_days': val['mean_days'],
-            'lower_ci': val['confidence_interval_days'][0],
-            'upper_ci': val['confidence_interval_days'][1]
-        })
-    station_summary_df = pd.DataFrame(station_summary)
-
-    boxplot = alt.Chart(station_df).mark_boxplot().encode(
-        x=alt.X('station:N', title='Station'),
-        y=alt.Y('days:Q', title='Days'),
-        color='station:N'
-    )
-
-    # Add mean and CI overlay using rule and point marks
-    mean_ci_lines = alt.Chart(station_summary_df).mark_rule(color='red').encode(
-        x='station:N',
-        y='lower_ci:Q',
-        y2='upper_ci:Q'
-    )
-
-    mean_points = alt.Chart(station_summary_df).mark_point(color='red', size=50).encode(
-        x='station:N',
-        y='mean_days:Q'
-    )
-
-    return (boxplot + mean_ci_lines + mean_points).properties(
-        title="Distribution of Times by Station"
-    )
-
-def create_plant_chart(plant_df, results):
-    """
-    Similar to station chart, but grouped by plant.
-    """
-    # Create a summary table for plants
+def create_simple_executive_visuals(results, station_data_df):
+    # Extract total summary
+    total_mean = results['total']['mean_days']
+    total_lower, total_upper = results['total']['confidence_interval_days']
+    predicted_end_mean = results['total']['predicted_end_date_mean']
+    predicted_end_lower = results['total']['predicted_end_date_lower']
+    predicted_end_upper = results['total']['predicted_end_date_upper']
+    
+    # Prepare plant summary data
+    plant_order = ['PLANT1', 'PAINT', 'PLANT3', 'VEHICLE']
     plant_summary = []
     for plant, val in results['plants'].items():
         plant_summary.append({
@@ -120,54 +23,112 @@ def create_plant_chart(plant_df, results):
             'upper_ci': val['confidence_interval_days'][1]
         })
     plant_summary_df = pd.DataFrame(plant_summary)
+    # Ensure correct plant order
+    plant_summary_df['plant'] = pd.Categorical(plant_summary_df['plant'], categories=plant_order, ordered=True)
+    plant_summary_df = plant_summary_df.sort_values('plant')
+    
+    # Prepare station summary data
+    station_summary = []
+    for station, val in results['stations'].items():
+        # Find plant for station from station_data_df
+        station_row = station_data_df[station_data_df['STATION'] == station].iloc[0]
+        plant = station_row['PLANT']
+        station_summary.append({
+            'station': station,
+            'plant': plant,
+            'mean_days': val['mean_days'],
+            'lower_ci': val['confidence_interval_days'][0],
+            'upper_ci': val['confidence_interval_days'][1]
+        })
+    station_summary_df = pd.DataFrame(station_summary)
+    # Sort stations by plant order, then by station name
+    station_summary_df['plant'] = pd.Categorical(station_summary_df['plant'], categories=plant_order, ordered=True)
+    station_summary_df = station_summary_df.sort_values(['plant', 'station'])
 
-    boxplot = alt.Chart(plant_df).mark_boxplot().encode(
-        x=alt.X('plant:N', title='Plant'),
-        y=alt.Y('days:Q', title='Days'),
-        color='plant:N'
+    # ---------------------------------------
+    # Create Charts
+    # ---------------------------------------
+
+    # 1. Simple total summary chart
+    # Instead of a complex chart, let's just show a single bar with error bars.
+    total_df = pd.DataFrame([{
+        'category': 'Total Schedule',
+        'mean_days': total_mean,
+        'lower_ci': total_lower,
+        'upper_ci': total_upper
+    }])
+
+    total_chart = alt.Chart(total_df).mark_bar(color='steelblue').encode(
+        x=alt.X('category:N', title='', axis=alt.Axis(labels=False, ticks=False)),
+        y=alt.Y('mean_days:Q', title='Days')
+    ).properties(title="Overall Completion Prediction")
+
+    error_bars_total = alt.Chart(total_df).mark_rule(color='black').encode(
+        x='category:N',
+        y='lower_ci:Q',
+        y2='upper_ci:Q'
     )
 
-    mean_ci_lines = alt.Chart(plant_summary_df).mark_rule(color='red').encode(
+    # Add a text annotation to show the predicted end date directly
+    text_annotation = alt.Chart(pd.DataFrame({
+        'category': ['Total Schedule'],
+        'label': [f"Estimated Completion: {predicted_end_mean.date()} (90% CI: {predicted_end_lower.date()} - {predicted_end_upper.date()})"]
+    })).mark_text(align='left', dx=5).encode(
+        x='category:N',
+        y=alt.value(0),  # near the top
+        text='label:N'
+    )
+
+    total_combined = (total_chart + error_bars_total + text_annotation).properties(
+        width=300, height=150
+    )
+
+    # 2. Plant-level chart: Bar chart with error bars
+    plant_chart = alt.Chart(plant_summary_df).mark_bar(color='forestgreen').encode(
+        x=alt.X('plant:N', title='Plant'),
+        y=alt.Y('mean_days:Q', title='Mean Days')
+    ).properties(
+        title="By Plant: Mean and Confidence Interval",
+        width=300,
+        height=200
+    )
+
+    plant_error = alt.Chart(plant_summary_df).mark_rule(color='black').encode(
         x='plant:N',
         y='lower_ci:Q',
         y2='upper_ci:Q'
     )
 
-    mean_points = alt.Chart(plant_summary_df).mark_point(color='red', size=50).encode(
-        x='plant:N',
-        y='mean_days:Q'
+    plant_combined = plant_chart + plant_error
+
+    # 3. Station-level chart: Bar chart with error bars
+    # We'll show stations in order and color by their plant to reflect grouping
+    station_chart = alt.Chart(station_summary_df).mark_bar().encode(
+        x=alt.X('station:N', title='Station', sort=None),
+        y=alt.Y('mean_days:Q', title='Mean Days'),
+        color=alt.Color('plant:N', title='Plant', sort=plant_order)
+    ).properties(
+        title="By Station: Mean and Confidence Interval",
+        width=500,
+        height=200
     )
 
-    return (boxplot + mean_ci_lines + mean_points).properties(
-        title="Distribution of Times by Plant"
+    station_error = alt.Chart(station_summary_df).mark_rule(color='black').encode(
+        x='station:N',
+        y='lower_ci:Q',
+        y2='upper_ci:Q'
     )
 
-def create_leadership_dashboard(results):
-    """
-    Create a set of Altair charts for leadership to see schedule predictions.
-    Returns a dictionary of charts.
-    """
-    total_df, station_df, plant_df = prepare_data_for_viz(results)
+    station_combined = station_chart + station_error
 
-    total_chart = create_total_distribution_chart(total_df, results)
-    station_chart = create_station_chart(station_df, results)
-    plant_chart = create_plant_chart(plant_df, results)
+    return total_combined, plant_combined, station_combined
 
-    return {
-        'total_chart': total_chart,
-        'station_chart': station_chart,
-        'plant_chart': plant_chart
-    }
-
-# Example usage (assuming `results` is obtained from the Monte Carlo simulation above):
+# Example usage:
 if __name__ == "__main__":
-    # Suppose we have `results` from the simulation
-    # Here we'd just run the previous simulation code
-    # (Omitting the simulation code here for brevity, assume `results` is available)
-    # results = run_monte_carlo_simulation(...)
-
-    charts = create_leadership_dashboard(results)
-    # Display in a Jupyter environment:
-    charts['total_chart'].display()
-    charts['station_chart'].display()
-    charts['plant_chart'].display()
+    # Assuming `results` and `station_data_df` from previous steps
+    # total_combined, plant_combined, station_combined = create_simple_executive_visuals(results, station_data_df)
+    # In a Jupyter environment:
+    # total_combined.display()
+    # plant_combined.display()
+    # station_combined.display()
+    pass
