@@ -1,193 +1,173 @@
-import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+import pandas as pd
+import altair as alt
 
-def lognormal_params_from_stats(mean, std):
+def prepare_data_for_viz(results):
     """
-    Given the arithmetic mean and standard deviation of a dataset,
-    return the μ and σ parameters of the underlying normal distribution
-    for the corresponding lognormal distribution.
+    Prepare data from the simulation results dictionary into DataFrames suitable for visualization.
     """
-    if std <= 0:
-        # If std is zero or not positive, assume no variability: 
-        # This basically means deterministic = lognormal with σ=0.
-        # μ = ln(mean)
-        return np.log(mean), 0.0
-    variance = std**2
-    sigma_sq = np.log((variance / (mean**2)) + 1)
-    sigma = np.sqrt(sigma_sq)
-    mu = np.log(mean) - (sigma_sq / 2)
-    return mu, sigma
-
-def run_monte_carlo_simulation(
-    df, 
-    station_data_df,
-    monthly_schedule, 
-    num_simulations=10000, 
-    confidence=0.90,
-    start_date=datetime.now()
-):
-    """
-    Run Monte Carlo simulations using a lognormal distribution for each station 
-    and aggregate results at station, plant, and total levels.
-
-    Parameters:
-    - df: DataFrame with columns ['STATION', 'VARIANT', 'AVG_NUM_DAYS', 'STD_DEV'].
-    - station_data_df: DataFrame with columns ['STATION','PARENT','PLANT'].
-    - monthly_schedule: dict like {'VARIANT_A': 10, 'VARIANT_B': 5}.
-    - num_simulations: Number of Monte Carlo iterations.
-    - confidence: Confidence level for intervals (e.g., 0.90 for 90%).
-    - start_date: datetime object representing when production starts.
-
-    Returns:
-    A dictionary with simulation results, including distributions and CI for 
-    total, per-plant, and per-station aggregates.
-    """
-
-    # Group variant data for quick access
-    variant_groups = df.groupby('VARIANT')
-
-    # Create a mapping of STATION -> PLANT
-    station_to_plant = station_data_df.set_index('STATION')['PLANT'].to_dict()
-
-    # Identify all stations and plants involved
-    all_stations = df['STATION'].unique()
-    all_plants = station_data_df['PLANT'].unique()
-
-    # Initialize arrays to accumulate results
-    # We'll store total simulated days for entire schedule:
-    total_days_per_simulation = np.zeros(num_simulations)
-    # Store by station
-    station_days = {station: np.zeros(num_simulations) for station in all_stations}
-    # Store by plant
-    plant_days = {plant: np.zeros(num_simulations) for plant in all_plants}
-
-    # For each variant and quantity
-    for variant, quantity in monthly_schedule.items():
-        if variant not in variant_groups.groups:
-            raise ValueError(f"No data found for variant {variant} in the dataset.")
-
-        variant_data = variant_groups.get_group(variant)
-        
-        # For each unit of this variant
-        for _ in range(quantity):
-            # Simulate each station
-            for _, row in variant_data.iterrows():
-                station = row['STATION']
-                mean = row['AVG_NUM_DAYS']
-                std = row['STD_DEV']
-
-                # Convert to lognormal parameters
-                mu, sigma = lognormal_params_from_stats(mean, std)
-
-                # Draw samples from lognormal distribution
-                # np.random.lognormal uses parameters mean=mu, sigma=sigma where 
-                # mean/sigma refer to the underlying normal distribution.
-                samples = np.random.lognormal(mean=mu, sigma=sigma, size=num_simulations)
-                # Add these samples to the totals
-                total_days_per_simulation += samples
-                station_days[station] += samples
-                
-                # Add to plant-level sums
-                plant = station_to_plant.get(station, None)
-                if plant is not None:
-                    plant_days[plant] += samples
-
-    # Compute confidence intervals and statistics
-    def confidence_interval(data, conf):
-        lower_percentile = (1 - conf) / 2 * 100
-        upper_percentile = (1 - (1 - conf) / 2) * 100
-        return np.percentile(data, lower_percentile), np.percentile(data, upper_percentile)
-
-    total_ci = confidence_interval(total_days_per_simulation, confidence)
-    total_mean = np.mean(total_days_per_simulation)
-
-    # Compute results for stations
-    station_results = {}
-    for station in all_stations:
-        dist = station_days[station]
-        ci = confidence_interval(dist, confidence)
-        mean_val = np.mean(dist)
-        station_results[station] = {
-            'mean_days': mean_val,
-            'confidence_interval_days': ci
-        }
-
-    # Compute results for plants
-    plant_results = {}
-    for plant in all_plants:
-        dist = plant_days[plant]
-        ci = confidence_interval(dist, confidence)
-        mean_val = np.mean(dist)
-        plant_results[plant] = {
-            'mean_days': mean_val,
-            'confidence_interval_days': ci
-        }
-
-    # Convert mean and CI bounds into dates
-    predicted_end_mean = start_date + timedelta(days=total_mean)
-    predicted_end_lower = start_date + timedelta(days=total_ci[0])
-    predicted_end_upper = start_date + timedelta(days=total_ci[1])
-
-    results = {
-        'total': {
-            'mean_days': total_mean,
-            'confidence_interval_days': total_ci,
-            'predicted_end_date_mean': predicted_end_mean,
-            'predicted_end_date_lower': predicted_end_lower,
-            'predicted_end_date_upper': predicted_end_upper
-        },
-        'stations': station_results,
-        'plants': plant_results,
-        'distributions': {
-            'total_days_distribution': total_days_per_simulation,
-            'station_days_distribution': station_days,
-            'plant_days_distribution': plant_days
-        },
-        'start_date': start_date
-    }
-
-    return results
-
-# Example usage:
-if __name__ == "__main__":
-    # Example station-level dataset
-    df = pd.DataFrame({
-        'STATION': ['STATION_1', 'STATION_2', 'STATION_3', 'STATION_1', 'STATION_2', 'STATION_3'],
-        'VARIANT': ['VARIANT_A', 'VARIANT_A', 'VARIANT_A', 'VARIANT_B', 'VARIANT_B', 'VARIANT_B'],
-        'AVG_NUM_DAYS': [5.0, 3.0, 2.0, 4.0, 6.0, 5.0],
-        'STD_DEV': [1.0, 0.5, 0.2, 1.5, 2.0, 1.0]
+    # Extract total distribution
+    total_dist = results['distributions']['total_days_distribution']
+    total_df = pd.DataFrame({
+        'simulation_id': np.arange(len(total_dist)),
+        'total_days': total_dist
     })
 
-    # Station data linking stations to plants
-    station_data_df = pd.DataFrame({
-        'STATION': ['STATION_1', 'STATION_2', 'STATION_3'],
-        'PARENT': ['PARENT_1', 'PARENT_1', 'PARENT_2'],
-        'PLANT': ['PLANT1', 'PAINT', 'VEHICLE']
-    })
+    # Station distributions
+    station_data = []
+    for station, dist in results['distributions']['station_days_distribution'].items():
+        station_data.append(pd.DataFrame({
+            'simulation_id': np.arange(len(dist)),
+            'station': station,
+            'days': dist
+        }))
+    station_df = pd.concat(station_data, ignore_index=True)
 
-    monthly_schedule = {
-        'VARIANT_A': 10,
-        'VARIANT_B': 5
-    }
+    # Plant distributions
+    plant_data = []
+    for plant, dist in results['distributions']['plant_days_distribution'].items():
+        plant_data.append(pd.DataFrame({
+            'simulation_id': np.arange(len(dist)),
+            'plant': plant,
+            'days': dist
+        }))
+    plant_df = pd.concat(plant_data, ignore_index=True)
 
-    results = run_monte_carlo_simulation(
-        df, 
-        station_data_df, 
-        monthly_schedule, 
-        num_simulations=5000, 
-        confidence=0.90,
-        start_date=datetime(2025, 1, 1)
+    return total_df, station_df, plant_df
+
+def create_total_distribution_chart(total_df, results):
+    """
+    Create a histogram of the total days distribution with mean and CI lines.
+    """
+    mean_days = results['total']['mean_days']
+    lower_ci, upper_ci = results['total']['confidence_interval_days']
+
+    base = alt.Chart(total_df).mark_bar(opacity=0.7).encode(
+        alt.X('total_days:Q', bin=alt.Bin(maxbins=50), title='Total Days'),
+        alt.Y('count()', title='Count of Simulations')
     )
 
-    print("Total Mean Days:", results['total']['mean_days'])
-    print("Total 90% CI (days):", results['total']['confidence_interval_days'])
-    print("Station Results:")
-    for st, val in results['stations'].items():
-        print(f"  {st}: mean={val['mean_days']}, CI={val['confidence_interval_days']}")
-    print("Plant Results:")
-    for pl, val in results['plants'].items():
-        print(f"  {pl}: mean={val['mean_days']}, CI={val['confidence_interval_days']}")
-    print("Predicted End Date (Mean):", results['total']['predicted_end_date_mean'])
-    print("Predicted End Date (Lower CI):", results['total']['predicted_end_date_lower'])
-    print("Predicted End Date (Upper CI):", results['total']['predicted_end_date_upper'])
+    mean_line = alt.Chart(pd.DataFrame({'x': [mean_days]})).mark_rule(color='red').encode(x='x:Q')
+    lower_ci_line = alt.Chart(pd.DataFrame({'x': [lower_ci]})).mark_rule(color='green').encode(x='x:Q')
+    upper_ci_line = alt.Chart(pd.DataFrame({'x': [upper_ci]})).mark_rule(color='green').encode(x='x:Q')
+
+    text_mean = alt.Chart(pd.DataFrame({'x': [mean_days], 'label': [f'Mean: {mean_days:.1f}']})).mark_text(
+        align='left', dx=5, dy=-10, color='red'
+    ).encode(x='x:Q', text='label:N')
+
+    text_lower = alt.Chart(pd.DataFrame({'x': [lower_ci], 'label': [f'Lower CI: {lower_ci:.1f}']})).mark_text(
+        align='left', dx=5, dy=-10, color='green'
+    ).encode(x='x:Q', text='label:N')
+
+    text_upper = alt.Chart(pd.DataFrame({'x': [upper_ci], 'label': [f'Upper CI: {upper_ci:.1f}']})).mark_text(
+        align='left', dx=5, dy=-10, color='green'
+    ).encode(x='x:Q', text='label:N')
+
+    return (base + mean_line + lower_ci_line + upper_ci_line + text_mean + text_lower + text_upper).properties(
+        title="Total Completion Time Distribution"
+    )
+
+def create_station_chart(station_df, results):
+    """
+    Create boxplot or violin plot by station to visualize the distribution of times per station.
+    Also overlay mean and CI as text or lines.
+    """
+
+    # Create a summary table for stations
+    station_summary = []
+    for station, val in results['stations'].items():
+        station_summary.append({
+            'station': station,
+            'mean_days': val['mean_days'],
+            'lower_ci': val['confidence_interval_days'][0],
+            'upper_ci': val['confidence_interval_days'][1]
+        })
+    station_summary_df = pd.DataFrame(station_summary)
+
+    boxplot = alt.Chart(station_df).mark_boxplot().encode(
+        x=alt.X('station:N', title='Station'),
+        y=alt.Y('days:Q', title='Days'),
+        color='station:N'
+    )
+
+    # Add mean and CI overlay using rule and point marks
+    mean_ci_lines = alt.Chart(station_summary_df).mark_rule(color='red').encode(
+        x='station:N',
+        y='lower_ci:Q',
+        y2='upper_ci:Q'
+    )
+
+    mean_points = alt.Chart(station_summary_df).mark_point(color='red', size=50).encode(
+        x='station:N',
+        y='mean_days:Q'
+    )
+
+    return (boxplot + mean_ci_lines + mean_points).properties(
+        title="Distribution of Times by Station"
+    )
+
+def create_plant_chart(plant_df, results):
+    """
+    Similar to station chart, but grouped by plant.
+    """
+    # Create a summary table for plants
+    plant_summary = []
+    for plant, val in results['plants'].items():
+        plant_summary.append({
+            'plant': plant,
+            'mean_days': val['mean_days'],
+            'lower_ci': val['confidence_interval_days'][0],
+            'upper_ci': val['confidence_interval_days'][1]
+        })
+    plant_summary_df = pd.DataFrame(plant_summary)
+
+    boxplot = alt.Chart(plant_df).mark_boxplot().encode(
+        x=alt.X('plant:N', title='Plant'),
+        y=alt.Y('days:Q', title='Days'),
+        color='plant:N'
+    )
+
+    mean_ci_lines = alt.Chart(plant_summary_df).mark_rule(color='red').encode(
+        x='plant:N',
+        y='lower_ci:Q',
+        y2='upper_ci:Q'
+    )
+
+    mean_points = alt.Chart(plant_summary_df).mark_point(color='red', size=50).encode(
+        x='plant:N',
+        y='mean_days:Q'
+    )
+
+    return (boxplot + mean_ci_lines + mean_points).properties(
+        title="Distribution of Times by Plant"
+    )
+
+def create_leadership_dashboard(results):
+    """
+    Create a set of Altair charts for leadership to see schedule predictions.
+    Returns a dictionary of charts.
+    """
+    total_df, station_df, plant_df = prepare_data_for_viz(results)
+
+    total_chart = create_total_distribution_chart(total_df, results)
+    station_chart = create_station_chart(station_df, results)
+    plant_chart = create_plant_chart(plant_df, results)
+
+    return {
+        'total_chart': total_chart,
+        'station_chart': station_chart,
+        'plant_chart': plant_chart
+    }
+
+# Example usage (assuming `results` is obtained from the Monte Carlo simulation above):
+if __name__ == "__main__":
+    # Suppose we have `results` from the simulation
+    # Here we'd just run the previous simulation code
+    # (Omitting the simulation code here for brevity, assume `results` is available)
+    # results = run_monte_carlo_simulation(...)
+
+    charts = create_leadership_dashboard(results)
+    # Display in a Jupyter environment:
+    charts['total_chart'].display()
+    charts['station_chart'].display()
+    charts['plant_chart'].display()
