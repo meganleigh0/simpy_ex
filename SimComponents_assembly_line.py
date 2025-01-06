@@ -10,7 +10,7 @@ data = {
     'PLANT':   ['PlantA','PlantA','PlantA','PlantB','PlantB','PlantC'],
     'STATION': ['S1','S2','S3','S1','S2','S1'],
     'AVG_NUM_DAYS': [5.0, 6.7, 8.2, 3.5, 4.0, 10.0],
-    'MEDIAN_NUM_DAYS': [5.0, 6.5, 8.0, 3.3, 3.8, 9.5],  # Not used for sampling
+    'MEDIAN_NUM_DAYS': [5.0, 6.5, 8.0, 3.3, 3.8, 9.5],  # Not used directly for sampling
     'STD_DEV': [1.0, 1.5, 2.0, 1.2, 1.3, 2.2],
     'PARENT':  ['S2','S3','End','S2','End','End']      # Not used for sampling here
 }
@@ -18,32 +18,24 @@ data = {
 df = pd.DataFrame(data)
 
 # ---------------------------------------------------------------------------------
-# 2. Helper: Convert (mean, std) in real space -> (mu, sigma) for lognormal
-#    so the generated samples will have the desired mean = AVG_NUM_DAYS
-#    and std = STD_DEV in *real* space.
+# 2. Helper: Convert (mean, std) in real space -> (mu, sigma) in log space
 # ---------------------------------------------------------------------------------
 def get_lognorm_params(mean, std):
     """
     Given a desired mean and std (in real space), return (mu, sigma) parameters
-    for the underlying normal distribution of a lognormal.
+    for the underlying normal distribution (log space) of a lognormal.
     
     mean = exp(mu + sigma^2 / 2)
-    var  = (exp(sigma^2) - 1) * exp(2mu + sigma^2)
+    var  = (exp(sigma^2) - 1) * exp(2*mu + sigma^2)
     std  = sqrt(var)
     """
     var = std**2
-    # mu
     mu = np.log(mean**2 / np.sqrt(var + mean**2))
-    # sigma
-    sigma = np.sqrt(np.log(1 + var / mean**2))
+    sigma = np.sqrt(np.log(1 + var / (mean**2)))
     return mu, sigma
 
 # ---------------------------------------------------------------------------------
 # 3. Monte Carlo Simulation with Lognormal draws
-#    - Groups by PLANT
-#    - For each station, draws from lognormal based on (AVG_NUM_DAYS, STD_DEV)
-#    - Takes the max across stations to get the "cycle time."
-#    - Returns a dict: {plant_name: np.array_of_cycle_times}
 # ---------------------------------------------------------------------------------
 def run_monte_carlo_sims(df, num_simulations=10_000):
     results = {}
@@ -57,7 +49,7 @@ def run_monte_carlo_sims(df, num_simulations=10_000):
             mean = row['AVG_NUM_DAYS']
             std_dev = row['STD_DEV']
             
-            # Convert (mean, std) in real space to (mu, sigma) in log space
+            # Convert (mean, std) in real space to (mu, sigma) for lognormal
             mu, sigma = get_lognorm_params(mean, std_dev)
             
             # Sample from lognormal using (s=sigma, scale=exp(mu))
@@ -65,10 +57,8 @@ def run_monte_carlo_sims(df, num_simulations=10_000):
             
             station_samples.append(samples)
         
-        # Stack: shape => (num_stations, num_simulations)
         station_stacks = np.stack(station_samples, axis=0)
-        
-        # Cycle time is the maximum station time across all stations
+        # The plant's "cycle time" is the max across station times
         cycle_times = np.max(station_stacks, axis=0)
         results[plant] = cycle_times
     
@@ -80,7 +70,7 @@ def run_monte_carlo_sims(df, num_simulations=10_000):
 monte_carlo_results = run_monte_carlo_sims(df, num_simulations=10_000)
 
 # ---------------------------------------------------------------------------------
-# 5. Flatten results into a "long" DataFrame for Altair
+# 5. Flatten results for Altair
 # ---------------------------------------------------------------------------------
 records = []
 for plant, times in monte_carlo_results.items():
@@ -89,7 +79,7 @@ for plant, times in monte_carlo_results.items():
 dist_df = pd.DataFrame(records)
 
 # ---------------------------------------------------------------------------------
-# 6. Chart #1: Histogram of cycle times (lognormal-based), colored by Plant
+# 6. Chart #1: Histogram of cycle times, colored by Plant
 # ---------------------------------------------------------------------------------
 chart1 = (
     alt.Chart(dist_df)
@@ -105,10 +95,8 @@ chart1 = (
 )
 
 # ---------------------------------------------------------------------------------
-# 7. Chart #2: Interactive estimation of days needed for a given vehicle quantity
-#    Assumption: total time ~ quantity * cycle_time (linear flow)
-#    We'll add an Altair parameter (slider) for "vehicle_qty" and
-#    display the resulting distribution as a histogram.
+# 7. Chart #2: Interactive slider for Vehicle Qty -> total days estimate
+#    This uses alt.Param (introduced in Altair 5).
 # ---------------------------------------------------------------------------------
 vehicle_qty = alt.binding_range(min=1, max=200, step=1, name='Vehicle Qty:')
 vehicle_qty_param = alt.param(value=1, bind=vehicle_qty)
@@ -116,7 +104,6 @@ vehicle_qty_param = alt.param(value=1, bind=vehicle_qty)
 chart2 = (
     alt.Chart(dist_df)
     .transform_calculate(
-        # Multiply each cycle time by the user-selected quantity
         Est_Days='datum.Cycle_Time * vehicle_qty_param',
         vehicle_qty_param=vehicle_qty_param
     )
@@ -127,12 +114,12 @@ chart2 = (
         color='Plant:N',
         tooltip=['Plant:N', 'Est_Days:Q']
     )
-    .properties(width=600, height=300, title='Estimated Total Days vs Vehicle Quantity')
-    .add_params(vehicle_qty_param)  # Adds the slider to the chart
+    .properties(width=600, height=300, title='Estimated Total Days vs. Vehicle Quantity')
+    .add_params(vehicle_qty_param)  # attach the slider
     .interactive()
 )
 
 # ---------------------------------------------------------------------------------
-# 8. Display both charts (if in a Jupyter environment, just output the final line)
+# 8. Display both charts (in Jupyter, just use the final line to see them side-by-side)
 # ---------------------------------------------------------------------------------
 chart1 & chart2
