@@ -1,173 +1,162 @@
-import os
-import random
-import urllib.request
-import xlrd
-import csv
+###############################################################################
+# Single-cell example: 
+# Train multiple regression models to predict how many days (Number) a 
+# vehicle variant spends at each station, then visualize predictions with Plotly.
+###############################################################################
+
 import pandas as pd
-import functools
-import simpy
-from SimComponents_for_supply_chain import DataframeSource, Sink, Process, Monitor
-import matplotlib.pyplot as plt
-import time
+import numpy as np
 
-""" Data loading
-    1. request raw excel file from github of jonghunwoo
-    2. then, change the format from excel to csv
-    3. Data frame object of product data is generated from csv file
-"""
+# 1. Data Loading and Preparation
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import OneHotEncoder
 
-# ./data 폴더에 해당 파일이 없으면 실행
-if not os.path.isfile('./data/spool_data_for_simulation.csv'):
-    url = "https://raw.githubusercontent.com/jonghunwoo/public/master/spool_data_for_simulation.xlsx"
-    filename = "./data/spool_data_for_simulation.xlsx"
-    urllib.request.urlretrieve(url, filename)
+# 2. Models and Metrics
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.neural_network import MLPRegressor
+import xgboost as xgb
+from sklearn.metrics import mean_squared_error, r2_score
 
-    def csv_from_excel(excel_name, file_name, sheet_name):
-        workbook = xlrd.open_workbook(excel_name)
-        worksheet = workbook.sheet_by_name(sheet_name)
-        csv_file = open(file_name, 'w')
-        writer = csv.writer(csv_file, quoting=csv.QUOTE_ALL)
+# 3. Visualization
+import plotly.graph_objects as go
 
-        for row_num in range(worksheet.nrows):
-            writer.writerow(worksheet.row_values(row_num))
+# ---------------------------
+#   A) LOAD YOUR DATA
+# ---------------------------
+# Replace with your real data file or DataFrame
+df = pd.DataFrame({
+    "Vehicle": ["V1","V1","V2","V2","V3","V3"],
+    "Section": ["S1","S1","S2","S2","S1","S2"],
+    "Station": ["StA","StB","StA","StB","StB","StA"],
+    "Date": pd.date_range("2021-01-01", periods=6, freq="D"),
+    "Variant": ["Type1","Type1","Type2","Type2","Type1","Type2"],
+    "Number": [3, 5, 2, 6, 8, 4]  # Number of days the vehicle was at the Station
+})
 
-        csv_file.close()
+# Convert Date to datetime (already done above, but here for completeness)
+df["Date"] = pd.to_datetime(df["Date"])
 
-    csv_from_excel('./data/spool_data_for_simulation.xlsx', './data/spool_data_for_simulation.csv', 'Sheet1')
+# ---------------------------
+#   B) FEATURE ENGINEERING
+# ---------------------------
+# Let's assume "Number" (the number of days) is our target.
+# We'll encode categorical features. For brevity, we’ll keep only 
+# relevant columns for modeling and drop or ignore others as an example.
 
-# csv 파일 pandas 객체 생성
-data = pd.read_csv('./data/spool_data_for_simulation.csv')
-df = data[["NO_SPOOL", "DIA", "Length", "Weight", "MemberCount", "JointCount", "Material", "제작협력사", "도장협력사", "Plan_makingLT", "Actual_makingLT", "Predicted_makingLT", "Plan_paintingLT", "Actual_paintingLT", "Predicted_paintingLT"]]
+# Example: encode "Variant" and "Station" using one-hot encoding.
+cat_features = ["Variant", "Station"]
+encoder = OneHotEncoder(drop='first', sparse=False)
+encoded = encoder.fit_transform(df[cat_features])
 
-df.rename(columns={'NO_SPOOL': 'part_no', "제작협력사": 'proc1', '도장협력사': 'proc2', 'Plan_makingLT': 'ct1', 'Actual_makingLT': 'ct3', 'Predicted_makingLT': 'ct5', 'Plan_paintingLT': 'ct2', 'Actual_paintingLT': 'ct4', 'Predicted_paintingLT': 'ct6'}, inplace=True)
-print(df.shape[0])
+# Create a new DataFrame for the encoded columns
+encoded_df = pd.DataFrame(encoded, columns=encoder.get_feature_names_out(cat_features))
 
-""" Simulation
-    Dataframe with product data is passed to Source.
-    Then, source create product with interval time of defined adist function.
-    For this purpose, DataframeSource is defined based on original Source.
-"""
+# Combine original DataFrame with the encoded data
+df_encoded = pd.concat([df, encoded_df], axis=1)
 
-random.seed(42)
-adist = functools.partial(random.randrange,1,10) # Inter-arrival time
-samp_dist = functools.partial(random.expovariate, 1) # need to be checked
-proc_time = functools.partial(random.normalvariate,5,1) # sample process working time
+# Define X (features) and y (target)
+# Here, y is the "Number" of days at the station
+y = df_encoded["Number"]
 
-RUN_TIME = 45000
+# We'll drop columns that are not suitable as direct features (Vehicle, Section, Date, etc.)
+# You might keep "Date" if you want to engineer day-of-week/month features, etc.
+X = df_encoded.drop(["Number", "Vehicle", "Section", "Date", "Variant", "Station"], axis=1)
 
-env = simpy.Environment()
+# Train/test split (random for example; if time-based, use chronological split)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-Source = DataframeSource(env, "Source", adist, df)
-Sink = Sink(env, 'Sink', debug=False, rec_arrivals=True)
+# ---------------------------
+#   C) MODEL TRAINING
+# ---------------------------
+models = {
+    "Linear": LinearRegression(),
+    "RandomForest": RandomForestRegressor(n_estimators=50, random_state=42),
+    "XGBoost": xgb.XGBRegressor(n_estimators=50, use_label_encoder=False, eval_metric='rmse', random_state=42),
+    "NeuralNetwork": MLPRegressor(hidden_layer_sizes=(16,8), max_iter=500, random_state=42)
+}
 
-proc1_name_list = list(df.drop_duplicates(['proc1'])['proc1'])
-proc2_name_list = list(df.drop_duplicates(['proc2'])['proc2'])
+results = {}
+for model_name, model in models.items():
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+    mse = mean_squared_error(y_test, y_pred)
+    r2  = r2_score(y_test, y_pred)
+    results[model_name] = {"MSE": mse, "R^2": r2}
 
-proc1_list = []
-proc2_list = []
-monitor1_list = []
-monitor2_list = []
+results_df = pd.DataFrame(results).T
+print("Model Comparison:")
+print(results_df)
 
-#print(proc1_name_list)
+# ---------------------------
+#   D) PREDICTIONS FOR PLOTTING
+# ---------------------------
+# Store each model's predictions in a DataFrame
+predictions_df = pd.DataFrame({
+    "TrueDays": y_test.reset_index(drop=True),
+    "Pred_Linear": models["Linear"].predict(X_test),
+    "Pred_RF": models["RandomForest"].predict(X_test),
+    "Pred_XGBoost": models["XGBoost"].predict(X_test),
+    "Pred_NeuralNetwork": models["NeuralNetwork"].predict(X_test),
+})
 
-proc1_qlimit = [10, 10, 10, 10, 10, 10, 10]
-proc2_qlimit = [10, 10, 10, 10, 10, 10, 10]
-proc1_subprocess = [5, 5, 5, 5, 5, 5, 5]
-proc2_subprocess = [5, 5, 5, 5, 5, 5, 5]
+# ---------------------------
+#   E) PLOTLY VISUALIZATION WITH DROPDOWN
+# ---------------------------
+fig = go.Figure()
 
-#proc1_qlimit = [1, 1, 1, 1, 1, 1, 1]
-#proc2_qlimit = [1, 1, 1, 1, 1, 1, 1]
-#proc1_subprocess = [1, 1, 1, 1, 1, 1, 1]
-#proc2_subprocess = [1, 1, 1, 1, 1, 1, 1]
+# Always show the "TrueDays" trace
+fig.add_trace(go.Scatter(
+    x=predictions_df.index,
+    y=predictions_df["TrueDays"],
+    mode='lines',
+    name='True Days'
+))
 
-for i in range(len(proc1_name_list)):
-    proc1_list.append(Process(env, "proc1", "{}".format(proc1_name_list[i]), proc_time, proc1_subprocess[i], qlimit=proc1_qlimit[i], limit_bytes=False))
-    #monitor1_list.append(Monitor(env, proc1_list[i], samp_dist))
-    Source.outs['{}'.format(proc1_list[i].name)] = proc1_list[i]
+# Add a trace for each model; make them initially invisible
+model_cols = ["Pred_Linear", "Pred_RF", "Pred_XGBoost", "Pred_NeuralNetwork"]
+for col in model_cols:
+    fig.add_trace(go.Scatter(
+        x=predictions_df.index,
+        y=predictions_df[col],
+        mode='lines',
+        name=col,
+        visible=False
+    ))
 
-for i in range(len(proc2_name_list)):
-    proc2_list.append(Process(env, "proc2", "{}".format(proc2_name_list[i]), proc_time, proc2_subprocess[i], qlimit=proc2_qlimit[i], limit_bytes=False))
-    #monitor2_list.append(Monitor(env, proc2_list[i], samp_dist))
-    proc2_list[i].outs['Sink'] = Sink
+# Create dropdown that toggles which model's prediction trace is visible
+updatemenus = [
+    dict(
+        buttons=[
+            dict(label="Linear", 
+                 method="update",
+                 args=[{"visible": [True, True, False, False, False]}, 
+                       {"title": "Linear vs. True"}]),
+            dict(label="RandomForest", 
+                 method="update",
+                 args=[{"visible": [True, False, True, False, False]}, 
+                       {"title": "RandomForest vs. True"}]),
+            dict(label="XGBoost", 
+                 method="update",
+                 args=[{"visible": [True, False, False, True, False]}, 
+                       {"title": "XGBoost vs. True"}]),
+            dict(label="NeuralNetwork", 
+                 method="update",
+                 args=[{"visible": [True, False, False, False, True]}, 
+                       {"title": "NeuralNetwork vs. True"}]),
+        ],
+        direction="down",
+        showactive=True,
+        x=0,  # x-position of the dropdown
+        y=1.1 # y-position of the dropdown
+    )
+]
 
-for i in range(len(proc1_list)):
-    for j in range(len(proc2_list)):
-        proc1_list[i].outs['{}'.format(proc2_list[j].name)] = proc2_list[j]
+fig.update_layout(
+    updatemenus=updatemenus,
+    title="Days at Station: Predictions vs. True",
+    xaxis_title="Test Sample Index",
+    yaxis_title="Number of Days"
+)
 
-start = time.time()  # 시작 시간 저장
-# Run it
-env.run(until=RUN_TIME)
-print("time :", time.time() - start)
-
-print("Total Lead Time : ", Sink.last_arrival)
-
-# 공정별 가동률
-for i in range(len(proc1_list)):
-    print("utilization of {0}: {1:2.2f}".format(proc1_list[i].name ,proc1_list[i].working_time / Sink.last_arrival))
-for i in range(len(proc2_list)):
-    print("utilization of {0}: {1:2.2f}".format(proc2_list[i].name ,proc2_list[i].working_time / Sink.last_arrival))
-
-#for i in range(len(proc1_list)):
-    #print("average system occupancy of {0}: {1:.3f}".format(proc1_list[i].name, float(sum(monitor1_list[i].sizes)) / len(monitor1_list[i].sizes)))
-#for i in range(len(proc2_list)):
-    #print("average system occupancy of {0}: {1:.3f}".format(proc2_list[i].name, float(sum(monitor2_list[i].sizes)) / len(monitor2_list[i].sizes)))
-
-# 공정별 대기시간의 합
-
-names = ["(주)성광테크", "건일산업(주)", "부흥", "삼성중공업(주)거제", "성일", "성일SIM함안공장", "해승케이피피", "삼녹", "성도", "하이에어"]
-waiting_time = {}
-for name in names:
-    t = 0
-    for i in range(len(Sink.waiting_list)):
-        if len(Sink.waiting_list[i]) == 2:
-            if name + ' ' + "waiting start" == list(Sink.waiting_list[i].keys())[0]:
-                t += Sink.waiting_list[i][name + " waiting finish"] - Sink.waiting_list[i][name + " waiting start"]
-                #print("2 ", Sink.waiting_list[i][name + " waiting finish"], " - ", Sink.waiting_list[i][name + " waiting start"])
-
-        elif len(Sink.waiting_list[i]) == 4:
-            #print(list(Sink.waiting_list[i].keys())[0])
-            #print(list(Sink.waiting_list[i].keys())[1])
-            #print(list(Sink.waiting_list[i].keys())[2])
-            #print(list(Sink.waiting_list[i].keys())[3])
-            if name + ' ' + "waiting start" == list(Sink.waiting_list[i].keys())[0]:
-                t += Sink.waiting_list[i][name + " waiting finish"] - Sink.waiting_list[i][name + " waiting start"]
-                #print("4 ", Sink.waiting_list[i][name + " waiting finish"], " - ", Sink.waiting_list[i][name + " waiting start"])
-            if name + ' ' + "waiting start" == list(Sink.waiting_list[i].keys())[2]:
-                t += Sink.waiting_list[i][name + " waiting finish"] - Sink.waiting_list[i][name + " waiting start"]
-                #print("4 ", Sink.waiting_list[i][name + " waiting finish"], " - ", Sink.waiting_list[i][name + " waiting start"])
-        else:
-            print(Sink.waiting_list[i])
-
-    waiting_time[name] = t
-
-print("total waiting time of (주)성광테크 : ",waiting_time["(주)성광테크"])
-print("total waiting time of 건일사업(주) : ",waiting_time["건일산업(주)"])
-print("total waiting time of 부흥 : ",waiting_time["부흥"])
-print("total waiting time of 삼성중공업(주)거제 : ",waiting_time["삼성중공업(주)거제"])
-print("total waiting time of 성일 : ",waiting_time["성일"])
-print("total waiting time of 성일SIM함안공장 : ",waiting_time["성일SIM함안공장"])
-print("total waiting time of 해승케이피피 : ",waiting_time["해승케이피피"])
-print("total waiting time of 삼녹 : ",waiting_time["삼녹"])
-print("total waiting time of 성도 : ",waiting_time["성도"])
-print("total waiting time of 하이에어 : ",waiting_time["하이에어"])
-
-fig, axis = plt.subplots()
-axis.hist(Sink.waits, bins=100, density=True)
-axis.set_title("Histogram for waiting times")
-axis.set_xlabel("time")
-axis.set_ylabel("normalized frequency of occurrence")
-plt.show()
-
-fig, axis = plt.subplots()
-axis.hist(Sink.arrivals, bins=100, density=True)
-axis.set_title("Histogram for Sink Interarrival times")
-axis.set_xlabel("time")
-axis.set_ylabel("normalized frequency of occurrence")
-plt.show()
-
-fig, axis = plt.subplots()
-axis.hist(monitor1_list[0].sizes, bins=10, density=True)
-axis.set_title("Histogram for Process1 WIP")
-axis.set_xlabel("time")
-axis.set_ylabel("normalized frequency of occurrence")
-plt.show()
+fig.show()
