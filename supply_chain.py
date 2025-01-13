@@ -1,3 +1,76 @@
+
+# ---------------------------
+#   B) FEATURE ENGINEERING
+# ---------------------------
+# We'll predict "Number" = days at station
+# We'll one-hot encode (Variant, Station) or anything relevant.
+cat_features = ["Variant", "Station"]
+encoder = OneHotEncoder(drop='first', sparse=False)  # Remove 'drop="first"' if it errors
+encoded = encoder.fit_transform(df[cat_features])
+
+# For scikit-learn 0.24.2, we must use get_feature_names:
+feature_names = encoder.get_feature_names(cat_features)
+
+encoded_df = pd.DataFrame(encoded, columns=feature_names)
+
+# Combine with original
+df_encoded = pd.concat([df, encoded_df], axis=1)
+
+# Our target
+y = df_encoded["Number"]
+
+# Example features: the encoded columns only
+X = df_encoded.drop(["Number", "Vehicle", "Section", "Date", "Variant", "Station"], axis=1)
+
+# We'll also store the Station in X_test or in a separate array for later filtering
+stations = df_encoded["Station"]
+vehicles = df_encoded["Vehicle"]
+
+# Train/test split
+X_train, X_test, y_train, y_test, stations_train, stations_test, vehicles_train, vehicles_test = train_test_split(
+    X, y, stations, vehicles, test_size=0.5, random_state=42  # large test_size for demo
+)
+
+# ---------------------------
+#   C) TRAIN MULTIPLE MODELS
+# ---------------------------
+models = {
+    "Linear": LinearRegression(),
+    "RandomForest": RandomForestRegressor(n_estimators=20, random_state=42),
+    "XGBoost": xgb.XGBRegressor(n_estimators=20, use_label_encoder=False, eval_metric='rmse', random_state=42),
+    "NeuralNet": MLPRegressor(hidden_layer_sizes=(16,), max_iter=200, random_state=42)
+}
+
+results = {}
+predictions_dict = {}  # We'll store predictions for each model
+
+for model_name, model in models.items():
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+    mse = mean_squared_error(y_test, y_pred)
+    rmse = np.sqrt(mse)
+    r2 = r2_score(y_test, y_pred)
+    results[model_name] = {"RMSE": rmse, "R^2": r2}
+    
+    # Store predictions in a DataFrame with Station info
+    preds_df = pd.DataFrame({
+        "Station": stations_test.values,
+        "Vehicle": vehicles_test.values,
+        "TrueDays": y_test.values,
+        "PredDays": y_pred
+    })
+    predictions_dict[model_name] = preds_df
+
+results_df = pd.DataFrame(results).T
+print("Model Comparison (RMSE, R^2):\n", results_df, "\n")
+
+# Example interpret: if RMSE ~300 and R^2 ~0.3, we have fairly large errors
+# with ~30% of variance explained. Possibly not great for scheduling decisions
+# and might require better data or time-card timestamps.
+
+# ---------------------------
+#   D) PULL MAX (BOTTLENECK) STATION TIME PER VEHICLE
+# ---------------------------
 # Suppose each station is parallel, and total build time = maximum station time
 # among all stations for that vehicle. We'll do this for one chosen model
 # (e.g., RandomForest).
