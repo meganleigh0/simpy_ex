@@ -1,125 +1,91 @@
-# --------------------------------------------------
-# All-in-one Python code for:
-# 1. Reading data with columns ["VEHICLE", "COMPLETION_DATE"]
-# 2. Preprocessing and grouping by month
-# 3. Plotting monthly production counts (vehicles completed per month)
-# 4. Time series forecasting using Prophet
-# 5. Splitting data for model evaluation
-# 6. Computing forecast metrics
-# --------------------------------------------------
-
 import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-from prophet import Prophet
-from sklearn.metrics import mean_squared_error, mean_absolute_error
+import datetime
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, r2_score
 
-# ------------------------
-# 1. Read and preprocess data
-# ------------------------
-# Replace 'your_data.csv' with the actual path to your dataset
-df = pd.read_csv('your_data.csv')  
+# 1. Load data
+df = pd.read_csv("plant_data.csv")
 
-# Convert COMPLETION_DATE to datetime
-df['COMPLETION_DATE'] = pd.to_datetime(df['COMPLETION_DATE'])
-
-# ------------------------
-# 2. Group by month and count vehicles
-# ------------------------
-# Group by month (start of each month) to get monthly totals
-df_monthly = (
-    df.groupby(pd.Grouper(key='COMPLETION_DATE', freq='MS'))
-      .size()
-      .reset_index(name='count')
+# 2. Summarize or pivot by vehicle
+pivot_df = (
+    df.groupby(['VEHICLE','VARIANT','SECTION'], as_index=False)
+      .agg({'NUM_DAYS_SPENT':'sum'})
+    .pivot_table(index=['VEHICLE','VARIANT'],
+                 columns='SECTION',
+                 values='NUM_DAYS_SPENT',
+                 fill_value=0)
+    .reset_index()
 )
 
-# ------------------------
-# 3. Plot monthly production counts
-# ------------------------
-plt.figure(figsize=(10, 5))
-plt.plot(df_monthly['COMPLETION_DATE'], df_monthly['count'], marker='o')
-plt.title('Monthly Vehicle Completion Counts')
-plt.xlabel('Month')
-plt.ylabel('Number of Vehicles Completed')
-plt.grid(True)
-plt.show()
+pivot_df.columns.name = None
+pivot_df.rename(columns={'HP1': 'HP1_time',
+                         'TP1': 'TP1_time',
+                         'HP3': 'HP3_time',
+                         'TP3': 'TP3_time',
+                         'V': 'V_time'},
+                inplace=True)
 
-# Let's also print the top 5 months with highest outputs
-top_months = df_monthly.nlargest(5, 'count')
-print("Top 5 months with highest completion counts:")
-print(top_months)
+pivot_df['total_time'] = pivot_df[['HP1_time','TP1_time','HP3_time','TP3_time','V_time']].sum(axis=1)
 
-# ------------------------
-# 4. Prepare data for Prophet
-# ------------------------
-# Prophet expects 'ds' and 'y' as column names
-df_monthly_prophet = df_monthly.rename(columns={'COMPLETION_DATE': 'ds', 'count': 'y'})
+# 3. Separate completed vs. incomplete
+completed_vehicles_df = pivot_df[
+    (pivot_df['HP1_time']>0)&
+    (pivot_df['TP1_time']>0)&
+    (pivot_df['HP3_time']>0)&
+    (pivot_df['TP3_time']>0)&
+    (pivot_df['V_time']>0)
+].copy()
 
-# ------------------------
-# 5. Split data into train/test for evaluation
-# ------------------------
-# For simplicity, let's take the last 3 months as the test set
-split_index = len(df_monthly_prophet) - 3
-train_data = df_monthly_prophet.iloc[:split_index]
-test_data = df_monthly_prophet.iloc[split_index:].copy()
+incomplete_df = pivot_df[~pivot_df.index.isin(completed_vehicles_df.index)].copy()
 
-# ------------------------
-# 6. Build and fit the Prophet model
-# ------------------------
-model = Prophet(seasonality_mode='multiplicative',
-                yearly_seasonality=True,
-                weekly_seasonality=False,
-                daily_seasonality=False)
-model.fit(train_data)
+# 4. Train a simple model on completed vehicles
+completed_vehicles_df['VARIANT_encoded'] = completed_vehicles_df['VARIANT'].astype('category').cat.codes
+X = completed_vehicles_df[['VARIANT_encoded','HP1_time','TP1_time','HP3_time','TP3_time','V_time']]
+y = completed_vehicles_df['total_time']
 
-# ------------------------
-# 7. Forecast on the test period
-# ------------------------
-# We'll create a future dataframe that covers the test period 
-# (and possibly further if we want to see beyond the test window)
-future_dates = model.make_future_dataframe(
-    periods=3,  # 3 months beyond the training set
-    freq='MS'   # monthly start
-)
-forecast = model.predict(future_dates)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+model = RandomForestRegressor(n_estimators=100, random_state=42)
+model.fit(X_train, y_train)
+y_pred = model.predict(X_test)
+print("MAE:", mean_absolute_error(y_test, y_pred))
+print("R2 Score:", r2_score(y_test, y_pred))
 
-# Extract only the rows corresponding to the test set for evaluation
-test_forecast = forecast[forecast['ds'].isin(test_data['ds'])].copy()
+# 5. Predict for incomplete vehicles
+incomplete_df['VARIANT_encoded'] = incomplete_df['VARIANT'].astype('category').cat.codes
+incomplete_df['spent_so_far'] = incomplete_df[['HP1_time','TP1_time','HP3_time','TP3_time','V_time']].sum(axis=1)
+X_incomplete = incomplete_df[['VARIANT_encoded','HP1_time','TP1_time','HP3_time','TP3_time','V_time']]
 
-# ------------------------
-# 8. Evaluation on the test set
-# ------------------------
-# Merge actual values with forecast
-evaluation_df = pd.merge(
-    test_data[['ds', 'y']],
-    test_forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']],
-    on='ds',
-    how='left'
+incomplete_df['predicted_total_time'] = model.predict(X_incomplete)
+incomplete_df['remaining_time'] = incomplete_df['predicted_total_time'] - incomplete_df['spent_so_far']
+incomplete_df['remaining_time'] = incomplete_df['remaining_time'].clip(lower=0)
+
+# For demonstration, assume "today" is a known date
+today = pd.to_datetime("2025-01-01")
+incomplete_df['estimated_completion_date'] = incomplete_df.apply(
+    lambda row: today + pd.Timedelta(days=row['remaining_time']),
+    axis=1
 )
 
-# Calculate metrics
-mse = mean_squared_error(evaluation_df['y'], evaluation_df['yhat'])
-rmse = np.sqrt(mse)
-mae = mean_absolute_error(evaluation_df['y'], evaluation_df['yhat'])
+# 6. Combine everything
+# Let's unify the 'completed_vehicles_df' and 'incomplete_df' with an 'estimated_completion_date'
 
-print("\nEvaluation on Test Set:")
-print("-----------------------")
-print(f"Test MSE:  {mse:.2f}")
-print(f"Test RMSE: {rmse:.2f}")
-print(f"Test MAE:  {mae:.2f}")
+# For completed vehicles, assume their actual finishing date = some known date column
+# If you only have total time, you might not have actual finish dates. As a placeholder:
+# We'll just define them as finished on some earlier day.
+completed_vehicles_df['estimated_completion_date'] = today
 
-print("\nTest Data vs. Forecast:")
-print(evaluation_df)
+full_df = pd.concat([completed_vehicles_df, incomplete_df], ignore_index=True)
 
-# ------------------------
-# 9. Plot the forecast for entire dataset (including future)
-# ------------------------
-fig1 = model.plot(forecast)
-plt.title("Prophet Forecast (Training + Test + Future)")
-plt.xlabel("Month")
-plt.ylabel("Vehicles Completed")
-plt.show()
+# 7. Group by month, variant for next 3 months
+full_df['completion_month'] = full_df['estimated_completion_date'].dt.to_period('M')
 
-# If you want an extended forecast beyond just the test set,
-# you can specify a larger `periods` above, e.g. periods=6 or 12
-# to forecast 6 or 12 months into the future.
+schedule_summary = (
+    full_df.groupby(['completion_month','VARIANT'])
+    .agg(Qty=('VEHICLE','count'))
+    .reset_index()
+    .sort_values(['completion_month','VARIANT'])
+)
+
+# Print or save schedule
+print(schedule_summary)
