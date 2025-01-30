@@ -1,36 +1,55 @@
-Here’s a professional and concise email you could send:
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
 
-Subject: Follow-Up: AI Solution for Contract and Compliance Workflows
+from sklearn.metrics import confusion_matrix, classification_report, roc_curve, auc
+from sklearn.pipeline import Pipeline
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
 
-Hi [Director’s Name],
+# Assume you've already done train_test_split and have X_train, X_test, y_train, y_test
 
-I wanted to follow up on our conversation about the potential for using AI, such as a large language model or chatbot, to help streamline contract and compliance workflows. After reflecting on what we discussed, I’ve put together some thoughts on what could be possible and how we might approach it.
+# 1. Build the pipeline with your best params
+final_pipeline = Pipeline([
+    ('tfidf', TfidfVectorizer(max_df=0.8, ngram_range=(1,2))),
+    ('clf', LogisticRegression(C=10, solver='liblinear'))
+])
 
-What’s Possible
-	1.	Automated Clause and Compliance Analysis: A tool could analyze contracts to flag specific standards or clauses, identify compliance gaps, and provide insights across multiple documents quickly.
-	2.	Draft Resolution Documents: By training the model on historical resolutions, it could generate drafts tailored to specific issues, saving time and ensuring consistency.
-	3.	Insights and Trend Analysis: The system could identify recurring compliance challenges or patterns in resolutions, helping us address systemic issues proactively.
+# 2. Train (fit) the final model
+final_pipeline.fit(X_train, y_train)
 
-How We Could Approach It
-	•	Data: We’d need access to historical contracts, resolution documents, and compliance reports. These would form the training data to teach the AI to recognize patterns and generate outputs.
-	•	Technology: A cloud-based platform (like Azure, AWS, or Google Cloud) with LLM integration would allow us to build and deploy the tool. If our company already has an LLM in place, we could fine-tune it on our specific data; otherwise, we could leverage APIs like OpenAI’s GPT.
-	•	Development: A phased approach could help us deliver results quickly:
-	•	Start with a simple chatbot that can answer basic questions (e.g., “What clauses reference X standard?”).
-	•	Expand to include resolution generation and trend analysis as we refine the tool.
+# 3. Predict on test set
+y_pred = final_pipeline.predict(X_test)
 
-What’s Next
+# 4. Print classification report and accuracy
+print("Final Model: LogisticRegression (Tuned)")
+print("Test Accuracy:", np.round(final_pipeline.score(X_test, y_test), 4))
+print("Classification Report:")
+print(classification_report(y_test, y_pred))
 
-If this sounds like a useful direction, I’d love to explore:
-	•	What specific challenges or tasks you’d want this tool to address first.
-	•	The availability of historical data we could use to train the model.
-	•	Whether securing resources (e.g., cloud platform funding or LLM access) would be possible.
+# 5. Confusion Matrix & Visualization
+cm = confusion_matrix(y_test, y_pred)
+labels = ['Class 0', 'Class 1']
+plt.figure(figsize=(6,4))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=labels, yticklabels=labels)
+plt.title("Confusion Matrix - Final Model")
+plt.ylabel("True Class")
+plt.xlabel("Predicted Class")
+plt.show()
 
-I believe we could deliver a functional prototype in a few months, starting with core functionality and building from there. Let me know if this aligns with your vision, or if you’d like to discuss further!
+# 6. ROC Curve (for binary classification)
+y_probs = final_pipeline.predict_proba(X_test)[:,1]  # Probability of class 1
+fpr, tpr, thresholds = roc_curve(y_test, y_probs)
+roc_auc = auc(fpr, tpr)
 
-Looking forward to your thoughts.
-
-Best regards,
-[Your Name]
-[Your Job Title]
-
-This email is professional, summarizes the discussion clearly, and positions you as proactive and thoughtful. Would you like me to adjust it further?
+plt.figure(figsize=(6,4))
+plt.plot(fpr, tpr, color='darkorange', label=f'ROC curve (AUC = {roc_auc:.2f})')
+plt.plot([0, 1], [0, 1], color='navy', linestyle='--')
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('Receiver Operating Characteristic - Final Model')
+plt.legend(loc="lower right")
+plt.show()
