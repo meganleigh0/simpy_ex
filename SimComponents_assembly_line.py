@@ -1,58 +1,59 @@
-import pandas as pd
-import plotly.express as px
+import plotly.graph_objects as go
 
-# ===== 1) Summarize CURRENT_DATA by variant =====
-# Count how many distinct VEHICLEs (or rows) exist per variant.
-current_counts = (
-    CURRENT_DATA
-    .groupby('VARIANT')['VEHICLE']
-    .nunique()  # or .count(), depending on your logic
-    .reset_index(name='count_current')
-)
+# Extract unique sections
+unique_sections = CURRENT_DATA['SECTION'].unique()
 
-# ===== 2) Convert RECORVER_SCHEDULE from *cumulative* to *monthly increments* =====
-df_schedule = RECORVER_SCHEDULE.copy()
+# Create figure
+fig = go.Figure()
 
-# Identify the month columns (excluding 'VARIANT')
-month_cols = [c for c in df_schedule.columns if c != 'VARIANT']
+# Add one scatter trace per SECTION
+for i, section in enumerate(unique_sections):
+    subset = CURRENT_DATA[CURRENT_DATA['SECTION'] == section]
+    
+    fig.add_trace(
+        go.Scatter(
+            x=subset['STATION'],
+            y=subset['NUMBER'],
+            mode='markers',
+            name=f"Section {section}",
+            # Only show the first section by default
+            visible=True if i == 0 else False
+        )
+    )
 
-# (Optional) Ensure month_cols are in chronological order, e.g. if columns are strings like 'Jan 2025', 'Feb 2025'...
-# month_cols = sorted(month_cols, key=lambda x: pd.to_datetime(x, format='%b %Y'))
+# Build dropdown buttons, one per SECTION
+buttons = []
+for i, section in enumerate(unique_sections):
+    # For each button, we turn on only the ith trace (and turn off the others).
+    visible_array = [False] * len(unique_sections)
+    visible_array[i] = True
+    
+    buttons.append(
+        dict(
+            label=f"Section {section}",
+            method="update",
+            args=[
+                {"visible": visible_array},
+                {"title": f"Current Data for Section {section}"}
+            ]
+        )
+    )
 
-# For each variant, transform each month’s *cumulative* number into that month’s *increment*
-for i, col in enumerate(month_cols):
-    if i == 0:
-        # The first column (e.g. January) stays as is, because there's no previous month
-        continue
-    else:
-        # Subtract the previous month’s cumulative count to get just the increment
-        df_schedule[col] = df_schedule[col] - df_schedule[month_cols[i - 1]]
-
-# ===== 3) Sum across all monthly increments to get each variant’s total annual schedule =====
-df_schedule['count_schedule'] = df_schedule[month_cols].sum(axis=1)
-
-# ===== 4) Merge current_counts with df_schedule =====
-compare_df = pd.merge(
-    current_counts,
-    df_schedule[['VARIANT', 'count_schedule']],  # we only need these two columns from df_schedule
-    on='VARIANT', 
-    how='outer'
-).fillna(0)
-
-# ===== 5) Plotly grouped bar chart comparing current vs. scheduled =====
-fig = px.bar(
-    compare_df,
-    x='VARIANT',
-    y=['count_current', 'count_schedule'],
-    barmode='group',
-    title='Current Production vs. Yearly Schedule (using monthly increments)'
-)
-
+# Add dropdown to figure
 fig.update_layout(
-    xaxis_title='Variant',
-    yaxis_title='Number of Vehicles',
-    legend_title='',
-    template='plotly_white'
+    updatemenus=[
+        dict(
+            active=0,
+            buttons=buttons,
+            x=0.0,
+            xanchor="left",
+            y=1.1,
+            yanchor="top"
+        )
+    ],
+    title=f"Current Data for Section {unique_sections[0]}",
+    xaxis_title="Station",
+    yaxis_title="Number"
 )
 
 fig.show()
