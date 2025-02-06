@@ -2,6 +2,7 @@ import pandas as pd
 import re
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.cluster import KMeans
+from fuzzywuzzy import fuzz, process
 
 # Load dataset
 df = pd.read_csv("your_dataset.csv")  # Replace with actual file path
@@ -9,7 +10,7 @@ df = pd.read_csv("your_dataset.csv")  # Replace with actual file path
 # Standardize column names
 df.columns = df.columns.str.lower().str.replace(" ", "_")
 
-# Function to clean text (removes special characters, extra spaces)
+# Function to clean text further
 def clean_text(text):
     if pd.isna(text) or text.strip() == "":
         return ""
@@ -18,19 +19,36 @@ def clean_text(text):
     text = re.sub(r'\s+', ' ', text)  # Replace multiple spaces with a single space
     return text
 
-# Apply cleaning to both 'symptom' and 'fmode' columns
+# Apply text cleaning
 df["symptom"] = df["symptom"].apply(clean_text)
 df["fmode"] = df["fmode"].apply(clean_text)
 
 # Ensure that if failure = 0, symptom should be empty
 df.loc[df["failure"] == 0, "symptom"] = ""
 
-# Check unique values after cleaning
-unique_symptoms = df["symptom"].value_counts()
-unique_fmodes = df["fmode"].value_counts()
+# Group similar failure modes and symptoms using fuzzy matching
+def match_similar_strings(text_series, threshold=85):
+    unique_texts = text_series.unique()
+    grouped_texts = {}
+    
+    for text in unique_texts:
+        best_match = process.extractOne(text, grouped_texts.keys(), scorer=fuzz.token_sort_ratio)
+        if best_match and best_match[1] >= threshold:
+            grouped_texts[best_match[0]].append(text)
+        else:
+            grouped_texts[text] = [text]
 
-print("Top unique symptoms:\n", unique_symptoms.head(20))
-print("Top unique failure modes:\n", unique_fmodes.head(20))
+    # Create mapping of similar texts to representative form
+    text_mapping = {text: representative for representative, matches in grouped_texts.items() for text in matches}
+    return text_mapping
+
+# Apply fuzzy matching to symptoms and failure modes
+symptom_mapping = match_similar_strings(df["symptom"])
+fmode_mapping = match_similar_strings(df["fmode"])
+
+# Replace with grouped values
+df["symptom"] = df["symptom"].map(symptom_mapping)
+df["fmode"] = df["fmode"].map(fmode_mapping)
 
 # Vectorize text using TF-IDF for clustering
 vectorizer = TfidfVectorizer()
@@ -45,13 +63,13 @@ kmeans_fmode = KMeans(n_clusters=num_clusters, random_state=42, n_init=10)
 df["symptom_cluster"] = kmeans_symptom.fit_predict(X_symptom)
 df["fmode_cluster"] = kmeans_fmode.fit_predict(X_fmode)
 
-# Analyze which failure modes are most linked to specific symptoms
+# Analyze failure correlations
 failure_analysis = df.groupby(["fmode_cluster", "symptom_cluster"])["failure"].sum().reset_index()
 
-# Save the cleaned dataset
-df.to_csv("cleaned_dataset.csv", index=False)
-print("Cleaned dataset saved as 'cleaned_dataset.csv'")
+# Save the refined dataset
+df.to_csv("refined_dataset.csv", index=False)
+print("Refined dataset saved as 'refined_dataset.csv'")
 
-# Display failure analysis results
+# Display failure mode and symptom analysis results
 import ace_tools as tools
-tools.display_dataframe_to_user(name="Failure Mode & Symptom Analysis", dataframe=failure_analysis)
+tools.display_dataframe_to_user(name="Refined Failure Mode & Symptom Analysis", dataframe=failure_analysis)
