@@ -1,59 +1,57 @@
 import pandas as pd
-import numpy as np
 import re
-import nltk
-from nltk.corpus import stopwords
-from nltk.tokenize import word_tokenize
-from nltk.stem import WordNetLemmatizer
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.cluster import KMeans
 
-# Ensure nltk resources are available
-nltk.download('punkt')
-nltk.download('stopwords')
-nltk.download('wordnet')
-
-# Load the dataset
+# Load dataset
 df = pd.read_csv("your_dataset.csv")  # Replace with actual file path
 
 # Standardize column names
 df.columns = df.columns.str.lower().str.replace(" ", "_")
 
-# Clean text function
+# Function to clean text (removes special characters, extra spaces)
 def clean_text(text):
-    if pd.isna(text):
+    if pd.isna(text) or text.strip() == "":
         return ""
-    text = text.lower()  # Lowercase
-    text = re.sub(r'[^a-z\s]', '', text)  # Remove special characters
-    tokens = word_tokenize(text)  # Tokenization
-    tokens = [word for word in tokens if word not in stopwords.words('english')]  # Remove stopwords
-    lemmatizer = WordNetLemmatizer()
-    tokens = [lemmatizer.lemmatize(word) for word in tokens]  # Lemmatization
-    return " ".join(tokens)
+    text = text.lower().strip()  # Convert to lowercase and remove extra spaces
+    text = re.sub(r'[^a-z0-9\s]', '', text)  # Remove special characters
+    text = re.sub(r'\s+', ' ', text)  # Replace multiple spaces with a single space
+    return text
 
-# Apply text cleaning
-df["fail_mode_and_symptoms"] = df["fail_mode_and_symptoms"].apply(clean_text)
+# Apply cleaning to both 'symptom' and 'fmode' columns
+df["symptom"] = df["symptom"].apply(clean_text)
+df["fmode"] = df["fmode"].apply(clean_text)
 
-# If failure = 0, ensure symptoms are empty
-df.loc[df["failure"] == 0, "fail_mode_and_symptoms"] = ""
+# Ensure that if failure = 0, symptom should be empty
+df.loc[df["failure"] == 0, "symptom"] = ""
 
-# Identify unique fail modes and symptoms
-unique_symptoms = df["fail_mode_and_symptoms"].value_counts()
+# Check unique values after cleaning
+unique_symptoms = df["symptom"].value_counts()
+unique_fmodes = df["fmode"].value_counts()
+
 print("Top unique symptoms:\n", unique_symptoms.head(20))
+print("Top unique failure modes:\n", unique_fmodes.head(20))
 
-# Convert text into numerical features using TF-IDF
+# Vectorize text using TF-IDF for clustering
 vectorizer = TfidfVectorizer()
-X = vectorizer.fit_transform(df["fail_mode_and_symptoms"])
+X_symptom = vectorizer.fit_transform(df["symptom"])
+X_fmode = vectorizer.fit_transform(df["fmode"])
 
-# Cluster similar symptoms
+# Cluster similar symptoms and failure modes
 num_clusters = 5  # Adjust based on dataset size
-kmeans = KMeans(n_clusters=num_clusters, random_state=42, n_init=10)
-df["symptom_cluster"] = kmeans.fit_predict(X)
+kmeans_symptom = KMeans(n_clusters=num_clusters, random_state=42, n_init=10)
+kmeans_fmode = KMeans(n_clusters=num_clusters, random_state=42, n_init=10)
 
-# Analyze which symptoms most often result in failure
-failure_symptom_counts = df[df["failure"] == 1]["symptom_cluster"].value_counts()
-print("Clusters associated with failures:\n", failure_symptom_counts)
+df["symptom_cluster"] = kmeans_symptom.fit_predict(X_symptom)
+df["fmode_cluster"] = kmeans_fmode.fit_predict(X_fmode)
+
+# Analyze which failure modes are most linked to specific symptoms
+failure_analysis = df.groupby(["fmode_cluster", "symptom_cluster"])["failure"].sum().reset_index()
 
 # Save the cleaned dataset
 df.to_csv("cleaned_dataset.csv", index=False)
 print("Cleaned dataset saved as 'cleaned_dataset.csv'")
+
+# Display failure analysis results
+import ace_tools as tools
+tools.display_dataframe_to_user(name="Failure Mode & Symptom Analysis", dataframe=failure_analysis)
