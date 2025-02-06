@@ -1,69 +1,59 @@
 import pandas as pd
-import plotly.express as px
-from datetime import date
+import numpy as np
+import re
+import nltk
+from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize
+from nltk.stem import WordNetLemmatizer
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.cluster import KMeans
 
-# ------------------------------------------------------------------
-# 1) Simulate / Load Your Main Data Frame
-# ------------------------------------------------------------------
-# In practice, replace this with your real loading logic, e.g.:
-# df = pd.read_csv("floor_data.csv") or a database query
-data = {
-    'vehicle': ['VIN100','VIN101','VIN102','VIN103','VIN104','VIN105','VIN106'],
-    'section': ['Paint','Paint','Assembly','Assembly','Weld','Weld','Weld'],
-    'station': ['Station A','Station A','Station B','Station C','Station D','Station D','Station D'],
-    'date': [
-        '2025-01-31','2025-01-31','2025-01-31',
-        '2025-01-31','2025-01-31','2025-01-31','2025-01-31'
-    ],
-    'variant': ['Program D','Program D','Program A','Program C','Program D','Program A','Program B'],
-    'number':  [ 32,         33,         11,         7,         35,         19,         4         ]
-}
-df = pd.DataFrame(data)
+# Ensure nltk resources are available
+nltk.download('punkt')
+nltk.download('stopwords')
+nltk.download('wordnet')
 
-# Convert 'date' to an actual date type for filtering
-df['date'] = pd.to_datetime(df['date']).dt.date
+# Load the dataset
+df = pd.read_csv("your_dataset.csv")  # Replace with actual file path
 
-# ------------------------------------------------------------------
-# 2) Filter to "What's on the floor TODAY"
-# ------------------------------------------------------------------
-today = date.today()  # Real-time
-df_today = df[df['date'] == today].copy()
+# Standardize column names
+df.columns = df.columns.str.lower().str.replace(" ", "_")
 
-# ------------------------------------------------------------------
-# 3) Compute Unique Vehicle Counts per (Section, Station, Variant)
-# ------------------------------------------------------------------
-# If you want the count of unique vehicles in each station/section/variant:
-grouped = (
-    df_today
-    .groupby(['section', 'station', 'variant'])['vehicle']
-    .nunique()  # number of distinct vehicles
-    .reset_index(name='unique_vehicle_count')
-)
+# Clean text function
+def clean_text(text):
+    if pd.isna(text):
+        return ""
+    text = text.lower()  # Lowercase
+    text = re.sub(r'[^a-z\s]', '', text)  # Remove special characters
+    tokens = word_tokenize(text)  # Tokenization
+    tokens = [word for word in tokens if word not in stopwords.words('english')]  # Remove stopwords
+    lemmatizer = WordNetLemmatizer()
+    tokens = [lemmatizer.lemmatize(word) for word in tokens]  # Lemmatization
+    return " ".join(tokens)
 
-# ------------------------------------------------------------------
-# 4) Plotly Visualization
-#    - We facet by SECTION so each "section" is a separate panel.
-#    - X-axis is STATION, color is VARIANT, and the height is the count of unique vehicles.
-# ------------------------------------------------------------------
-fig = px.bar(
-    grouped,
-    x='station',
-    y='unique_vehicle_count',
-    color='variant',
-    facet_col='section',            # one subplot per section
-    barmode='group',                # group bars side-by-side
-    text='unique_vehicle_count',    # show counts on bars
-    title=f"Unique Variant Counts per Station/Section for {today.isoformat()}"
-)
+# Apply text cleaning
+df["fail_mode_and_symptoms"] = df["fail_mode_and_symptoms"].apply(clean_text)
 
-# Optional styling tweaks:
-fig.update_layout(
-    font=dict(size=12),
-    paper_bgcolor='white',
-    plot_bgcolor='white',
-    height=600,
-    legend_title_text='Variant'
-)
-fig.update_xaxes(title="Station")
-fig.update_yaxes(title="Count of Unique Vehicles")
-fig.show()
+# If failure = 0, ensure symptoms are empty
+df.loc[df["failure"] == 0, "fail_mode_and_symptoms"] = ""
+
+# Identify unique fail modes and symptoms
+unique_symptoms = df["fail_mode_and_symptoms"].value_counts()
+print("Top unique symptoms:\n", unique_symptoms.head(20))
+
+# Convert text into numerical features using TF-IDF
+vectorizer = TfidfVectorizer()
+X = vectorizer.fit_transform(df["fail_mode_and_symptoms"])
+
+# Cluster similar symptoms
+num_clusters = 5  # Adjust based on dataset size
+kmeans = KMeans(n_clusters=num_clusters, random_state=42, n_init=10)
+df["symptom_cluster"] = kmeans.fit_predict(X)
+
+# Analyze which symptoms most often result in failure
+failure_symptom_counts = df[df["failure"] == 1]["symptom_cluster"].value_counts()
+print("Clusters associated with failures:\n", failure_symptom_counts)
+
+# Save the cleaned dataset
+df.to_csv("cleaned_dataset.csv", index=False)
+print("Cleaned dataset saved as 'cleaned_dataset.csv'")
