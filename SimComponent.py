@@ -1,104 +1,125 @@
 import pandas as pd
 import plotly.express as px
 
+def analyze_bom_data(df_ebom, df_mbom_tc, df_mbom_oracle):
+    """
+    Analyze EBOM vs. MBOM data from different sources (EBOM, TeamCenter, Oracle).
+    
+    Parameters
+    ----------
+    df_ebom : pd.DataFrame
+        DataFrame containing EBOM data with at least a 'PART_NUMBER' column.
+    df_mbom_tc : pd.DataFrame
+        DataFrame containing TeamCenter MBOM data with at least a 'PART_NUMBER' column.
+    df_mbom_oracle : pd.DataFrame
+        DataFrame containing Oracle MBOM data with at least a 'PART_NUMBER' column.
+
+    Returns
+    -------
+    combined_df : pd.DataFrame
+        A DataFrame with all unique part numbers (from all sources) and boolean columns
+        indicating presence in EBOM, TeamCenter MBOM, and Oracle MBOM. Optionally also
+        has columns for BASE_PART and SUFFIX (if underscore format is used).
+    summary : dict
+        Dictionary of key metrics (unique counts in each source, intersection sizes, etc.).
+    fig : plotly.graph_objects.Figure or plotly.express.Figure
+        A Plotly bar chart illustrating selected summary metrics.
+    """
+
+    # -----------------------------------------------------------------------------
+    # 1. Gather Unique Part Numbers from Each Source
+    # -----------------------------------------------------------------------------
+    ebom_parts = set(df_ebom["PART_NUMBER"].unique())
+    tc_parts = set(df_mbom_tc["PART_NUMBER"].unique())
+    oracle_parts = set(df_mbom_oracle["PART_NUMBER"].unique())
+
+    # -----------------------------------------------------------------------------
+    # 2. Create Combined DataFrame of All Unique Parts
+    # -----------------------------------------------------------------------------
+    all_parts = ebom_parts.union(tc_parts).union(oracle_parts)
+    combined_df = pd.DataFrame({"PART_NUMBER": list(all_parts)})
+
+    # Add columns for presence in each source
+    combined_df["IN_EBOM"] = combined_df["PART_NUMBER"].isin(ebom_parts)
+    combined_df["IN_MBom_TC"] = combined_df["PART_NUMBER"].isin(tc_parts)
+    combined_df["IN_MBom_Oracle"] = combined_df["PART_NUMBER"].isin(oracle_parts)
+
+    # -----------------------------------------------------------------------------
+    # 3. (Optional) Parse Base & Suffix
+    # -----------------------------------------------------------------------------
+    def split_part_suffix(part):
+        if "_" in part:
+            base, suffix = part.rsplit("_", 1)
+            return base, suffix
+        return part, None
+
+    combined_df["BASE_PART"], combined_df["SUFFIX"] = zip(
+        *combined_df["PART_NUMBER"].apply(split_part_suffix)
+    )
+
+    # -----------------------------------------------------------------------------
+    # 4. Compute Summary Metrics
+    # -----------------------------------------------------------------------------
+    # Individual counts
+    num_ebom = len(ebom_parts)
+    num_mbom_tc = len(tc_parts)
+    num_mbom_oracle = len(oracle_parts)
+    num_all_unique = len(all_parts)
+
+    # Intersections
+    intersect_ebom_tc = ebom_parts.intersection(tc_parts)
+    intersect_ebom_oracle = ebom_parts.intersection(oracle_parts)
+    intersect_tc_oracle = tc_parts.intersection(oracle_parts)
+    intersect_all_three = ebom_parts.intersection(tc_parts, oracle_parts)
+
+    summary = {
+        "num_ebom": num_ebom,
+        "num_mbom_tc": num_mbom_tc,
+        "num_mbom_oracle": num_mbom_oracle,
+        "num_all_unique": num_all_unique,
+        "intersect_ebom_tc": len(intersect_ebom_tc),
+        "intersect_ebom_oracle": len(intersect_ebom_oracle),
+        "intersect_tc_oracle": len(intersect_tc_oracle),
+        "intersect_all_three": len(intersect_all_three),
+    }
+
+    # -----------------------------------------------------------------------------
+    # 5. Create a Visualization (Bar Chart of Unique Part Counts)
+    # -----------------------------------------------------------------------------
+    plot_data = pd.DataFrame({
+        "Source": ["EBOM", "MBOM_TC", "MBOM_Oracle", "All_Combined"],
+        "Count": [
+            summary["num_ebom"],
+            summary["num_mbom_tc"],
+            summary["num_mbom_oracle"],
+            summary["num_all_unique"]
+        ]
+    })
+
+    fig = px.bar(
+        plot_data,
+        x="Source", 
+        y="Count", 
+        title="Unique Part Counts by Source",
+        text="Count",
+        color="Source"
+    )
+    fig.update_layout(xaxis_title="Source", yaxis_title="Count of Unique Parts")
+    fig.update_traces(textposition='outside')
+
+    return combined_df, summary, fig
+
+
 # -----------------------------------------------------------------------------
-# 1. Get Unique Parts from each DataFrame
+# Example usage:
 # -----------------------------------------------------------------------------
-# Assuming your DataFrames are:
-# LATEST_RELEASE_TC (EBOM)
-# LATEST_RELEASE_TC_MBOM (TeamCenter MBOM)
-# oracle_df (Oracle MBOM)
-# and each has a column "PART_NUMBER"
 
-ebom_unique_parts = LATEST_RELEASE_TC["PART_NUMBER"].unique()
-mbom_tc_unique_parts = LATEST_RELEASE_TC_MBOM["PART_NUMBER"].unique()
-mbom_oracle_unique_parts = oracle_df["PART_NUMBER"].unique()
+# combined_df, metrics_summary, figure = analyze_bom_data(
+#     LATEST_RELEASE_TC,        # EBOM dataframe
+#     LATEST_RELEASE_TC_MBOM,   # TeamCenter MBOM dataframe
+#     oracle_df                 # Oracle MBOM dataframe
+# )
 
-num_ebom = len(ebom_unique_parts)
-num_mbom_tc = len(mbom_tc_unique_parts)
-num_mbom_oracle = len(mbom_oracle_unique_parts)
-
-# For combined total unique parts across *all* dataframes:
-all_unique_parts = set(ebom_unique_parts).union(
-    set(mbom_tc_unique_parts), 
-    set(mbom_oracle_unique_parts)
-)
-num_all_unique = len(all_unique_parts)
-
-# -----------------------------------------------------------------------------
-# 2. Parse Suffixes (Optional)
-# -----------------------------------------------------------------------------
-# If you want to split PART_NUMBER like "1234_p" into "1234" and "p", you can:
-def split_part_suffix(part_number):
-    # Check if there's an underscore in the part_number
-    if '_' in part_number:
-        base, suffix = part_number.rsplit('_', 1)
-        return base, suffix
-    else:
-        # No underscore, treat the entire part as base, no suffix
-        return part_number, None
-
-# Create new columns in each dataframe
-LATEST_RELEASE_TC['BASE_PART'], LATEST_RELEASE_TC['SUFFIX'] = zip(*LATEST_RELEASE_TC['PART_NUMBER'].apply(split_part_suffix))
-LATEST_RELEASE_TC_MBOM['BASE_PART'], LATEST_RELEASE_TC_MBOM['SUFFIX'] = zip(*LATEST_RELEASE_TC_MBOM['PART_NUMBER'].apply(split_part_suffix))
-oracle_df['BASE_PART'], oracle_df['SUFFIX'] = zip(*oracle_df['PART_NUMBER'].apply(split_part_suffix))
-
-# -----------------------------------------------------------------------------
-# 3. Print Metrics / Summary
-# -----------------------------------------------------------------------------
-print("Number of unique EBOM parts:", num_ebom)
-print("Number of unique MBOM (TeamCenter) parts:", num_mbom_tc)
-print("Number of unique MBOM (Oracle) parts:", num_mbom_oracle)
-print("Total unique parts across all sources:", num_all_unique)
-
-# Optionally compute intersections if needed:
-ebom_set = set(ebom_unique_parts)
-mbom_tc_set = set(mbom_tc_unique_parts)
-mbom_oracle_set = set(mbom_oracle_unique_parts)
-
-common_ebom_mbom_tc = ebom_set.intersection(mbom_tc_set)
-common_ebom_mbom_oracle = ebom_set.intersection(mbom_oracle_set)
-common_mbom_tc_oracle = mbom_tc_set.intersection(mbom_oracle_set)
-common_all_three = ebom_set.intersection(mbom_tc_set, mbom_oracle_set)
-
-print("Intersection EBOM & MBOM (TeamCenter):", len(common_ebom_mbom_tc))
-print("Intersection EBOM & MBOM (Oracle):", len(common_ebom_mbom_oracle))
-print("Intersection MBOM (TeamCenter) & MBOM (Oracle):", len(common_mbom_tc_oracle))
-print("Intersection across all three:", len(common_all_three))
-
-# -----------------------------------------------------------------------------
-# 4. Create a Plotly Visualization
-# -----------------------------------------------------------------------------
-# A simple bar chart of the counts:
-data_to_plot = pd.DataFrame({
-    'Source': [
-        'EBOM', 
-        'MBOM_TC', 
-        'MBOM_Oracle',
-        'All_Combined'
-    ],
-    'Unique_Count': [
-        num_ebom,
-        num_mbom_tc,
-        num_mbom_oracle,
-        num_all_unique
-    ]
-})
-
-fig = px.bar(
-    data_to_plot,
-    x='Source',
-    y='Unique_Count',
-    title='Unique Part Counts from EBOM, MBOM (TC), and MBOM (Oracle)',
-    text='Unique_Count'
-)
-
-# Improve layout (optional)
-fig.update_layout(
-    xaxis_title='Source',
-    yaxis_title='Count of Unique Parts',
-    uniformtext_minsize=8,
-    uniformtext_mode='hide'
-)
-
-fig.show()
+# print(metrics_summary)
+# figure.show()
+# combined_df.head()
