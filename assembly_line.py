@@ -1,55 +1,51 @@
 import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-
-from sklearn.metrics import confusion_matrix, classification_report, roc_curve, auc
-from sklearn.pipeline import Pipeline
+from sklearn.model_selection import train_test_split
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.pipeline import Pipeline
 from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
 
-# Assume you've already done train_test_split and have X_train, X_test, y_train, y_test
+from sklearn.metrics import accuracy_score, classification_report
 
-# 1. Build the pipeline with your best params
-final_pipeline = Pipeline([
-    ('tfidf', TfidfVectorizer(max_df=0.8, ngram_range=(1,2))),
-    ('clf', LogisticRegression(C=10, solver='liblinear'))
-])
+# 1. Load your data
+df = pd.read_csv("your_final_data.csv")  # has columns: [report_text, final_symptom, ...]
 
-# 2. Train (fit) the final model
-final_pipeline.fit(X_train, y_train)
+# 2. Split into train/test
+X = df['report_text']
+y = df['final_symptom']
 
-# 3. Predict on test set
-y_pred = final_pipeline.predict(X_test)
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
 
-# 4. Print classification report and accuracy
-print("Final Model: LogisticRegression (Tuned)")
-print("Test Accuracy:", np.round(final_pipeline.score(X_test, y_test), 4))
-print("Classification Report:")
-print(classification_report(y_test, y_pred))
+# 3. Define the models you want to compare
+models = [
+    ("Logistic Regression", LogisticRegression(max_iter=1000, solver='lbfgs')),
+    ("Random Forest",       RandomForestClassifier(n_estimators=100, random_state=42)),
+    ("SVM",                 SVC(kernel='linear', probability=True, random_state=42))
+]
 
-# 5. Confusion Matrix & Visualization
-cm = confusion_matrix(y_test, y_pred)
-labels = ['Class 0', 'Class 1']
-plt.figure(figsize=(6,4))
-sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=labels, yticklabels=labels)
-plt.title("Confusion Matrix - Final Model")
-plt.ylabel("True Class")
-plt.xlabel("Predicted Class")
-plt.show()
-
-# 6. ROC Curve (for binary classification)
-y_probs = final_pipeline.predict_proba(X_test)[:,1]  # Probability of class 1
-fpr, tpr, thresholds = roc_curve(y_test, y_probs)
-roc_auc = auc(fpr, tpr)
-
-plt.figure(figsize=(6,4))
-plt.plot(fpr, tpr, color='darkorange', label=f'ROC curve (AUC = {roc_auc:.2f})')
-plt.plot([0, 1], [0, 1], color='navy', linestyle='--')
-plt.xlim([0.0, 1.0])
-plt.ylim([0.0, 1.05])
-plt.xlabel('False Positive Rate')
-plt.ylabel('True Positive Rate')
-plt.title('Receiver Operating Characteristic - Final Model')
-plt.legend(loc="lower right")
-plt.show()
+# 4. Loop over each model, train, and evaluate
+for model_name, model in models:
+    print("="*60)
+    print(f"Training model: {model_name}")
+    
+    # Create pipeline: TF-IDF => model
+    pipeline = Pipeline([
+        ('tfidf', TfidfVectorizer(ngram_range=(1,2), min_df=2)),
+        ('clf', model)
+    ])
+    
+    # Train
+    pipeline.fit(X_train, y_train)
+    
+    # Predict
+    y_pred = pipeline.predict(X_test)
+    
+    # Evaluate
+    accuracy = accuracy_score(y_test, y_pred)
+    print(f"Accuracy: {accuracy:.3f}")
+    
+    print("Classification Report:")
+    print(classification_report(y_test, y_pred))
