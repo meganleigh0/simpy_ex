@@ -1,167 +1,153 @@
 import pandas as pd
+import numpy as np
 import re
+
+from sklearn.model_selection import train_test_split, RandomizedSearchCV
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.ensemble import RandomForestClassifier
+
+from sklearn.metrics import classification_report, accuracy_score
+from sklearn.metrics import roc_curve, auc, roc_auc_score
+from sklearn.preprocessing import LabelBinarizer
+
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score
+##############################################################################
+# 1. Load Data
+##############################################################################
+df = pd.read_csv("your_final_data.csv")
+# We assume the DataFrame has columns: ["report_text", "final_symptom", "name"]
 
-# 1. Load data
-df = pd.read_csv("your_data.csv")
-print("Initial data sample:")
-print(df.head())
+X = df[["report_text", "name"]]
+y = df["final_symptom"]
 
-# If your columns are: did, report_text, symptom, pname
-# we'll focus on 'symptom' for cleaning and clustering.
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, 
+    test_size=0.2, 
+    random_state=42, 
+    stratify=y
+)
 
-############################################################################
-# 2. Basic Normalization
-############################################################################
+##############################################################################
+# 2. Define ColumnTransformer for text columns
+##############################################################################
+text_transformer = TfidfVectorizer(ngram_range=(1,2), min_df=2)
+name_transformer = TfidfVectorizer(ngram_range=(1,2), min_df=1)
 
-def basic_normalization(text):
-    if pd.isna(text):
-        return ""
-    text = text.lower()
-    text = re.sub(r"[^\w\s]", "", text)
-    text = text.strip()
-    return text
+column_transform = ColumnTransformer(
+    [
+        ("text_tfidf", text_transformer, "report_text"),
+        ("name_tfidf", name_transformer, "name")
+    ],
+    remainder="drop"
+)
 
-df['norm_symptom'] = df['symptom'].apply(basic_normalization)
+##############################################################################
+# 3. Define a Pipeline with RandomForest
+##############################################################################
+pipeline = Pipeline([
+    ("features", column_transform),
+    ("clf", RandomForestClassifier(random_state=42))
+])
 
-# Check how many unique symptoms after basic normalization
-print("Unique symptoms (just normalized):", df['norm_symptom'].nunique())
+##############################################################################
+# 4. Hyperparameter Tuning with RandomizedSearchCV
+##############################################################################
+# Define the parameter distributions we want to sample from:
+param_distributions = {
+    "clf__n_estimators": [100, 200, 300, 500],
+    "clf__max_depth": [None, 10, 20, 30, 50],
+    "clf__min_samples_split": [2, 5, 10],
+    "clf__min_samples_leaf": [1, 2, 4],
+    "clf__bootstrap": [True, False]
+}
 
-############################################################################
-# 3. TF-IDF Vectorization
-############################################################################
-# We'll create a TF-IDF matrix from the 'norm_symptom' column.
+# RandomizedSearchCV allows specifying n_iter to control how many random combos we try
+search = RandomizedSearchCV(
+    pipeline,
+    param_distributions=param_distributions,
+    n_iter=20,               # Try 20 different parameter combinations
+    cv=5,                    # 5-fold cross-validation
+    scoring="accuracy",      # You can also use "f1_macro" if you prefer
+    n_jobs=-1,               # Use all available cores
+    random_state=42,
+    verbose=1
+)
 
-vectorizer = TfidfVectorizer(ngram_range=(1,2), min_df=2)  
-# ngram_range=(1,2) helps capture bigrams
-# min_df=2 ignores very rare terms that appear only once.
+search.fit(X_train, y_train)
 
-X = vectorizer.fit_transform(df['norm_symptom'])
+print(f"Best params found: {search.best_params_}")
+print(f"Best CV accuracy: {search.best_score_:.3f}")
 
-print("TF-IDF matrix shape:", X.shape)
-# Example: (2640, ???) depending on how many terms survive min_df
+# Retrieve the best pipeline
+best_pipeline = search.best_estimator_
 
-############################################################################
-# 4. Find a Good Number of Clusters (Optional)
-############################################################################
-# If you don't know how many clusters to use, you can do a quick 
-# silhouette-based or elbow method approach. We'll do a simple silhouette sample.
+##############################################################################
+# 5. Evaluate on Test Set
+##############################################################################
+y_pred = best_pipeline.predict(X_test)
+test_accuracy = accuracy_score(y_test, y_pred)
+print(f"Test Accuracy: {test_accuracy:.3f}")
 
-possible_ks = [5, 10, 15, 20, 30, 40]  # tweak based on data size
-scores = []
+print("Classification Report:")
+print(classification_report(y_test, y_pred, zero_division=0))
 
-for k in possible_ks:
-    kmeans_temp = KMeans(n_clusters=k, random_state=42)
-    labels_temp = kmeans_temp.fit_predict(X)
-    score_temp = silhouette_score(X, labels_temp)
-    scores.append(score_temp)
-    print(f"K={k}, silhouette={score_temp:.3f}")
+##############################################################################
+# 6. Multi-class ROC–AUC Curve
+##############################################################################
+# For multi-class, we compute one-vs-rest curves.
+#  - First, get the probability scores
+#  - Binarize y_test
+#  - For each class, compute fpr/tpr, then AUC
+##############################################################################
 
-# Plot silhouette to help decide
-plt.plot(possible_ks, scores, marker='o')
-plt.title("Silhouette Scores for Different K")
-plt.xlabel("Number of Clusters (K)")
-plt.ylabel("Silhouette Score")
+# 6a. Predict probabilities on test
+y_score = best_pipeline.predict_proba(X_test)
+
+# 6b. Binarize the labels for one-vs-rest ROC
+lb = LabelBinarizer()
+lb.fit(y_train)  # Learn classes from train set
+y_test_bin = lb.transform(y_test)  # shape: (num_samples, num_classes)
+
+n_classes = y_test_bin.shape[1]
+class_names = lb.classes_
+
+# 6c. Plot the ROC curve for each class
+plt.figure(figsize=(8, 6))
+
+fpr = dict()
+tpr = dict()
+roc_auc = dict()
+
+for i in range(n_classes):
+    fpr[i], tpr[i], _ = roc_curve(y_test_bin[:, i], y_score[:, i])
+    roc_auc[i] = auc(fpr[i], tpr[i])
+    plt.plot(fpr[i], tpr[i], lw=1.5, 
+             label=f"Class {class_names[i]} (AUC = {roc_auc[i]:.2f})")
+
+# 6d. Macro-average AUC
+all_fpr = np.unique(np.concatenate([fpr[i] for i in range(n_classes)]))
+mean_tpr = np.zeros_like(all_fpr)
+for i in range(n_classes):
+    mean_tpr += np.interp(all_fpr, fpr[i], tpr[i])
+
+mean_tpr /= n_classes
+macro_auc = auc(all_fpr, mean_tpr)
+plt.plot(all_fpr, mean_tpr, color="navy", lw=2, linestyle="--",
+         label=f"Macro-average (AUC = {macro_auc:.2f})")
+
+# Chance line
+plt.plot([0, 1], [0, 1], "r--", label="Chance", lw=1)
+
+plt.title("Multi-class ROC Curve (One-vs-Rest)")
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.legend(loc="lower right")
 plt.show()
 
-# Let's pick a K based on the best silhouette or business logic.
-# Suppose we see K=15 is decent, or K=20, etc.
-best_k = 15  # example choice
-
-############################################################################
-# 5. K-Means Clustering with chosen K
-############################################################################
-kmeans = KMeans(n_clusters=best_k, random_state=42)
-df['cluster'] = kmeans.fit_predict(X)
-
-print("Cluster assignments done. Number of clusters:", best_k)
-
-############################################################################
-# 6. Choose a Representative Label per Cluster
-############################################################################
-# A common approach: pick the most frequent "norm_symptom" in each cluster
-# or pick the symptom with the highest average TF-IDF within that cluster.
-
-cluster_to_symptoms = {}
-for idx, row in df.iterrows():
-    c = row['cluster']
-    symptom = row['norm_symptom']
-    if c not in cluster_to_symptoms:
-        cluster_to_symptoms[c] = []
-    cluster_to_symptoms[c].append(symptom)
-
-# Let's define a simple function to find the "most frequent symptom" in each cluster
-cluster_reps = {}
-for c, symptoms in cluster_to_symptoms.items():
-    freq = pd.Series(symptoms).value_counts()
-    # The top symptom is freq.index[0]
-    representative = freq.index[0]
-    cluster_reps[c] = representative
-
-# Another approach might be to find the symptom string that is closest to the cluster centroid in TF-IDF space.
-# We'll do the simpler approach here.
-
-# Now map each cluster to its representative
-def get_cluster_label(c):
-    return cluster_reps[c]
-
-df['cluster_label'] = df['cluster'].apply(get_cluster_label)
-
-############################################################################
-# 7. (Optional) Final Fuzzy Matching to a Known Symptom List
-############################################################################
-# If you have a curated list, map these cluster representatives to that list.
-from fuzzywuzzy import process
-
-valid_symptoms = [
-    "fever", "cough", "headache", "dizziness", "vomiting", "nausea",
-    "fatigue", "chills", "sore throat", "shortness of breath",
-    "chest pain", "diarrhea", "constipation", "rash", "body aches",
-    "migraine", "arrhythmia", "hypertension"
-    # etc.
-]
-
-def fuzzy_map_to_valid(sym, valid_list=valid_symptoms, threshold=80):
-    if not sym:
-        return sym
-    best_match, score = process.extractOne(sym, valid_list)
-    if score >= threshold:
-        return best_match
-    return sym
-
-df['final_symptom'] = df['cluster_label'].apply(fuzzy_map_to_valid)
-
-############################################################################
-# 8. Check Results
-############################################################################
-print("Unique raw symptoms before:", df['symptom'].nunique())
-print("Unique final symptoms after cluster+map:", df['final_symptom'].nunique())
-
-# Let's see some example transformations
-print(df[['symptom','norm_symptom','cluster','cluster_label','final_symptom']].head(30))
-
-############################################################################
-# 9. Visualization
-############################################################################
-# a) Compare unique counts
-unique_before = df['symptom'].nunique()
-unique_after = df['final_symptom'].nunique()
-
-plt.bar(["Before","After"], [unique_before, unique_after], color=['red','green'])
-plt.title("Unique Symptom Count: Before vs. After Clustering & Mapping")
-plt.ylabel("Count of Unique Symptoms")
-plt.show()
-
-# b) Frequency of final symptoms
-plt.figure(figsize=(10,6))
-sns.countplot(y=df['final_symptom'], order=df['final_symptom'].value_counts().index)
-plt.title("Symptom Frequency (After Clustering and Mapping)")
-plt.xlabel("Count")
-plt.ylabel("Symptom")
-plt.tight_layout()
-plt.show()
+# (Optional) If you only want an aggregated AUC metric:
+macro_roc_score = roc_auc_score(y_test_bin, y_score, average="macro", multi_class="ovr")
+print(f"Macro-average ROC-AUC: {macro_roc_score:.3f}")
