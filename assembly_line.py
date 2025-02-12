@@ -1,39 +1,62 @@
 import pandas as pd
 from sklearn.model_selection import train_test_split
-from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import SVC
 
 from sklearn.metrics import accuracy_score, classification_report
+import warnings
 
 # 1. Load your data
-df = pd.read_csv("your_final_data.csv")  # has columns: [report_text, final_symptom, ...]
+#    Ensure that df has columns: "report_text", "final_symptom", and "name"
+df = pd.read_csv("your_final_data.csv")
 
-# 2. Split into train/test
-X = df['report_text']
+# For demonstration, let's rename the columns if needed:
+# df.rename(columns={'pname': 'name'}, inplace=True)
+
+X = df[['report_text', 'name']]  # We'll use BOTH columns as features
 y = df['final_symptom']
 
+# 2. Train/test split
 X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=42, stratify=y
+    X, y, 
+    test_size=0.2, 
+    random_state=42, 
+    stratify=y
 )
 
-# 3. Define the models you want to compare
+# 3. Define the column transformer for the features
+#    We'll apply TfidfVectorizer to both the 'report_text' and 'name' columns.
+
+text_transformer = TfidfVectorizer(ngram_range=(1,2), min_df=2)
+name_transformer = TfidfVectorizer(ngram_range=(1,2), min_df=1)  # or min_df=2
+
+column_transform = ColumnTransformer(
+    [
+        ('text_tfidf', text_transformer, 'report_text'),
+        ('name_tfidf', name_transformer, 'name')
+    ],
+    remainder='drop'  # Only transform these two columns
+)
+
+# 4. Define multiple models to compare
 models = [
-    ("Logistic Regression", LogisticRegression(max_iter=1000, solver='lbfgs')),
+    ("Logistic Regression", LogisticRegression(solver='lbfgs', max_iter=1000)),
     ("Random Forest",       RandomForestClassifier(n_estimators=100, random_state=42)),
     ("SVM",                 SVC(kernel='linear', probability=True, random_state=42))
 ]
 
-# 4. Loop over each model, train, and evaluate
+# 5. Train & Evaluate each model in a loop
 for model_name, model in models:
     print("="*60)
     print(f"Training model: {model_name}")
     
-    # Create pipeline: TF-IDF => model
+    # Build a pipeline: (ColumnTransformer => Classifier)
     pipeline = Pipeline([
-        ('tfidf', TfidfVectorizer(ngram_range=(1,2), min_df=2)),
+        ('features', column_transform),
         ('clf', model)
     ])
     
@@ -46,6 +69,9 @@ for model_name, model in models:
     # Evaluate
     accuracy = accuracy_score(y_test, y_pred)
     print(f"Accuracy: {accuracy:.3f}")
-    
+
+    # classification_report can produce warnings if some classes have zero predictions.
+    # We specify zero_division=0 to handle "divide by zero" gracefully.
+    report = classification_report(y_test, y_pred, zero_division=0)
     print("Classification Report:")
-    print(classification_report(y_test, y_pred))
+    print(report)
