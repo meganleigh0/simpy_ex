@@ -1,153 +1,158 @@
 import pandas as pd
 import numpy as np
-import re
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, r2_score
 
-from sklearn.model_selection import train_test_split, RandomizedSearchCV
-from sklearn.pipeline import Pipeline
-from sklearn.compose import ColumnTransformer
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.ensemble import RandomForestClassifier
+# ---------------------------------------------------------------------
+# 1. Read in or have your DataFrames
+# ---------------------------------------------------------------------
+# Example structure (replace with your actual data loading)
+# current_status_df has columns: [Vehicle, Section, Station, Date, Variant, Number]
+# station_df has columns: [Station, average_days, median_days, Variant]
 
-from sklearn.metrics import classification_report, accuracy_score
-from sklearn.metrics import roc_curve, auc, roc_auc_score
-from sklearn.preprocessing import LabelBinarizer
+# current_status_df = pd.read_csv("current_status.csv")
+# station_df = pd.read_csv("station_history.csv")
 
-import matplotlib.pyplot as plt
-import seaborn as sns
+# For illustration, let's make some tiny mock data
+current_status_df = pd.DataFrame({
+    'Vehicle': ['VIN123', 'VIN456', 'VIN789'],
+    'Section': ['Paint', 'Assembly', 'Assembly'],
+    'Station': ['STN1', 'STN2', 'STN3'],
+    'Date': pd.to_datetime(['2025-02-01', '2025-02-02', '2025-02-03']),
+    'Variant': ['V1', 'V2', 'V1'],
+    'Number': [2, 1, 3]  # days so far at that station
+})
 
-##############################################################################
-# 1. Load Data
-##############################################################################
-df = pd.read_csv("your_final_data.csv")
-# We assume the DataFrame has columns: ["report_text", "final_symptom", "name"]
+station_df = pd.DataFrame({
+    'Station': ['STN1', 'STN2', 'STN3'],
+    'Variant': ['V1', 'V2', 'V1'],
+    'average_days': [3.2, 5.5, 4.1],
+    'median_days': [3, 5, 4]
+})
 
-X = df[["report_text", "name"]]
-y = df["final_symptom"]
-
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, 
-    test_size=0.2, 
-    random_state=42, 
-    stratify=y
+# ---------------------------------------------------------------------
+# 2. Merge DataFrames to get historical features (avg, median, etc.)
+# ---------------------------------------------------------------------
+# We can do a left join from current_status_df to station_df
+merged_df = pd.merge(
+    current_status_df, 
+    station_df, 
+    how='left',
+    on=['Station', 'Variant']
 )
 
-##############################################################################
-# 2. Define ColumnTransformer for text columns
-##############################################################################
-text_transformer = TfidfVectorizer(ngram_range=(1,2), min_df=2)
-name_transformer = TfidfVectorizer(ngram_range=(1,2), min_df=1)
+# The merged DataFrame now contains all columns from current_status_df
+# plus average_days, median_days from the station_df.
 
-column_transform = ColumnTransformer(
-    [
-        ("text_tfidf", text_transformer, "report_text"),
-        ("name_tfidf", name_transformer, "name")
-    ],
-    remainder="drop"
+# merged_df might look like:
+#   Vehicle Section   Station  Date        Variant Number  average_days  median_days
+# 0 VIN123  Paint     STN1     2025-02-01 V1      2       3.2           3
+# 1 VIN456  Assembly  STN2     2025-02-02 V2      1       5.5           5
+# 2 VIN789  Assembly  STN3     2025-02-03 V1      3       4.1           4
+
+# ---------------------------------------------------------------------
+# 3. Create a historical dataset with known completion times
+#    for training a supervised model
+# ---------------------------------------------------------------------
+# In real use, you'll have a historical dataset with completion info.
+# For demonstration, let's create a hypothetical "historical_data_df":
+#   Each row is a vehicle in some station snapshot, along with the final
+#   days_to_completion that actually happened. This is your 'label'.
+historical_data_df = pd.DataFrame({
+    'Vehicle': ['VIN0001', 'VIN0002', 'VIN0003', 'VIN0004', 'VIN0005'],
+    'Section': ['Paint', 'Paint', 'Assembly', 'Assembly', 'Assembly'],
+    'Station': ['STN1', 'STN1', 'STN2', 'STN3', 'STN2'],
+    'Date': pd.to_datetime(['2024-10-01', '2024-10-02', '2024-10-03', '2024-10-04', '2024-10-05']),
+    'Variant': ['V1', 'V1', 'V2', 'V1', 'V2'],
+    'Number': [1, 2, 1, 1, 2],  # days so far at that station
+    # "days_to_completion" is how many more days from this point until final completion
+    'days_to_completion': [5, 4, 10, 3, 9]
+})
+
+# Merge in the average/median station info
+historical_merged_df = pd.merge(
+    historical_data_df,
+    station_df,
+    how='left',
+    on=['Station', 'Variant']
 )
 
-##############################################################################
-# 3. Define a Pipeline with RandomForest
-##############################################################################
-pipeline = Pipeline([
-    ("features", column_transform),
-    ("clf", RandomForestClassifier(random_state=42))
-])
+# ---------------------------------------------------------------------
+# 4. Feature Engineering
+# ---------------------------------------------------------------------
+# For example, we can keep:
+#   - 'Number' (days at current station so far)
+#   - 'average_days', 'median_days'
+#   - Possibly convert 'Section' and 'Station' into categorical dummies
+#   - 'Variant' also as categorical
+#   - Exclude 'Vehicle' and 'Date' for now
+#   - 'days_to_completion' is our target
 
-##############################################################################
-# 4. Hyperparameter Tuning with RandomizedSearchCV
-##############################################################################
-# Define the parameter distributions we want to sample from:
-param_distributions = {
-    "clf__n_estimators": [100, 200, 300, 500],
-    "clf__max_depth": [None, 10, 20, 30, 50],
-    "clf__min_samples_split": [2, 5, 10],
-    "clf__min_samples_leaf": [1, 2, 4],
-    "clf__bootstrap": [True, False]
-}
+# Simple example:
+feature_cols = ['Number', 'average_days', 'median_days', 'Section', 'Station', 'Variant']
+target_col = 'days_to_completion'
 
-# RandomizedSearchCV allows specifying n_iter to control how many random combos we try
-search = RandomizedSearchCV(
-    pipeline,
-    param_distributions=param_distributions,
-    n_iter=20,               # Try 20 different parameter combinations
-    cv=5,                    # 5-fold cross-validation
-    scoring="accuracy",      # You can also use "f1_macro" if you prefer
-    n_jobs=-1,               # Use all available cores
-    random_state=42,
-    verbose=1
-)
+# Convert categorical columns to dummies (one-hot encoding)
+categorical_cols = ['Section', 'Station', 'Variant']
+historical_merged_df = pd.get_dummies(historical_merged_df, columns=categorical_cols, drop_first=True)
 
-search.fit(X_train, y_train)
+X = historical_merged_df[[c for c in historical_merged_df.columns if c not in ['Vehicle','Date','days_to_completion']]]
+y = historical_merged_df[target_col]
 
-print(f"Best params found: {search.best_params_}")
-print(f"Best CV accuracy: {search.best_score_:.3f}")
+# ---------------------------------------------------------------------
+# 5. Train/Test Split
+# ---------------------------------------------------------------------
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-# Retrieve the best pipeline
-best_pipeline = search.best_estimator_
+# ---------------------------------------------------------------------
+# 6. Train a Regression Model
+# ---------------------------------------------------------------------
+model = RandomForestRegressor(n_estimators=100, random_state=42)
+model.fit(X_train, y_train)
 
-##############################################################################
-# 5. Evaluate on Test Set
-##############################################################################
-y_pred = best_pipeline.predict(X_test)
-test_accuracy = accuracy_score(y_test, y_pred)
-print(f"Test Accuracy: {test_accuracy:.3f}")
+# ---------------------------------------------------------------------
+# 7. Evaluate the Model
+# ---------------------------------------------------------------------
+y_pred = model.predict(X_test)
 
-print("Classification Report:")
-print(classification_report(y_test, y_pred, zero_division=0))
+mae = mean_absolute_error(y_test, y_pred)
+r2  = r2_score(y_test, y_pred)
+print(f"MAE on Test: {mae:.2f} days")
+print(f"R^2 on Test: {r2:.3f}")
 
-##############################################################################
-# 6. Multi-class ROC–AUC Curve
-##############################################################################
-# For multi-class, we compute one-vs-rest curves.
-#  - First, get the probability scores
-#  - Binarize y_test
-#  - For each class, compute fpr/tpr, then AUC
-##############################################################################
+# ---------------------------------------------------------------------
+# 8. Predict for Current Vehicles
+# ---------------------------------------------------------------------
+# Now, we want to predict 'days_to_completion' for vehicles in current_status_df (merged_df).
+# We must replicate the same feature engineering steps we did on the training set
+current_features_df = merged_df.copy()
 
-# 6a. Predict probabilities on test
-y_score = best_pipeline.predict_proba(X_test)
+# Convert the same categorical columns to dummies
+# We must ensure the columns are consistent with the training dummy columns
+current_features_df = pd.get_dummies(current_features_df, columns=categorical_cols, drop_first=True)
 
-# 6b. Binarize the labels for one-vs-rest ROC
-lb = LabelBinarizer()
-lb.fit(y_train)  # Learn classes from train set
-y_test_bin = lb.transform(y_test)  # shape: (num_samples, num_classes)
+# Some columns might not exist if the category wasn't in the new data (or vice versa).
+# A safe approach is to reindex the new data's columns to match the training data's columns:
+missing_cols = set(X.columns) - set(current_features_df.columns)
+for col in missing_cols:
+    current_features_df[col] = 0
+extra_cols = set(current_features_df.columns) - set(X.columns)
+current_features_df.drop(extra_cols, axis=1, inplace=True)
 
-n_classes = y_test_bin.shape[1]
-class_names = lb.classes_
+current_features_df = current_features_df[X.columns]  # ensure same column order
 
-# 6c. Plot the ROC curve for each class
-plt.figure(figsize=(8, 6))
+# Predict
+current_predictions = model.predict(current_features_df)
 
-fpr = dict()
-tpr = dict()
-roc_auc = dict()
+# Attach predictions back to the original merged_df
+merged_df['estimated_days_to_completion'] = current_predictions
 
-for i in range(n_classes):
-    fpr[i], tpr[i], _ = roc_curve(y_test_bin[:, i], y_score[:, i])
-    roc_auc[i] = auc(fpr[i], tpr[i])
-    plt.plot(fpr[i], tpr[i], lw=1.5, 
-             label=f"Class {class_names[i]} (AUC = {roc_auc[i]:.2f})")
+# We can also estimate a completion date by adding the predicted days to the current date
+# (for demonstration, we’ll just add to the 'Date' column in merged_df)
+merged_df['estimated_completion_date'] = merged_df['Date'] + pd.to_timedelta(merged_df['estimated_days_to_completion'].round(), unit='D')
 
-# 6d. Macro-average AUC
-all_fpr = np.unique(np.concatenate([fpr[i] for i in range(n_classes)]))
-mean_tpr = np.zeros_like(all_fpr)
-for i in range(n_classes):
-    mean_tpr += np.interp(all_fpr, fpr[i], tpr[i])
-
-mean_tpr /= n_classes
-macro_auc = auc(all_fpr, mean_tpr)
-plt.plot(all_fpr, mean_tpr, color="navy", lw=2, linestyle="--",
-         label=f"Macro-average (AUC = {macro_auc:.2f})")
-
-# Chance line
-plt.plot([0, 1], [0, 1], "r--", label="Chance", lw=1)
-
-plt.title("Multi-class ROC Curve (One-vs-Rest)")
-plt.xlabel("False Positive Rate")
-plt.ylabel("True Positive Rate")
-plt.legend(loc="lower right")
-plt.show()
-
-# (Optional) If you only want an aggregated AUC metric:
-macro_roc_score = roc_auc_score(y_test_bin, y_score, average="macro", multi_class="ovr")
-print(f"Macro-average ROC-AUC: {macro_roc_score:.3f}")
+# ---------------------------------------------------------------------
+# 9. Examine the Results
+# ---------------------------------------------------------------------
+print(merged_df[['Vehicle','Station','Variant','Date','estimated_days_to_completion','estimated_completion_date']])
