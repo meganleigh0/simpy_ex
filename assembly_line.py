@@ -1,26 +1,28 @@
-import matplotlib.pyplot as plt
-from matplotlib_venn import venn3
 
-# Define the dataset
-ebom_only = 4871
-mbom_tc_only = 2205
-mbom_oracle_only = 1657
-ebom_tc_intersect = 1981
-ebom_oracle_intersect = 1418
-tc_oracle_intersect = 1429
-all_three_intersect = 1218
-
-# Adjusted values for the Venn diagram
-ebom_tc_only = ebom_tc_intersect - all_three_intersect
-ebom_oracle_only = ebom_oracle_intersect - all_three_intersect
-tc_oracle_only = tc_oracle_intersect - all_three_intersect
+# Define the values
+ebom = 4871
+mbom_tc = 2205
+mbom_oracle = 1657
+intersect_ebom_tc = 1981
+intersect_ebom_oracle = 1418
+intersect_tc_oracle = 1429
+intersect_all_three = 1218
 
 # Create the Venn diagram
-plt.figure(figsize=(6, 6))
+plt.figure(figsize=(6,6))
 venn = venn3(
     subsets=(
-        ebom_only,       # Only in eBOM
-        mbom_tc_only,    # Only in mBOM_TC
-        ebom_tc_only,    # eBOM & mBOM_TC only (excluding all three)
-        mbom_oracle_only,  # Only in mBOM_Oracle
-        ebom_oracle_only
+        ebom,          # Only in eBOM
+        mbom_tc,       # Only in mBOM_TC
+        intersect_ebom_tc - intersect_all_three,  # eBOM & mBOM_TC only
+        mbom_oracle,   # Only in mBOM_Oracle
+        intersect_ebom_oracle - intersect_all_three,  # eBOM & mBOM_Oracle only
+        intersect_tc_oracle - intersect_all_three,  # mBOM_TC & mBOM_Oracle only
+        intersect_all_three  # All three
+    ),
+    set_labels=('eBOM', 'mBOM_TC', 'mBOM_Oracle')
+)
+
+# Display the diagram
+plt.title("Venn Diagram of BOM Intersections")
+plt.show()
