@@ -30,7 +30,7 @@ ebom_agg = (
     ebom_df
     .groupby('PART_NUMBER', as_index=False)
     .agg({
-        'Item Template': 'first',  # or another approach if needed
+        'Item Template': 'first',  # or use another aggregator if needed
         'Quantity': 'sum'
     })
 )
@@ -54,54 +54,55 @@ mbom_oracle_agg = (
 )
 
 # -----------------------------------------------------------------------------
-# 3. Rename "Item Type" -> "Item Template" in the Oracle MBOM for consistency
+# 3. Rename "Item Type" -> "Item Template_ORACLE" and "Quantity" -> "Quantity_ORACLE"
+#    So we don't clash with the other data
 # -----------------------------------------------------------------------------
-mbom_oracle_agg.rename(columns={'Item Type': 'Item Template'}, inplace=True)
+mbom_oracle_agg.rename(
+    columns={
+        'Item Type': 'Item Template_ORACLE',
+        'Quantity': 'Quantity_ORACLE'
+    },
+    inplace=True
+)
 
 # -----------------------------------------------------------------------------
 # 4. Merge the Aggregated DataFrames
-#    - Merge EBOM & Teamcenter
+#    - EBOM & Teamcenter
 #    - Then merge that result with Oracle
 # -----------------------------------------------------------------------------
 compare_tc = pd.merge(
-    ebom_agg,
-    mbom_tc_agg,
+    ebom_agg.rename(columns={'Item Template': 'Item Template_EBOM', 'Quantity': 'Quantity_EBOM'}),
+    mbom_tc_agg.rename(columns={'Item Template': 'Item Template_TC',   'Quantity': 'Quantity_TC'}),
     on='PART_NUMBER',
-    how='outer',
-    suffixes=('_EBOM', '_TC')
+    how='outer'
 )
 
 compare_all = pd.merge(
     compare_tc,
     mbom_oracle_agg,
     on='PART_NUMBER',
-    how='outer',
-    suffixes=('_TC', '_ORACLE')
+    how='outer'
 )
 
-# Now we have columns:
-# PART_NUMBER
-# Item Template_EBOM, Quantity_EBOM
-# Item Template_TC,   Quantity_TC
-# Item Template_ORACLE, Quantity_ORACLE
+# Final columns now include:
+# - PART_NUMBER
+# - Item Template_EBOM, Quantity_EBOM
+# - Item Template_TC,   Quantity_TC
+# - Item Template_ORACLE, Quantity_ORACLE
 
 # -----------------------------------------------------------------------------
 # 5. Create Comparison Columns
 # -----------------------------------------------------------------------------
-# (A) Compare Item Templates
 compare_all['Template_Match_EBOM_TC'] = (
     compare_all['Item Template_EBOM'] == compare_all['Item Template_TC']
 )
+
 compare_all['Template_Match_EBOM_Oracle'] = (
     compare_all['Item Template_EBOM'] == compare_all['Item Template_ORACLE']
 )
 
-# (B) Compare Quantities (EBOM minus MBOM)
-compare_all['Qty_Diff_EBOM_vs_TC'] = (
-    compare_all['Quantity_EBOM'].fillna(0) - compare_all['Quantity_TC'].fillna(0)
-)
-compare_all['Qty_Diff_EBOM_vs_Oracle'] = (
-    compare_all['Quantity_EBOM'].fillna(0) - compare_all['Quantity_ORACLE'].fillna(0)
-)
+compare_all['Qty_Diff_EBOM_vs_TC'] = compare_all['Quantity_EBOM'].fillna(0) - compare_all['Quantity_TC'].fillna(0)
+compare_all['Qty_Diff_EBOM_vs_Oracle'] = compare_all['Quantity_EBOM'].fillna(0) - compare_all['Quantity_ORACLE'].fillna(0)
 
+# Let's see the final result
 print(compare_all)
