@@ -1,43 +1,29 @@
 import pandas as pd
 
-# Ensure DateCount is in datetime format
-df['DateCount'] = pd.to_datetime(df['DateCount'])
-
-def get_initial_time(row, df):
+def normalize_part_numbers(bom_df, cross_ref_df, part_col='part_number', spec_col='specification', product_id_col='product_id'):
     """
-    Recursively traverse the parent chain for the same vehicle until reaching station 0.
+    Replaces specifications in the part_number column of the BOM DataFrame with actual part numbers 
+    using the consumables cross-reference DataFrame.
     
     Parameters:
-        row (pd.Series): The current row.
-        df (pd.DataFrame): The full dataframe.
-        
+    - bom_df: DataFrame containing the BOM (eBOM, mBOM-TC, mBOM-Oracle)
+    - cross_ref_df: DataFrame with columns for part number, specification, and product ID
+    - part_col: The name of the column in the BOM that contains the part numbers/specs
+    - spec_col: The name of the column in cross_ref_df that contains specifications
+    - product_id_col: Optional, in case you want to match on product ID too
+    
     Returns:
-        pd.Timestamp or pd.NaT: The DateCount corresponding to station 0 for that vehicle.
+    - A copy of the BOM DataFrame with normalized part numbers
     """
-    # Base case: if this row is station 0, return its DateCount
-    if row['Station'] == 0:
-        return row['DateCount']
+    # Create mapping from specification to part number
+    spec_to_part = dict(zip(cross_ref_df[spec_col], cross_ref_df[part_col]))
     
-    # Get the station referenced in the Parent column of the current row.
-    parent_station = row['Parent']
-    
-    # Filter the dataframe: same vehicle, station equals the parent's station,
-    # and the DateCount is earlier than the current row's DateCount.
-    subset = df[
-        (df['Vehicle'] == row['Vehicle']) &
-        (df['Station'] == parent_station) &
-        (df['DateCount'] < row['DateCount'])
-    ]
-    
-    # If no matching parent row is found, return NaT.
-    if subset.empty:
-        return pd.NaT
-    
-    # Otherwise, take the row with the most recent DateCount (i.e. the last occurrence)
-    parent_row = subset.loc[subset['DateCount'].idxmax()]
-    
-    # Recursively call the function on this parent row.
-    return get_initial_time(parent_row, df)
+    # Function to replace spec with part number if it matches
+    def replace_spec(val):
+        return spec_to_part.get(val, val)  # If no match, keep original
 
-# Apply the recursive function to create a new column with the initial (station 0) time.
-df['initial_station_time'] = df.apply(lambda row: get_initial_time(row, df), axis=1)
+    # Replace in a copy of the BOM
+    bom_df_copy = bom_df.copy()
+    bom_df_copy[part_col] = bom_df_copy[part_col].apply(replace_spec)
+
+    return bom_df_copy
