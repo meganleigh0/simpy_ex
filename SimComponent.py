@@ -1,29 +1,33 @@
 import pandas as pd
 
-def normalize_part_numbers(bom_df, cross_ref_df, part_col='part_number', spec_col='specification', product_id_col='product_id'):
+def replace_part_numbers(bom_df, cross_ref_df):
     """
-    Replaces specifications in the part_number column of the BOM DataFrame with actual part numbers 
-    using the consumables cross-reference DataFrame.
+    Replaces part numbers in the BOM DataFrame based on a cross-reference DataFrame.
     
     Parameters:
-    - bom_df: DataFrame containing the BOM (eBOM, mBOM-TC, mBOM-Oracle)
-    - cross_ref_df: DataFrame with columns for part number, specification, and product ID
-    - part_col: The name of the column in the BOM that contains the part numbers/specs
-    - spec_col: The name of the column in cross_ref_df that contains specifications
-    - product_id_col: Optional, in case you want to match on product ID too
+    - bom_df (pd.DataFrame): The BOM DataFrame containing a 'Part Number' column.
+    - cross_ref_df (pd.DataFrame): The cross-reference DataFrame with 'Original' and 'Replacement' columns.
     
     Returns:
-    - A copy of the BOM DataFrame with normalized part numbers
+    - updated_bom_df (pd.DataFrame): BOM with updated part numbers.
+    - mappings (dict): Dictionary of original -> replacement mappings that were applied.
     """
-    # Create mapping from specification to part number
-    spec_to_part = dict(zip(cross_ref_df[spec_col], cross_ref_df[part_col]))
+    # Make a copy to avoid modifying the original BOM
+    updated_bom_df = bom_df.copy()
     
-    # Function to replace spec with part number if it matches
-    def replace_spec(val):
-        return spec_to_part.get(val, val)  # If no match, keep original
+    # Create a dictionary from the cross-reference for fast lookup
+    cross_ref_dict = dict(zip(cross_ref_df['Original'], cross_ref_df['Replacement']))
+    
+    # Track the mappings that were actually used
+    mappings = {}
 
-    # Replace in a copy of the BOM
-    bom_df_copy = bom_df.copy()
-    bom_df_copy[part_col] = bom_df_copy[part_col].apply(replace_spec)
+    def replace_part(part_number):
+        if part_number in cross_ref_dict:
+            mappings[part_number] = cross_ref_dict[part_number]
+            return cross_ref_dict[part_number]
+        return part_number
 
-    return bom_df_copy
+    # Apply the replacement
+    updated_bom_df['Part Number'] = updated_bom_df['Part Number'].apply(replace_part)
+
+    return updated_bom_df, mappings
