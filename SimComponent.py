@@ -1,22 +1,42 @@
 import pandas as pd
-import yaml
-from datetime import datetime
+import os
 from pyspark.sql import SparkSession
 
-# Load config file
-config_path = "/Workspace/Repos/your_user/config.yaml"  # update as needed
-with open(config_path, 'r') as f:
-    config = yaml.safe_load(f)
+# -------------------------------
+# 1. Define your variant/date config
+# -------------------------------
+config = [
+    {"program": "xm30", "date": "02-20-2025"},
+    {"program": "xy22", "date": "03-10-2025"},
+    {"program": "zq19", "date": "03-25-2025"}
+    # Add more if needed
+]
 
-def calculate_bom_completion_detailed(combined_df, snapshot_date, variant_id):
-    records, bars = [], []
+# -------------------------------
+# 2. Define comparison and match logic
+# -------------------------------
+def compare_bom_data(df_ebom, df_mbom_tc, df_mbom_oracle):
+    group_df_ebom = pd.DataFrame(df_ebom.groupby("PART_NUMBER").agg({"Quantity": "sum", "Make or Buy": "first"})).reset_index()
+    group_df_mbom_tc = pd.DataFrame(df_mbom_tc.groupby("PART_NUMBER").agg({"Quantity": "sum", "Make or Buy": "first"}))
+    group_df_mbom_oracle = pd.DataFrame(df_mbom_oracle.groupby("PART_NUMBER").agg({"Quantity": "sum", "Make or Buy": "first"}))
 
+    merged_df = group_df_ebom.merge(group_df_mbom_tc, on="PART_NUMBER", how="left", suffixes=("_ebom", "_mbom_tc"))
+    combined_df = merged_df.merge(group_df_mbom_oracle, on="PART_NUMBER", how="left", suffixes=("", "_mbom_oracle"))
+
+    combined_df["Match_EBOM_MBOM_TC"] = combined_df["Quantity_ebom"] == combined_df["Quantity_mbom_tc"]
+    combined_df["Match_EBOM_MBOM_Oracle"] = combined_df["Quantity_ebom"] == combined_df["Quantity"]
+    combined_df["Match_MBOM_TC_MBOM_Oracle"] = combined_df["Quantity_mbom_tc"] == combined_df["Quantity"]
+
+    return combined_df
+
+def calculate_bom_completion(combined_df, snapshot_date, variant_id):
+    records = []
     for source, qty_col, match_flag in [
-        ('TeamCenter', 'quantity_mbom_tc', 'Match_EBOM_MBOM_TC'),
+        ('TeamCenter', 'Quantity_mbom_tc', 'Match_EBOM_MBOM_TC'),
         ('Oracle', 'Quantity', 'Match_EBOM_MBOM_Oracle')
     ]:
         for mob in ['Make', 'Buy']:
-            ebom_parts = combined_df[combined_df['Make_or_Buy_ebom'] == mob]
+            ebom_parts = combined_df[combined_df['Make or Buy_ebom'] == mob]
             total_parts = ebom_parts['PART_NUMBER'].nunique()
             matched_parts = ebom_parts[ebom_parts[match_flag] == True]['PART_NUMBER'].nunique()
             qty_mismatch_parts = ebom_parts[
@@ -25,8 +45,6 @@ def calculate_bom_completion_detailed(combined_df, snapshot_date, variant_id):
             missing_parts = ebom_parts[ebom_parts[qty_col].isnull()]['PART_NUMBER'].nunique()
             percent_matched = (matched_parts / total_parts * 100) if total_parts > 0 else 0
 
-            label = f"{source} - {mob}"
-            bars.append({'label': label, 'value': percent_matched})
             records.append({
                 'snapshot_date': snapshot_date,
                 'variant_id': variant_id,
@@ -41,33 +59,43 @@ def calculate_bom_completion_detailed(combined_df, snapshot_date, variant_id):
 
     return pd.DataFrame(records)
 
-# Process all programs
-for entry in config['programs']:
-    program = entry['name']
-    snapshot_date = entry['snapshot_date']
+# -------------------------------
+# 3. Process all configs
+# -------------------------------
+for entry in config:
+    program = entry["program"]
+    snapshot_date = entry["date"]
     variant_id = f"{program}_{snapshot_date}"
 
-    # Construct path to clean BOM CSV in silver volume
-    csv_path = f"/Volumes/POC/default/silver_boms_{program}/clean_bom_{snapshot_date}.csv"
-    combined_df = pd.read_csv(csv_path)
+    print(f"Processing: {variant_id}")
 
-    # Calculate snapshot metrics
-    snapshot_df = calculate_bom_completion_detailed(combined_df, snapshot_date, variant_id)
+    # Load silver files
+    ebom_path = f"/Volumes/poc/default/silver_boms_{program}/cleaned_ebom_{snapshot_date}.csv"
+    mbom_tc_path = f"/Volumes/poc/default/silver_boms_{program}/cleaned_mbom_tc_{snapshot_date}.csv"
+    mbom_oracle_path = f"/Volumes/poc/default/silver_boms_{program}/cleaned_mbom_oracle_{snapshot_date}.csv"
 
-    # Convert to Spark DataFrame
+    # Read CSVs
+    ebom_df = pd.read_csv(ebom_path)
+    ebom_df.rename(columns={"Make/Buy": "Make or Buy", "Qty": "Quantity"}, inplace=True)
+    mbom_tc_df = pd.read_csv(mbom_tc_path)
+    mbom_oracle_df = pd.read_csv(mbom_oracle_path)
+
+    # Compare BOMs
+    combined_df = compare_bom_data(ebom_df, mbom_tc_df, mbom_oracle_df)
+
+    # Calculate completion metrics
+    snapshot_df = calculate_bom_completion(combined_df, snapshot_date, variant_id)
+
+    # Save to Gold Layer
     snapshot_spark_df = spark.createDataFrame(snapshot_df)
-
-    # Define gold layer path
-    gold_path = f"/Volumes/POC/default/gold_bom_snapshot/{program}"
-
-    # Save to Delta (overwrite old snapshot if exists)
+    gold_path = f"/Volumes/poc/default/gold_bom_snapshot/{program}/{snapshot_date}"
     snapshot_spark_df.write.format("delta").mode("overwrite").save(gold_path)
 
-    # Register as table for dashboard use
+    # Register table for dashboard access
     spark.sql(f"""
         CREATE OR REPLACE TABLE gold_{program}_bom_completion_snapshot
         USING DELTA
         LOCATION '{gold_path}'
     """)
 
-print("All snapshots processed and saved to gold layer.")
+print("All snapshots processed and saved to gold.")
