@@ -3,16 +3,16 @@ from datetime import datetime
 from pyspark.sql import SparkSession
 
 # -------------------------------
-# 1. Define config with programs and their weekly snapshots
+# 1. Define your config
 # -------------------------------
 config = {
-    "xm30": ["02-20-2025", "02-27-2025", "03-05-2025"],
+    "xm30": ["02-20-2025", "02-27-2025", "03-06-2025"],
     "xy22": ["03-01-2025", "03-08-2025"],
-    "zq19": ["03-15-2025", "03-22-2025", "03-29-2025"]
+    "zq19": ["03-15-2025", "03-22-2025"]
 }
 
 # -------------------------------
-# 2. Comparison and metric logic
+# 2. Comparison and metric functions
 # -------------------------------
 def compare_bom_data(df_ebom, df_mbom_tc, df_mbom_oracle):
     group_df_ebom = pd.DataFrame(df_ebom.groupby("PART_NUMBER").agg({"Quantity": "sum", "Make or Buy": "first"})).reset_index()
@@ -59,7 +59,7 @@ def calculate_bom_completion(combined_df, snapshot_date, variant_id):
     return pd.DataFrame(records)
 
 # -------------------------------
-# 3. Process all programs and their weekly snapshots
+# 3. Process all snapshots and save
 # -------------------------------
 for program, dates in config.items():
     all_snapshots = []
@@ -69,7 +69,7 @@ for program, dates in config.items():
         print(f"Processing: {variant_id}")
 
         try:
-            # Load Silver BOM files
+            # Load silver data
             ebom_path = f"/Volumes/poc/default/silver_boms_{program}/cleaned_ebom_{snapshot_date}.csv"
             mbom_tc_path = f"/Volumes/poc/default/silver_boms_{program}/cleaned_mbom_tc_{snapshot_date}.csv"
             mbom_oracle_path = f"/Volumes/poc/default/silver_boms_{program}/cleaned_mbom_oracle_{snapshot_date}.csv"
@@ -79,31 +79,35 @@ for program, dates in config.items():
             mbom_tc_df = pd.read_csv(mbom_tc_path)
             mbom_oracle_df = pd.read_csv(mbom_oracle_path)
 
-            # Compare BOMs and calculate snapshot metrics
+            # Compare & calculate snapshot
             combined_df = compare_bom_data(ebom_df, mbom_tc_df, mbom_oracle_df)
             snapshot_df = calculate_bom_completion(combined_df, snapshot_date, variant_id)
-
             all_snapshots.append(snapshot_df)
 
         except Exception as e:
-            print(f"Failed to process {variant_id}: {e}")
+            print(f"Error processing {variant_id}: {e}")
             continue
 
-    # Combine all weekly snapshots for this program
+    # Save all snapshots for this program to Delta + SQL Table
     if all_snapshots:
         full_df = pd.concat(all_snapshots, ignore_index=True)
         spark_df = spark.createDataFrame(full_df)
 
-        # Save to Delta (append mode)
+        # Save to gold volume path
         gold_path = f"/Volumes/poc/default/gold_bom_snapshot/{program}"
         spark_df.write.format("delta").mode("append").save(gold_path)
 
-        # Register table for dashboards
+        # Register SQL table using delta.`<path>` for dashboard access
         spark.sql(f"""
-            CREATE TABLE IF NOT EXISTS gold_{program}_bom_completion_snapshot
-            USING DELTA
-            LOCATION '{gold_path}'
+            CREATE OR REPLACE TABLE {program}_bom_completion_snapshot
+            AS SELECT * FROM delta.`{gold_path}`
         """)
-        print(f"Saved and updated table: gold_{program}_bom_completion_snapshot")
 
-print("All program snapshots processed and available for dashboarding.")
+        print(f"Saved and updated SQL table: {program}_bom_completion_snapshot")
+
+print("All programs processed and SQL tables registered.")
+
+
+SELECT snapshot_date, source, make_or_buy, percent_matched
+FROM xm30_bom_completion_snapshot
+ORDER BY snapshot_date
