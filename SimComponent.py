@@ -1,19 +1,18 @@
 import pandas as pd
-import os
+from datetime import datetime
 from pyspark.sql import SparkSession
 
 # -------------------------------
-# 1. Define your variant/date config
+# 1. Define config with programs and their weekly snapshots
 # -------------------------------
-config = [
-    {"program": "xm30", "date": "02-20-2025"},
-    {"program": "xy22", "date": "03-10-2025"},
-    {"program": "zq19", "date": "03-25-2025"}
-    # Add more if needed
-]
+config = {
+    "xm30": ["02-20-2025", "02-27-2025", "03-05-2025"],
+    "xy22": ["03-01-2025", "03-08-2025"],
+    "zq19": ["03-15-2025", "03-22-2025", "03-29-2025"]
+}
 
 # -------------------------------
-# 2. Define comparison and match logic
+# 2. Comparison and metric logic
 # -------------------------------
 def compare_bom_data(df_ebom, df_mbom_tc, df_mbom_oracle):
     group_df_ebom = pd.DataFrame(df_ebom.groupby("PART_NUMBER").agg({"Quantity": "sum", "Make or Buy": "first"})).reset_index()
@@ -60,42 +59,51 @@ def calculate_bom_completion(combined_df, snapshot_date, variant_id):
     return pd.DataFrame(records)
 
 # -------------------------------
-# 3. Process all configs
+# 3. Process all programs and their weekly snapshots
 # -------------------------------
-for entry in config:
-    program = entry["program"]
-    snapshot_date = entry["date"]
-    variant_id = f"{program}_{snapshot_date}"
+for program, dates in config.items():
+    all_snapshots = []
 
-    print(f"Processing: {variant_id}")
+    for snapshot_date in dates:
+        variant_id = f"{program}_{snapshot_date}"
+        print(f"Processing: {variant_id}")
 
-    # Load silver files
-    ebom_path = f"/Volumes/poc/default/silver_boms_{program}/cleaned_ebom_{snapshot_date}.csv"
-    mbom_tc_path = f"/Volumes/poc/default/silver_boms_{program}/cleaned_mbom_tc_{snapshot_date}.csv"
-    mbom_oracle_path = f"/Volumes/poc/default/silver_boms_{program}/cleaned_mbom_oracle_{snapshot_date}.csv"
+        try:
+            # Load Silver BOM files
+            ebom_path = f"/Volumes/poc/default/silver_boms_{program}/cleaned_ebom_{snapshot_date}.csv"
+            mbom_tc_path = f"/Volumes/poc/default/silver_boms_{program}/cleaned_mbom_tc_{snapshot_date}.csv"
+            mbom_oracle_path = f"/Volumes/poc/default/silver_boms_{program}/cleaned_mbom_oracle_{snapshot_date}.csv"
 
-    # Read CSVs
-    ebom_df = pd.read_csv(ebom_path)
-    ebom_df.rename(columns={"Make/Buy": "Make or Buy", "Qty": "Quantity"}, inplace=True)
-    mbom_tc_df = pd.read_csv(mbom_tc_path)
-    mbom_oracle_df = pd.read_csv(mbom_oracle_path)
+            ebom_df = pd.read_csv(ebom_path)
+            ebom_df.rename(columns={"Make/Buy": "Make or Buy", "Qty": "Quantity"}, inplace=True)
+            mbom_tc_df = pd.read_csv(mbom_tc_path)
+            mbom_oracle_df = pd.read_csv(mbom_oracle_path)
 
-    # Compare BOMs
-    combined_df = compare_bom_data(ebom_df, mbom_tc_df, mbom_oracle_df)
+            # Compare BOMs and calculate snapshot metrics
+            combined_df = compare_bom_data(ebom_df, mbom_tc_df, mbom_oracle_df)
+            snapshot_df = calculate_bom_completion(combined_df, snapshot_date, variant_id)
 
-    # Calculate completion metrics
-    snapshot_df = calculate_bom_completion(combined_df, snapshot_date, variant_id)
+            all_snapshots.append(snapshot_df)
 
-    # Save to Gold Layer
-    snapshot_spark_df = spark.createDataFrame(snapshot_df)
-    gold_path = f"/Volumes/poc/default/gold_bom_snapshot/{program}/{snapshot_date}"
-    snapshot_spark_df.write.format("delta").mode("overwrite").save(gold_path)
+        except Exception as e:
+            print(f"Failed to process {variant_id}: {e}")
+            continue
 
-    # Register table for dashboard access
-    spark.sql(f"""
-        CREATE OR REPLACE TABLE gold_{program}_bom_completion_snapshot
-        USING DELTA
-        LOCATION '{gold_path}'
-    """)
+    # Combine all weekly snapshots for this program
+    if all_snapshots:
+        full_df = pd.concat(all_snapshots, ignore_index=True)
+        spark_df = spark.createDataFrame(full_df)
 
-print("All snapshots processed and saved to gold.")
+        # Save to Delta (append mode)
+        gold_path = f"/Volumes/poc/default/gold_bom_snapshot/{program}"
+        spark_df.write.format("delta").mode("append").save(gold_path)
+
+        # Register table for dashboards
+        spark.sql(f"""
+            CREATE TABLE IF NOT EXISTS gold_{program}_bom_completion_snapshot
+            USING DELTA
+            LOCATION '{gold_path}'
+        """)
+        print(f"Saved and updated table: gold_{program}_bom_completion_snapshot")
+
+print("All program snapshots processed and available for dashboarding.")
