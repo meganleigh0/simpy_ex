@@ -1,6 +1,17 @@
-for program in program_list:  # program_list should contain all your program names
-    try:
-        spark.sql(f"DROP TABLE IF EXISTS {program}_bom_completion_snapshot")
-        print(f"Dropped table: {program}_bom_completion_snapshot")
-    except Exception as e:
-        print(f"Error dropping table {program}_bom_completion_snapshot: {e}")
+SELECT 
+  snapshot_date,
+  make_or_buy,
+  source,
+  'Percent Matched' AS metric_type,
+  percent_matched AS metric_value
+FROM poc.default.xm30_bom_completion_snapshot
+
+UNION ALL
+
+SELECT 
+  snapshot_date,
+  make_or_buy,
+  source,
+  'Percent Matched Qty' AS metric_type,
+  percent_matched_qty AS metric_value
+FROM poc.default.xm30_bom_completion_snapshot
