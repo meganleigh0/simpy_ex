@@ -1,25 +1,28 @@
 import pandas as pd
-import re
 
-# Sample DataFrame
-df = pd.DataFrame({
-    'PartNumber': ['ABC123-20230409', 'XYZ-01012023-PQ', '456DEF', '789GHI-12-31-2022']
-})
+# Load the IBOM data (replace 'ibom.csv' with your file path)
+df = pd.read_csv('ibom.csv')
 
-# Function to remove date-like patterns
-def remove_dates(part):
-    # Common date patterns: YYYYMMDD, MMDDYYYY, DDMMYYYY, YYYY-MM-DD, MM-DD-YYYY, etc.
-    date_patterns = [
-        r'\b\d{8}\b',                   # 20230409
-        r'\b\d{2}[/-]\d{2}[/-]\d{4}\b', # 12/31/2022 or 12-31-2022
-        r'\b\d{4}[/-]\d{2}[/-]\d{2}\b', # 2022/12/31 or 2022-12-31
-        r'\b\d{2}\d{2}\d{4}\b',         # 12312022 or 31122022
-    ]
-    for pattern in date_patterns:
-        part = re.sub(pattern, '', part)
-    return part.strip('-_')
+# Preview the IBOM
+print("Raw IBOM:")
+print(df.head())
 
-# Apply the function
-df['CleanPartNumber'] = df['PartNumber'].apply(remove_dates)
+# Basic summary
+print("\n--- IBOM Summary ---")
+print("Total parts listed:", len(df))
+print("Unique part numbers:", df['part number'].nunique())
 
-print(df)
+# Group by level
+print("\n--- Parts by Hierarchical Level ---")
+level_counts = df['level'].value_counts().sort_index()
+print(level_counts)
+
+# Total quantity by part number (ignores hierarchy)
+print("\n--- Total Quantity by Part Number ---")
+total_quantity = df.groupby('part number')['quantity'].sum().reset_index()
+total_quantity = total_quantity.sort_values(by='quantity', ascending=False)
+print(total_quantity)
+
+# Optional: export flattened BOM summary
+total_quantity.to_csv('flattened_bom_summary.csv', index=False)
+print("\nFlattened BOM summary exported to 'flattened_bom_summary.csv'")
