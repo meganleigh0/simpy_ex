@@ -1,5 +1,22 @@
+import pandas as pd
 import plotly.graph_objects as go
 
+# Assume SNAPSHOT_DATA is already loaded
+# Sample structure: snapshot_date, source, make_or_buy, total_parts, matched_parts, quantity_mismatches, missing_parts, percent_matched, percent_matched_qty
+
+# Melt for stacked bar
+melted_df = SNAPSHOT_DATA.melt(
+    id_vars=["snapshot_date", "source", "make_or_buy", "total_parts"],
+    value_vars=["percent_matched", "percent_matched_qty"],
+    var_name="metric",
+    value_name="percent"
+)
+
+# Optional: filter to one snapshot_date to simplify the display
+snapshot_to_plot = melted_df["snapshot_date"].max()
+df_plot = melted_df[melted_df["snapshot_date"] == snapshot_to_plot]
+
+# Create figure
 fig = go.Figure()
 
 # Add stacked bar traces for each metric
