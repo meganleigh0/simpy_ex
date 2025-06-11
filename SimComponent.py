@@ -1,78 +1,67 @@
-# ---------------------------------------------
-# UPDATE BURDEN‑RATE MASTER FROM "OTHER RATES"
-# ---------------------------------------------
+import re
 import pandas as pd
-from pathlib import Path
+import numpy as np
 
-## ── CONFIG ──────────────────────────────────
-SOURCE_PATH  = Path("/dbfs/FileStore/raw/other_rates.xlsx")
-TARGET_PATH  = Path("/dbfs/FileStore/raw/burden_rate_import.xlsx")
-SOURCE_SHEET = "Rates"          # sheet that holds the I‑to‑M yearly numbers
-TARGET_SHEET = "BURDEN_RATE"    # sheet that holds the 28‑col master
+# ── 0. helper to extract 4‑digit years from column names ───────────────
+def get_year_cols(df):
+    years, renamed = {}, {}
+    for col in df.columns:
+        m = re.search(r'(\d{4})', str(col))
+        if m:
+            yr = int(m.group(1))
+            years[col] = yr
+            renamed[col] = yr         # rename to plain int for easier lookup
+    return years, renamed
 
-# 1) mapping:  (pattern_in_description, pattern_in_pool) → column‑in‑target
-MAPPING = {
-    ("PSGA - CSSC G & A ALLOWABLE", "CSSC"): "G&A CSSC",
-    ("DVGA - DIVISION GENERAL",      "GDLS"): "G&A GDLS",
-    ("DeptAA ALLOWABLE REORDER",     None)  : "ROP",
-    ("PRLS - GDLS PROCUREMENT",      "GDLS"): "AbatProcOH",
-    ("FRT - FREIGHT",                None)  : "FREIGHT",
-    ("GENERAL DYNAMICS LAND SYSTEMS",None)  : "PROCUREMENT",
-    ("DeptAlN ALLOWABLE MAJOR END",  None)  : "MAJOR END ITEM",
-    ("ALLOWABLE SUPPORT RATE",       None)  : "SUPPORT",
-    ("ALLOWABLE CONTL TEST RATE",    None)  : "CONTL TEST",
-}
+# ── 1. normalise both tables ───────────────────────────────────────────
+year_map, rename_src = get_year_cols(other_rates)
+other_src = other_rates.rename(columns=rename_src).copy()
 
-# 2) rounding rules per column name
-def _decimals(col):
-    if "Labor" in col:            # “labor dollars” fields
-        return 3
-    if col.strip().upper() == "COM":
-        return 6
-    return 5                      # all other burden %’s
+year_col = "Date"  # column in BURDEN_RATE that holds fiscal year
+years_tgt = BURDEN_RATE[year_col].astype(int).tolist()
 
-## ── LOAD WORKBOOKS ──────────────────────────
-src = pd.read_excel(SOURCE_PATH, sheet_name=SOURCE_SHEET, header=0)
-tgt = pd.read_excel(TARGET_PATH, sheet_name=TARGET_SHEET, header=0)
+# pick only numeric burden columns (skip meta / flags)
+meta_cols = {year_col, "Burden Pool", "Description", "Effective Date"}
+numeric_cols_tgt = [c for c in BURDEN_RATE.columns if c not in meta_cols]
 
-# If your source’s header row is offset (e.g. “Unnamed: 0”), fix once:
-if src.columns[0].startswith("Unnamed"):
-    src.columns = src.iloc[0]
-    src = src[1:].reset_index(drop=True)
+# ── 2. build column‑wise signatures in BURDEN_RATE ────────────────────
+sig_tgt = {}
+for col in numeric_cols_tgt:
+    series = BURDEN_RATE.set_index(year_col)[col]
+    sig_tgt[col] = series.dropna().round(6).to_dict()   # round for fuzzy compare
 
-## ── RESHAPE SOURCE TO LONG FORMAT ───────────
-# Keep meta columns then melt the year columns
-meta_cols = ["Burden Pool", "Description"]
-year_cols = [c for c in src.columns if isinstance(c, (int, float, str)) and str(c).isdigit()]
-src_long = src.melt(id_vars=meta_cols, value_vars=year_cols,
-                    var_name="Year", value_name="Rate").dropna(subset=["Rate"])
+# ── 3. build row‑wise signatures in other_rates  ───────────────────────
+sig_src = {}
+for i, row in other_src.iterrows():
+    desc = f"{row['Burden Pool']}".strip()   # use Burden Pool text as key
+    values = {yr: round(row[yr], 6) for yr in year_map.values() if not pd.isna(row[yr])}
+    if values:
+        sig_src[desc] = values
 
-## ── CORE UPDATE LOOP ────────────────────────
-for (desc_pat, pool_pat), tgt_col in MAPPING.items():
+# ── 4. match: ≥80 % year/value overlap & ≤1e‑6 difference ─────────────
+mapping = {}
+for desc, s_vals in sig_src.items():
+    best_match, best_score = None, 0
+    for col, t_vals in sig_tgt.items():
+        # intersect years
+        yrs = set(s_vals).intersection(t_vals)
+        if not yrs:
+            continue
+        equal = [abs(s_vals[y] - t_vals[y]) < 1e-6 for y in yrs]  # tolerance
+        score = sum(equal) / len(yrs)
+        if score > best_score:
+            best_match, best_score = col, score
+    if best_score >= 0.80:          # tweak threshold if needed
+        mapping[desc] = best_match
 
-    # --- 1. locate the relevant rows in the source ---
-    mask = src_long["Description"].str.contains(desc_pat, case=False, na=False)
-    if pool_pat:  # sometimes pool must match too
-        mask &= src_long["Burden Pool"].str.contains(pool_pat, case=False, na=False)
+# ── 5. show results  ───────────────────────────────────────────────────
+auto_map_df = (
+    pd.DataFrame(mapping.items(), columns=["Burden Pool (row text)", "BURDEN_RATE column"])
+    .sort_values("Burden Pool (row text)")
+    .reset_index(drop=True)
+)
+display(auto_map_df)
+print(f"✅  Found {len(mapping)}/{len(sig_src)} burden‑pool → column matches")
 
-    rows = src_long.loc[mask, ["Year", "Rate"]]
-    if rows.empty:
-        print(f"[warn] no data for mapping → {tgt_col}")
-        continue
-
-    # --- 2. shove those values into target ---
-    for yr, val in rows.itertuples(index=False):
-        idx = (tgt["Date"] == int(yr))  # target has a 'Date' (FY) col
-        tgt.loc[idx, tgt_col] = round(val, _decimals(tgt_col))
-
-    # --- 3. forward‑fill future fiscal years with last known value ---
-    last_val = round(rows.sort_values("Year")["Rate"].iloc[-1], _decimals(tgt_col))
-    future_mask = (tgt["Date"] > rows["Year"].max())
-    tgt.loc[future_mask, tgt_col] = tgt.loc[future_mask, tgt_col].fillna(last_val)
-
-## ── SAVE RESULT ─────────────────────────────
-with pd.ExcelWriter(TARGET_PATH.with_stem(TARGET_PATH.stem + "_updated"),
-                    engine="openpyxl", mode="w") as xls:
-    tgt.to_excel(xls, sheet_name=TARGET_SHEET, index=False)
-
-print("✅ burden‑rate workbook updated →", TARGET_PATH.with_stem(TARGET_PATH.stem + "_updated"))
+# If you want a plain dict for the earlier update function:
+# AUTO_MAPPING = {(k, None): v for k, v in mapping.items()}
