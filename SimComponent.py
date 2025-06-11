@@ -1,96 +1,75 @@
-# ────────────────────────────────────────────────────────────────────────────────
-# Pipeline: sync RateBandImport with Simplified Rates + Allowable Control Test
-#           (parses OTHER RATES exactly as in the user’s snippet)
-# ────────────────────────────────────────────────────────────────────────────────
-import pandas as pd, re
+# ---------------------------------------------------------------------
+# MASTER PIPELINE :  Cognos MRR  ➜  SCM Requisition  ➜  Open‑Order Report
+# ---------------------------------------------------------------------
+import pandas as pd
 from pathlib import Path
 
-# 1 ▌CONFIG ─────────────────────────────────────────────────────────────────────
-RATE_SUM_PATH    = Path("data/RATSUM.xlsx")             # workbook containing both sheets
-RATE_BAND_PATH   = Path("data/RateBandImport.xlsx")     # original import template
-OUTPUT_PATH      = Path("data/RateBandImport_UPDATED.xlsx")
-COMPARE_PATH     = Path("data/RateBand_Comparison.xlsx")
+# ---------------------------- 1. LOAD --------------------------------
+def load_excel(path, sheet_name=0, skiprows=None, usecols=None, debug_name=""):
+    """Light wrapper around pd.read_excel with a quick shape printout."""
+    df = pd.read_excel(path, sheet_name=sheet_name, skiprows=skiprows, usecols=usecols)
+    print(f"[✓] {debug_name or Path(path).name}  →  {df.shape[0]:,} rows × {df.shape[1]} cols")
+    return df
 
-SHEET_SIMPLIFIED = "SIMPLIFIED RATES NON-PSPL"
-SHEET_OTHER      = "OTHER RATES"          # sheet that has Allowable Control Test row
-SKIP_SIMPLIFIED  = 5                      # rows to skip before header in SIMPLIFIED
-VT_ABRAMS_CODE   = "VTABRAMS"             # Rate‑Band label inside RBI
+MRR_DF           = load_excel(mrr_file,            sheet_name="MRR", debug_name="MRR")
+SCM_REQ_DF       = load_excel(scm_requisition_file, skiprows=2,        debug_name="SCM Requisition")
+OPEN_ORD_DF      = load_excel(open_order_file,     sheet_name="Data",  debug_name="Open‑Order Report")
 
-# 2 ▌LOAD + CLEAN SIMPLIFIED RATES ─────────────────────────────────────────────
-def load_simplified_rates(path: Path) -> pd.DataFrame:
-    df = (pd.read_excel(path, sheet_name=SHEET_SIMPLIFIED, skiprows=SKIP_SIMPLIFIED)
-            .rename(columns={"Unnamed: 1": "BUSINESS UNIT GDLS"})
-            .iloc[1:]                                   # drop duplicated header row
-            .reset_index(drop=True))
-    df.columns = df.columns.map(lambda x: str(x).strip())
-    df = df.loc[:, ~df.columns.str.contains("Unnamed", case=False, na=False)]
-    df["rate_band"] = df["BUSINESS UNIT GDLS"].astype(str).str.extract(r"^(..)")
-    df = df[df["rate_band"].str.len() == 2]
-    year_cols = [c for c in df.columns if re.match(r"#\s*CY\d{4}", c)]
-    return df[["rate_band"] + year_cols]
+# ---------------------------- 2. CLEAN --------------------------------
+def standardize_cols(df):
+    """Lower‑case & strip – avoids key errors during merges."""
+    df.columns = df.columns.str.lower().str.strip()
+    return df
 
-simplified_rates = load_simplified_rates(RATE_SUM_PATH)
+MRR_DF, SCM_REQ_DF, OPEN_ORD_DF = map(standardize_cols, [MRR_DF, SCM_REQ_DF, OPEN_ORD_DF])
 
-# 3 ▌PARSE “OTHER RATES”  VIA YOUR ROW/COLUMN OFFSETS ──────────────────────────
-def load_allowable_control_rate(path: Path) -> pd.Series:
-    wb = pd.ExcelFile(path)
-    other_rates = wb.parse(SHEET_OTHER, skiprows=0)
+# Ensure critical columns are datetime
+MRR_DF["receipt_date"]       = pd.to_datetime(MRR_DF["receipt_date"],       errors="coerce")
+SCM_REQ_DF["req_creation_date"] = pd.to_datetime(SCM_REQ_DF["req_creation_date"], errors="coerce")
 
-    # row 25 → rate values; row 4 → same row that holds the CY headers
-    allowable_control_test_rate = other_rates.loc[25, 'Unnamed: 2':'Unnamed: 6']
-    years_row                   = other_rates.loc[4,  'Unnamed: 2':'Unnamed: 6']
+# ---------------------------- 3. FILTER --------------------------------
+# 3‑A.  Latest received‑material date from MRR
+latest_received = MRR_DF["receipt_date"].max()
+print(f"Latest material receipt in MRR: {latest_received:%Y‑%m‑%d}")
 
-    # build a mapping:  {"CY2022": 5724.10 , ...}
-    years  = years_row.squeeze().astype(str).str.strip()
-    rates  = pd.to_numeric(allowable_control_test_rate.squeeze(), errors='coerce')
-    return pd.Series(rates.values, index=years).rename_axis("Year")
+# 3‑B.  SCM Reqs after that date, excluding rejected/returned
+valid_status    = ~SCM_REQ_DF["req_status"].str.contains("reject|return", case=False, na=False)
+SCM_REQ_FILT    = SCM_REQ_DF[
+    (SCM_REQ_DF["req_creation_date"] >= latest_received) & valid_status
+].copy()
 
-allowable_rates = load_allowable_control_rate(RATE_SUM_PATH)
+# ---------------------------- 4. MATCH ---------------------------------
+# 4‑A.  Match MCPR Order # (col J)  →  Req # (col B)
+JOIN_KEYS_1 = ["mcpr_order_number", "req_#"]  # rename if your files differ
+SCM_REQ_FILT.rename(columns={"req #": "req_#", "mcpr order number": "mcpr_order_number"}, inplace=True)
 
-# 4 ▌LOAD RATE BAND IMPORT ─────────────────────────────────────────────────────
-rate_band = pd.read_excel(RATE_BAND_PATH)
-rate_band["Rate Band"] = rate_band["Rate Band"].astype(str).str.strip()
+MRR_JOINED = (
+    SCM_REQ_FILT
+    .merge(MRR_DF, left_on="mcpr_order_number", right_on="req_#", how="inner",
+           suffixes=("_req", "_mrr"))
+)
 
-if VT_ABRAMS_CODE not in set(rate_band["Rate Band"]):
-    rate_band = pd.concat(
-        [rate_band, pd.DataFrame([{"Rate Band": VT_ABRAMS_CODE}])],
-        ignore_index=True,
-    )
+# 4‑B.  “True planned replenishments & commitments” –‑
+#       assume that exists as a flag column you can tweak here:
+PLANNED_FLAG_COL = "commitment_type"   # <‑‑ change to the real column
+planned_commit   = MRR_JOINED[MRR_JOINED[PLANNED_FLAG_COL].str.contains("planned|commit", case=False, na=False)]
 
-# 5 ▌MERGE SIMPLIFIED RATES INTO RBI ───────────────────────────────────────────
-for col in simplified_rates.columns:
-    if col == "rate_band":
-        continue
-    tgt = re.sub(r"^#\s*", "", col)            # "# CY2024" → "CY2024"
-    if tgt not in rate_band.columns:
-        rate_band[tgt] = pd.NA
+# 4‑C.  Bring in open‑order lines (vendor progress payments)
+OPEN_ORD_DF.rename(columns={"mcpr order number": "mcpr_order_number"}, inplace=True)
 
-    mapping = simplified_rates.set_index("rate_band")[col]
-    rate_band[tgt] = rate_band["Rate Band"].map(mapping).combine_first(rate_band[tgt])
+FINAL_DF = (
+    planned_commit
+    .merge(OPEN_ORD_DF,
+           on="mcpr_order_number",
+           how="left",
+           suffixes=("", "_openord"))
+)
 
-# 6 ▌WRITE ALLOWABLE CONTROL TEST TO VT ABRAMS ────────────────────────────────
-for yr, val in allowable_rates.items():
-    if yr not in rate_band.columns:
-        rate_band[yr] = pd.NA
-    idx = rate_band["Rate Band"] == VT_ABRAMS_CODE
-    rate_band.loc[idx, yr] = val
-
-# 7 ▌ROUND & SAVE UPDATED RBI ─────────────────────────────────────────────────
-year_cols = [c for c in rate_band.columns if re.match(r"CY\d{4}", c)]
-rate_band[year_cols] = (rate_band[year_cols]
-                        .apply(pd.to_numeric, errors="coerce")
-                        .round(5))
-rate_band.to_excel(OUTPUT_PATH, index=False)
-
-# 8 ▌COMPARISON REPORT (“what’s missing”) ──────────────────────────────────────
-simplified_set = set(simplified_rates["rate_band"])
-rbi_set        = set(rate_band["Rate Band"])
-
-pd.DataFrame(sorted(simplified_set - rbi_set), columns=["rate_band"]) \
-  .to_excel(COMPARE_PATH, sheet_name="In_RateSum_only", index=False)
-pd.DataFrame(sorted(rbi_set - simplified_set), columns=["rate_band"]) \
-  .to_excel(COMPARE_PATH, sheet_name="In_RateBand_only", index=False)
-
-print("✅  Done!")
-print(f"   • Updated RBI  → {OUTPUT_PATH.resolve()}")
-print(f"   • Diff report  → {COMPARE_PATH.resolve()}")
+# ---------------------------- 5. OUTPUT --------------------------------
+out_path = "data/output/mrr_scm_openorder_pipeline.xlsx"
+with pd.ExcelWriter(out_path, engine="xlsxwriter") as xl:
+    MRR_DF.to_excel(xl,           sheet_name="RAW_MRR",            index=False)
+    SCM_REQ_FILT.to_excel(xl,     sheet_name="FILTERED_SCM_REQ",   index=False)
+    planned_commit.to_excel(xl,   sheet_name="PLANNED_COMMIT",     index=False)
+    FINAL_DF.to_excel(xl,         sheet_name="FINAL_MERGE",        index=False)
+print(f"[✓] Pipeline complete – outputs saved ➜  {out_path}")
