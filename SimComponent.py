@@ -1,32 +1,48 @@
-import pandas as pd
+# Create mapping for each target column
+mapping_instructions = [
+    {
+        'dept': 'PSGA - CSSC G & A',
+        'rate_type': 'ALLOWABLE G & A RATE',
+        'target_column': 'G&A CSSC'
+    },
+    {
+        'dept': 'DVGA - DIVISION GENERAL & ADM',
+        'rate_type': 'ALLOWABLE G & A RATE',
+        'target_column': 'G&A GDLS'
+    }
+]
 
-# Load both Excel sheets
-other_rates = pd.read_excel("RatesFile.xlsx", sheet_name="OTHER RATES", header=None)
-burden_df = pd.read_excel("BurdenFile.xlsx", sheet_name="20220511FRP Burden")
+# Iterate over mapping instructions
+for instruction in mapping_instructions:
+    dept = instruction['dept']
+    rate_type = instruction['rate_type']
+    target_col = instruction['target_column']
+    
+    # Filter the row from other_rates that matches dept + rate_type
+    rate_row = other_rates[
+        (other_rates['Unnamed: 0'] == dept) & 
+        (other_rates['Unnamed: 2'] == rate_type)
+    ]
+    
+    if rate_row.empty:
+        print(f"Warning: No matching rate found for {dept} - {rate_type}")
+        continue
 
-# Step 1: Extract G&A rates from Other Rates sheet
-gna_cssc_years = ['CY2022', 'CY2023', 'CY2024', 'CY2025']
-gna_cssc_values = other_rates.loc[6, 8:12].values  # Row 7, columns I-L (0-indexed)
-gna_gdls_values = other_rates.loc[7, 8:12].values  # Row 8, columns I-L
+    # Extract year-rate pairs from CY2022 to CY2025
+    for year in range(2022, 2026):
+        column_name = f'CY{year}'
+        rate_value = float(rate_row[column_name].values[0])
 
-# Step 2: Create mapping for each year
-years = [2022, 2023, 2024, 2025]
-gna_cssc_map = dict(zip(years, gna_cssc_values))
-gna_gdls_map = dict(zip(years, gna_gdls_values))
+        # Update matching rows in BURDEN_RATE where Description and Effective Date match
+        mask = (
+            BURDEN_RATE['Description'].str.contains(target_col.split()[-1], na=False) & 
+            (BURDEN_RATE['Effective Date'].astype(str) == str(year))
+        )
+        BURDEN_RATE.loc[mask, target_col] = round(rate_value, 5)
 
-# Step 3: Apply mapping to burden_df based on Effective Date (column 'C')
-burden_df['G&A CSSC'] = burden_df.apply(
-    lambda row: gna_cssc_map.get(row['Effective Date'], row.get('G&A CSSC')),
-    axis=1
-)
-burden_df['G&A GDLS'] = burden_df.apply(
-    lambda row: gna_gdls_map.get(row['Effective Date'], row.get('G&A GDLS')),
-    axis=1
-)
+# Forward-fill to handle years beyond 2025
+for col in ['G&A CSSC', 'G&A GDLS']:
+    BURDEN_RATE[col] = BURDEN_RATE.groupby('Description')[col].ffill()
 
-# Step 4: Forward-fill any remaining missing G&A values by group
-burden_df['G&A CSSC'] = burden_df['G&A CSSC'].ffill()
-burden_df['G&A GDLS'] = burden_df['G&A GDLS'].ffill()
-
-# Step 5: Save updated sheet
-burden_df.to_excel("Updated_Burden_Rate_Import.xlsx", index=False)
+# Show updated BURDEN_RATE
+BURDEN_RATE[['Description', 'Effective Date', 'G&A CSSC', 'G&A GDLS']].dropna(how='all', subset=['G&A CSSC', 'G&A GDLS'])
