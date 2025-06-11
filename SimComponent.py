@@ -1,21 +1,32 @@
-# -----------------------------------------------------------
-# 5‑BIS.  ROUND VALUES BY TYPE  (run **after** the ffill loop)
-# -----------------------------------------------------------
-LABOR_DOLLAR_COLS = {            # 3‑decimals
-    "Base Fee", "Goal Fee", "Profit/Fee"
-}
+import pandas as pd
 
-# any column that starts with “COM ” will be 6 decimals
-COM_PREFIX      = "COM "         # e.g.  "COM GDLS", "COM CSSC", …
+# Load both Excel sheets
+other_rates = pd.read_excel("RatesFile.xlsx", sheet_name="OTHER RATES", header=None)
+burden_df = pd.read_excel("BurdenFile.xlsx", sheet_name="20220511FRP Burden")
 
-# everything in long_rates['target_col'] that is NOT labor $ or COM* is a burden → 5 decimals
-BURDEN_COLS = set(long_rates["target_col"].unique()) - LABOR_DOLLAR_COLS
+# Step 1: Extract G&A rates from Other Rates sheet
+gna_cssc_years = ['CY2022', 'CY2023', 'CY2024', 'CY2025']
+gna_cssc_values = other_rates.loc[6, 8:12].values  # Row 7, columns I-L (0-indexed)
+gna_gdls_values = other_rates.loc[7, 8:12].values  # Row 8, columns I-L
 
-for col in BURDEN_COLS:
-    if col.startswith(COM_PREFIX):
-        BURDEN_RATE[col] = pd.to_numeric(BURDEN_RATE[col], errors="coerce").round(6)
-    else:
-        BURDEN_RATE[col] = pd.to_numeric(BURDEN_RATE[col], errors="coerce").round(5)
+# Step 2: Create mapping for each year
+years = [2022, 2023, 2024, 2025]
+gna_cssc_map = dict(zip(years, gna_cssc_values))
+gna_gdls_map = dict(zip(years, gna_gdls_values))
 
-for col in LABOR_DOLLAR_COLS:
-    BURDEN_RATE[col] = pd.to_numeric(BURDEN_RATE[col], errors="coerce").round(3)
+# Step 3: Apply mapping to burden_df based on Effective Date (column 'C')
+burden_df['G&A CSSC'] = burden_df.apply(
+    lambda row: gna_cssc_map.get(row['Effective Date'], row.get('G&A CSSC')),
+    axis=1
+)
+burden_df['G&A GDLS'] = burden_df.apply(
+    lambda row: gna_gdls_map.get(row['Effective Date'], row.get('G&A GDLS')),
+    axis=1
+)
+
+# Step 4: Forward-fill any remaining missing G&A values by group
+burden_df['G&A CSSC'] = burden_df['G&A CSSC'].ffill()
+burden_df['G&A GDLS'] = burden_df['G&A GDLS'].ffill()
+
+# Step 5: Save updated sheet
+burden_df.to_excel("Updated_Burden_Rate_Import.xlsx", index=False)
