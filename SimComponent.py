@@ -1,91 +1,98 @@
-# ---------------------------------------------------------------------
-# MASTER PIPELINE :  Cognos MRR  ➜  SCM Requisition  ➜  Open‑Order Report
-# ---------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────
+# ALL‑IN‑ONE  |  MRR  +  SCM Requisition  +  Open‑Order Report  (v2)
+# ──────────────────────────────────────────────────────────────────────────
 import pandas as pd, re, sys
 from pathlib import Path
 
-# -----------------------------------------------------------------------------
-# 1. LOAD (unchanged)
+# ──── USER CONFIG ────────────────────────────────────────────────────────
+MRR_SHEET          = "MRR"          # ← adjust if your sheet name changes
+OPEN_ORDER_SHEET   = "Data"
+DATE_KEY_MRR       = "need_by_date" # col used for Month / Year labels
+DATE_KEY_SCM       = "req_creation_date"
+KEY_REQ_NUM        = "req_num"
+KEY_MCPR           = "mcpr_order_number"
+OUTPUT_FILE        = "data/output/mrr_scm_openorder_pipeline.xlsx"
+# ─────────────────────────────────────────────────────────────────────────
+
+def std_cols(df):
+    """snake‑case all headers so merges don’t break when users rename things."""
+    df.columns = (df.columns.str.lower()
+                            .str.strip()
+                            .str.replace(r'[^a-z0-9]+', '_', regex=True)
+                            .str.replace(r'^_+|_+$', '', regex=True))
+    return df
+
 def load(path, sheet_name=0, skiprows=None, debug=""):
     df = pd.read_excel(path, sheet_name=sheet_name, skiprows=skiprows)
-    print(f"[✓] {debug or Path(path).name:<28}  {df.shape[0]:>7,} × {df.shape[1]}")
+    print(f"[✓] {debug or Path(path).name:<30}  {df.shape[0]:>7,} × {df.shape[1]}")
+    return std_cols(df)
+
+def add_month_year(df, date_col):
+    if date_col not in df.columns:
+        print(f"[!] '{date_col}' not found – skipping Month/Year labels.")
+        return df
+    df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+    df["month"] = df[date_col].dt.month
+    df["year"]  = df[date_col].dt.year
     return df
 
-MRR_DF      = load(mrr_file,            sheet_name="MRR",  debug="MRR")
-SCM_REQ_DF  = load(scm_requisition_file, skiprows=2,        debug="SCM Requisition")
-OPEN_ORD_DF = load(open_order_file,     sheet_name="Data", debug="Open‑Order")
-
-# -----------------------------------------------------------------------------
-# 2. CLEAN  – unify headers and discover key columns
-def std_cols(df):
-    df.columns = (
-        df.columns
-          .str.lower()
-          .str.strip()
-          .str.replace(r'[^a-z0-9]+', '_', regex=True)     # spaces, #, /, etc.
-          .str.replace(r'(^_+|_+$)', '', regex=True)       # trim leading/trailing _
-    )
+def add_promise_flag(df, source_col="order_promised_date"):
+    if source_col not in df.columns:
+        print(f"[!] '{source_col}' not found – skipping Promise‑Date flag.")
+        return df
+    df["promise_date_flag"] = df[source_col].notna().map({True: "yes", False: "no"})
     return df
 
-MRR_DF, SCM_REQ_DF, OPEN_ORD_DF = map(std_cols, [MRR_DF, SCM_REQ_DF, OPEN_ORD_DF])
+# ──── 1. LOAD RAW FILES ──────────────────────────────────────────────────
+MRR_DF      = load(mrr_file,            sheet_name=MRR_SHEET,  debug="MRR")
+SCM_DF      = load(scm_requisition_file, skiprows=2,            debug="SCM Requisition")
+OPEN_DF     = load(open_order_file,     sheet_name=OPEN_ORDER_SHEET, debug="Open‑Order")
 
-# ---- find the receipt‑date column in MRR ----
-date_candidates = [c for c in MRR_DF.columns if 'receipt' in c and 'date' in c]
-if not date_candidates:
-    sys.exit("❌ Couldn’t find a receipt‑date column in MRR.  Run MRR_DF.columns to inspect.")
-receipt_col = date_candidates[0]
-print(f"[i] Using '{receipt_col}' as MRR receipt date")
+# ──── 2. KEEP MRR “HELPER” COLS SAFE – strip then re‑add later ──────────
+HELPER_COLS = ["month", "year", "vpp_billing", "promise_date_flag"]
+MRR_HELPERS = MRR_DF[HELPER_COLS].copy() if set(HELPER_COLS) <= set(MRR_DF.columns) else None
+MRR_DF = MRR_DF.drop(columns=[c for c in HELPER_COLS if c in MRR_DF.columns])
 
-# ---- find requisition creation date in SCM report ----
-req_date_candidates = [c for c in SCM_REQ_DF.columns if re.search(r'creation.*date', c)]
-if not req_date_candidates:
-    sys.exit("❌ Couldn’t find a requisition‑creation‑date column in SCM report.")
-scm_date_col = req_date_candidates[0]
-print(f"[i] Using '{scm_date_col}' as SCM requisition date")
+# ──── 3. TIDY IDENTIFIERS & DEDUPLICATE SCM ─────────────────────────────
+for df in (MRR_DF, SCM_DF):
+    rename_map = {c: KEY_REQ_NUM      for c in df.columns if re.fullmatch(r'req[_ ]?#', c)}
+    rename_map.update({c: KEY_MCPR    for c in df.columns if 'mcpr' in c})
+    df.rename(columns=rename_map, inplace=True)
 
-# ---- normalise key names we’ll join on ----
-def rename_if_exists(df, current_name, new_name):
-    if current_name in df.columns: df.rename(columns={current_name: new_name}, inplace=True)
+OPEN_DF.rename(columns={c: KEY_MCPR for c in OPEN_DF.columns if 'mcpr' in c}, inplace=True)
+OPEN_DF.rename(columns={c: KEY_REQ_NUM for c in OPEN_DF.columns if 'requisition' in c}, inplace=True)
 
-rename_if_exists(SCM_REQ_DF, 'req_',              'req_num')
-rename_if_exists(MRR_DF,     'req_',              'req_num')
-rename_if_exists(SCM_REQ_DF, 'mcpr_order_number', 'mcpr_order_number')
-rename_if_exists(OPEN_ORD_DF,'mcpr_order_number', 'mcpr_order_number')
+# SCM datetime & dedup
+SCM_DF[DATE_KEY_SCM] = pd.to_datetime(SCM_DF[DATE_KEY_SCM], errors='coerce')
+SCM_DEDUP = (SCM_DF
+             .sort_values(DATE_KEY_SCM)
+             .drop_duplicates(KEY_REQ_NUM, keep='last'))
 
-# -----------------------------------------------------------------------------
-# 3. TYPE CONVERSION + FILTERS
-MRR_DF[receipt_col]          = pd.to_datetime(MRR_DF[receipt_col], errors='coerce')
-SCM_REQ_DF[scm_date_col]     = pd.to_datetime(SCM_REQ_DF[scm_date_col], errors='coerce')
+# ──── 4. MERGE  (1‑to‑1 guaranteed) ──────────────────────────────────────
+STEP1 = (MRR_DF
+         .merge(SCM_DEDUP[[KEY_REQ_NUM, KEY_MCPR, "req_status"]],
+                on=KEY_REQ_NUM, how='left'))
 
-latest_received = MRR_DF[receipt_col].max()
-print(f"[i] Latest receipt in MRR  →  {latest_received:%Y‑%m‑%d}")
+FINAL = STEP1.merge(OPEN_DF[[KEY_MCPR, "vpp_billing_rate"]],
+                    on=KEY_MCPR, how='left')
 
-is_not_rejected = ~SCM_REQ_DF['req_status'].str.contains('reject|return', case=False, na=False)
-SCM_REQ_FILT = SCM_REQ_DF[(SCM_REQ_DF[scm_date_col] >= latest_received) & is_not_rejected].copy()
+# ──── 5. RE‑ADD / GENERATE LABEL COLUMNS ────────────────────────────────
+# regenerate Month & Year if they were removed or missing
+FINAL = add_month_year(FINAL, DATE_KEY_MRR)
+FINAL = add_promise_flag(FINAL, source_col="order_promised_date")
 
-# -----------------------------------------------------------------------------
-# 4. MERGES
-STEP1 = SCM_REQ_FILT.merge(
-    MRR_DF,
-    on       ='req_num',           # same name in both after rename
-    how      ='inner',
-    suffixes =('_scm', '_mrr')
-)
+# if original helper cols existed keep original values (overwrite regenerated)
+if MRR_HELPERS is not None:
+    FINAL[MRR_HELPERS.columns] = MRR_HELPERS
 
-# Only “true planned replenishments & commitments”
-flag_col  = next((c for c in STEP1.columns if 'commitment' in c), None)
-if flag_col:
-    STEP1 = STEP1[STEP1[flag_col].str.contains('planned|commit', case=False, na=False)]
+# ──── 6. EXPORT  – raw + interim + final for audit trail ────────────────
+OUTPUT_FILE = Path(OUTPUT_FILE)
+OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-FINAL = STEP1.merge(OPEN_ORD_DF, on='mcpr_order_number', how='left')
+with pd.ExcelWriter(OUTPUT_FILE, engine='xlsxwriter') as xl:
+    MRR_DF.to_excel( xl, "RAW_MRR",           index=False)
+    SCM_DEDUP.to_excel(xl, "SCM_DEDUP",       index=False)
+    OPEN_DF.to_excel(xl, "OPEN_ORDER_RAW",    index=False)
+    FINAL.to_excel(xl,  "FINAL_MERGE",        index=False)
 
-# -----------------------------------------------------------------------------
-# 5. EXPORT
-out_path = "data/output/mrr_scm_openorder_pipeline.xlsx"
-with pd.ExcelWriter(out_path, engine='xlsxwriter') as xl:
-    MRR_DF.to_excel(xl,        'RAW_MRR',           index=False)
-    SCM_REQ_FILT.to_excel(xl,  'FILTERED_SCM_REQ',  index=False)
-    STEP1.to_excel(xl,         'PLANNED_COMMIT',    index=False)
-    FINAL.to_excel(xl,         'FINAL_MERGE',       index=False)
-
-print(f"[✓] Pipeline finished – results written to →  {out_path}")
+print(f"[✓] Pipeline complete → {OUTPUT_FILE.resolve()}")
