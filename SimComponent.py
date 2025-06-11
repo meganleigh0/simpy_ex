@@ -1,88 +1,62 @@
-# ─────────────────────────────────────────────────────────
-#  HARD‑CODED “WHERE DOES IT GO?” TABLE
-#     key  = ‘Burden Pool’ string in other_rates
-#     val  = ( row‑id in BURDEN_RATE, numeric column in BURDEN_RATE )
-# ─────────────────────────────────────────────────────────
-MAP = {
-    # ALLOWABLE G&A – CSSC
-    "PSGA - CSSC G & A ALLOWABLE G & A RATE"
-        : ("CSSC BURDEN RATES",                "G&A C$"),
+# ----------------------------------------------------------------------------------
+# Pipeline: update Rate Band sheet with the “Simplified Rates” from RATSUM.xlsx
+# ----------------------------------------------------------------------------------
+import pandas as pd
+from pathlib import Path
 
-    # DIVISION‑level G&A – CSSC
-    "DVGA - DIVISION GENERAL & ADM ALLOWABLE G & A RATE"
-        : ("CSSC BURDEN RATES",                "G&A G$"),
+# ── 1. CONFIG  ────────────────────────────────────────────────────────────────────
+RATE_SUM_PATH   = Path("data/RATSUM.xlsx")          # source file ①
+RATE_BAND_PATH  = Path("data/RateBandImport.xlsx")  # source file ②
+OUTPUT_PATH     = Path("data/RateBandImport_UPDATED.xlsx")  # ← will be written
 
-    # Re‑order‑point surcharge
-    "DeptNA ALLOWABLE REORDER POINT RATE"
-        : ("NON DELIVERABLE",                  "ROP"),
+SHEET_NAME      = "SIMPLIFIED RATES NON-PSPL"  # sheet that holds the clean rates
+SKIP_ROWS       = 5                            # rows to skip before table starts
 
-    # Procurement O/H – GDLS
-    "PRLS - GDLS PROCUREMENT ALLOWABLE OVERHEAD RATE"
-        : ("DELIVERABLE - NON‑PRODUCTION FACILITY", "Proc O/H"),
+# ── 2. LOAD & CLEAN “SIMPLIFIED RATES”  ───────────────────────────────────────────
+def load_rate_sum(fp: Path) -> pd.DataFrame:
+    df = (pd.read_excel(fp, sheet_name=SHEET_NAME, skiprows=SKIP_ROWS)
+            # rename the real header that sits in col B row 6
+            .rename(columns={"Unnamed: 1": "BUSINESS UNIT GDLS"})
+            .iloc[1:]                       # drop duplicate header row
+            .reset_index(drop=True))
 
-    # Freight O/H – GDLS & CSSC
-    "PFRT - FREIGHT -- GDLS & CSSC ALLOWABLE OVERHEAD RATE"
-        : ("PASS THRU",                        "Proc O/H"),
+    # drop any leftover “Unnamed” columns
+    df = df.loc[:, ~df.columns.str.contains("Unnamed")]
 
-    # Corporate‑wide Procurement O/H
-    "GENERAL DYNAMICS LAND SYSTEMS ALLOWABLE PROCUREMENT RATE"
-        : ("DELIVERABLE - PRODUCTION FACILITY", "Proc O/H"),
+    # create two‑letter “rate_band” code (first two chars of BUSINESS UNIT)
+    df["rate_band"] = df["BUSINESS UNIT GDLS"].str.extract(r"^(..)")
+    df = df[~df["rate_band"].isin({"B/", "na", "nan"})]  # remove sub‑headers
 
-    # Major End‑Item surcharge
-    "DeptNA ALLOWABLE MAJOR END-ITEM RATE"
-        : ("MAJOR END ITEMS",                  "MEI O/H"),
+    # keep only the CY20xx numeric columns + the key
+    year_cols = [c for c in df.columns if c.startswith("# CY")]
+    keep_cols = ["rate_band"] + year_cols
+    return df[keep_cols]
 
-    # Support surcharge
-    "ALLOWABLE SUPPORT RATE"
-        : ("PASS THRU SPARES",                 "Support"),
+simplified_rates = load_rate_sum(RATE_SUM_PATH)
 
-    # Control‑test surcharge
-    "ALLOWABLE CONTL TEST RATE"
-        : ("OTHER DIRECT COST",                "Contl Test"),
-}
+# ── 3. LOAD “RateBandImport.xlsx”  ────────────────────────────────────────────────
+rate_band = pd.read_excel(RATE_BAND_PATH)
+rate_band["Rate Band"] = rate_band["Rate Band"].astype(str)  # normalise dtype
 
-# ─────────────────────────────────────────────────────────
-#  MAIN UPDATE ROUTINE
-# ─────────────────────────────────────────────────────────
-def push_other_rates_into_burden_rate(
-    other_rates: pd.DataFrame,
-    burden_rate: pd.DataFrame,
-    years      = (2022, 2023, 2024, 2025)
-) -> pd.DataFrame:
-    """
-    Copy every CYxxxx value in *other_rates* to its mapped
-    row/column in *burden_rate*.
+# ── 4. UPDATE RATE BAND VALUES  ───────────────────────────────────────────────────
+# match on the two‑letter code and overwrite CY20xx columns where a match exists
+for col in simplified_rates.columns:
+    if col == "rate_band":
+        continue                                          # skip key column
+    target_col = col.replace("# ", "")                    # "# CY2024" → "CY2024"
+    if target_col not in rate_band.columns:
+        # add missing year column so that the merge is loss‑less
+        rate_band[target_col] = pd.NA
 
-    Returns a **new** DataFrame (does not mutate in place).
-    """
-    br = burden_rate.copy()
+    # map() will align by index; combine_first() keeps existing non‑NA values
+    mapping = simplified_rates.set_index("rate_band")[col]
+    rate_band[target_col] = (rate_band["Rate Band"]
+                             .map(mapping)
+                             .combine_first(rate_band[target_col]))
 
-    # make look‑ups quick
-    br.set_index(["Description", "# Date"], inplace=True, drop=False)
+# ── 5. ROUND & SAVE  ──────────────────────────────────────────────────────────────
+year_cols = [c for c in rate_band.columns if c.startswith("CY20")]
+rate_band[year_cols] = rate_band[year_cols].astype(float).round(5)  # 5‑dec default
+rate_band.to_excel(OUTPUT_PATH, index=False)
 
-    for pool, (br_row_desc, br_col) in MAP.items():
-        for yr in years:
-            col_in_other = f"CY{yr}"
-            if col_in_other not in other_rates.columns:
-                continue                                    # that year isn't present
-            new_val = other_rates.loc[pool, col_in_other]
-
-            # locate the single row (Description == br_row_desc & # Date == yr)
-            key = (br_row_desc, yr)
-            if key not in br.index:
-                raise KeyError(f"Row “{br_row_desc}” / year {yr} not found in BURDEN_RATE")
-
-            br.at[key, br_col] = new_val
-
-    # restore original positional index order
-    br.reset_index(drop=True, inplace=True)
-    return br
-
-
-# ─────────────────────────────────────────────────────────
-#  USAGE
-# ─────────────────────────────────────────────────────────
-BURDEN_RATE = push_other_rates_into_burden_rate(other_rates, BURDEN_RATE)
-
-# (Optional) save the refreshed file
-# BURDEN_RATE.to_excel("updated_BurdenRateImport.xlsx", index=False)
+print(f"✅  RateBandImport has been updated and written to → {OUTPUT_PATH.resolve()}")
