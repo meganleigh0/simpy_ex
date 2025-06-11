@@ -1,56 +1,69 @@
-# ---------------------------------------------------------------
-#  ONE‑SHOT 2022‑VALUE‑MAPPER   other_rates  →  BURDEN_RATE
-# ---------------------------------------------------------------
+# ------------------------------------------------------------
+#  FY‑2022 VALUE‑BASED  M A P P E R
+#  (uses existing `other_rates`  &  `BURDEN_RATE` DataFrames)
+# ------------------------------------------------------------
 import re, numpy as np, pandas as pd
 
-YEAR_TO_MATCH = 2022      # change if you need a different anchor year
-TOL           = 1e-6      # allowed absolute difference for a "match"
+ANCHOR_YEAR = 2022     # year to compare
+TOL         = 1e-6     # allowed abs diff
 
-# ── 1. normalise year headers in other_rates ────────────────────
-year_re  = re.compile(r'(\d{4})')
-rename   = {c:int(year_re.search(str(c)).group(1))
-            for c in other_rates.columns if year_re.search(str(c))}
-orates   = other_rates.rename(columns=rename)
-if YEAR_TO_MATCH not in orates.columns:
-    raise ValueError(f"{YEAR_TO_MATCH} not found among year columns in other_rates")
+# ──────────────────────────────────────────────────────────────
+# 1. normalise headers in other_rates and drop duplicate years
+# ──────────────────────────────────────────────────────────────
+year_re = re.compile(r'(\d{4})')
+rename  = {c: int(year_re.search(str(c)).group(1))
+           for c in other_rates.columns if year_re.search(str(c))}
 
-# ── 2. pull 2022 values from source rows ────────────────────────
-src_vals = (orates[['Burden Pool', YEAR_TO_MATCH]]
-            .dropna(subset=[YEAR_TO_MATCH])
-            .assign(Value=lambda d: d[YEAR_TO_MATCH].astype(float))
-            .groupby('Burden Pool', as_index=False)      # if duplicates, keep first
-            .first())
+orates  = (other_rates
+           .rename(columns=rename)
+           .loc[:, ~other_rates.rename(columns=rename).columns.duplicated()])
 
-# ── 3. pull 2022 values from BURDEN_RATE columns ───────────────
+if ANCHOR_YEAR not in orates.columns:
+    raise ValueError(f"{ANCHOR_YEAR} not found among year columns after renaming")
+
+# ──────────────────────────────────────────
+# 2. 2022 values from each source row
+# ──────────────────────────────────────────
+src_vals = (orates[['Burden Pool', ANCHOR_YEAR]]
+            .dropna(subset=[ANCHOR_YEAR])
+            .astype({ANCHOR_YEAR: float})
+            .groupby('Burden Pool', as_index=False)    # if duplicates keep first
+            .first()
+            .rename(columns={ANCHOR_YEAR: 'Value'}))
+
+# ──────────────────────────────────────────
+# 3. 2022 values from each BURDEN_RATE column
+# ──────────────────────────────────────────
 BURDEN_RATE['Date'] = BURDEN_RATE['Date'].astype(int)
-tgt_2022 = BURDEN_RATE[BURDEN_RATE['Date'] == YEAR_TO_MATCH]
+row_2022 = BURDEN_RATE.loc[BURDEN_RATE['Date'] == ANCHOR_YEAR]
+
+if row_2022.empty:
+    raise ValueError(f"No row with Date == {ANCHOR_YEAR} in BURDEN_RATE")
 
 numeric_cols = [c for c in BURDEN_RATE.columns
                 if c not in {'Date', 'Burden Pool', 'Description', 'Effective Date'}
                 and np.issubdtype(BURDEN_RATE[c].dtype, np.number)]
 
-tgt_vals = (tgt_2022[numeric_cols].iloc[0]   # one row, because Date == 2022
+tgt_vals = (row_2022[numeric_cols].iloc[0]
             .dropna()
             .astype(float)
             .to_dict())
 
-# ── 4. build mapping by exact (±TOL) value match ───────────────
-mapping_rows = []
-used_cols    = set()
+# ──────────────────────────────────────────
+# 4. build 1‑to‑1 mapping on 2022 value
+# ──────────────────────────────────────────
+pairs, used_cols = [], set()
 
-for _, row in src_vals.iterrows():
-    pool, v = row['Burden Pool'], row['Value']
-    # find candidate columns whose 2022 value equals v within tolerance
-    cands = [c for c, tv in tgt_vals.items() if abs(tv - v) < TOL and c not in used_cols]
-    
-    if not cands:
-        mapping_rows.append((pool, None, '⚠ no match'))
-    else:
-        chosen = cands[0]
-        mapping_rows.append((pool, chosen, '' if len(cands) == 1 else 'dup‑value'))
-        used_cols.add(chosen)
+for _, r in src_vals.iterrows():
+    pool, v = r['Burden Pool'], r['Value']
+    match = next((c for c, tv in tgt_vals.items()
+                  if abs(tv - v) < TOL and c not in used_cols), None)
+    note  = '' if match else '⚠ no match'
+    if match:
+        used_cols.add(match)
+    pairs.append((pool, match, note))
 
-mapping_df = (pd.DataFrame(mapping_rows,
+mapping_df = (pd.DataFrame(pairs,
                            columns=['Burden Pool (other_rates)',
                                     'BURDEN_RATE column',
                                     'Note'])
@@ -58,9 +71,11 @@ mapping_df = (pd.DataFrame(mapping_rows,
               .reset_index(drop=True))
 
 display(mapping_df)
-print(f"✅  Matched {mapping_df['BURDEN_RATE column'].notna().sum()} "
-      f"of {len(src_vals)} rows on {YEAR_TO_MATCH} values")
+print(f"✅  matched {mapping_df['BURDEN_RATE column'].notna().sum()}"
+      f" of {len(mapping_df)} rows on FY‑{ANCHOR_YEAR}")
 
-# ── 5. dict you can feed into update_burden_rate() ──────────────
-AUTO_MAPPING = {(r['Burden Pool (other_rates)'], None): r['BURDEN_RATE column']
-                for _, r in mapping_df[mapping_df['BURDEN_RATE column'].notna()].iterrows()}
+# ──────────────────────────────────────────
+# 5. dict ready for update_burden_rate()
+# ──────────────────────────────────────────
+AUTO_MAPPING = {(row['Burden Pool (other_rates)'], None): row['BURDEN_RATE column']
+                for _, row in mapping_df[mapping_df['BURDEN_RATE column'].notna()].iterrows()}
