@@ -1,68 +1,88 @@
-# ----------------------------------------------------------
-# ONE‑CELL “FIRST VALUE” LOCATOR AND MAPPER
-# ----------------------------------------------------------
-import numpy as np
-import pandas as pd
+# ─────────────────────────────────────────────────────────
+#  HARD‑CODED “WHERE DOES IT GO?” TABLE
+#     key  = ‘Burden Pool’ string in other_rates
+#     val  = ( row‑id in BURDEN_RATE, numeric column in BURDEN_RATE )
+# ─────────────────────────────────────────────────────────
+MAP = {
+    # ALLOWABLE G&A – CSSC
+    "PSGA - CSSC G & A ALLOWABLE G & A RATE"
+        : ("CSSC BURDEN RATES",                "G&A C$"),
 
-# ── SET‑UP ────────────────────────────────────────────────
-ANCHOR_YEAR = 2022       # look only at 2022 rows in BURDEN_RATE
-TOLERANCE   = 1e-6       # float comparison tolerance
+    # DIVISION‑level G&A – CSSC
+    "DVGA - DIVISION GENERAL & ADM ALLOWABLE G & A RATE"
+        : ("CSSC BURDEN RATES",                "G&A G$"),
 
-# ── 1) isolate 2022 rows of BURDEN_RATE ───────────────────
-br2022 = BURDEN_RATE[BURDEN_RATE['# Date'] == ANCHOR_YEAR].copy()
+    # Re‑order‑point surcharge
+    "DeptNA ALLOWABLE REORDER POINT RATE"
+        : ("NON DELIVERABLE",                  "ROP"),
 
-# numeric columns to scan
-num_cols = br2022.select_dtypes(include='number').columns.tolist()
+    # Procurement O/H – GDLS
+    "PRLS - GDLS PROCUREMENT ALLOWABLE OVERHEAD RATE"
+        : ("DELIVERABLE - NON‑PRODUCTION FACILITY", "Proc O/H"),
 
-# ── 2) find the first non‑blank, non‑1 numeric value ──────
-target_val = None
-br_info    = None
+    # Freight O/H – GDLS & CSSC
+    "PFRT - FREIGHT -- GDLS & CSSC ALLOWABLE OVERHEAD RATE"
+        : ("PASS THRU",                        "Proc O/H"),
 
-for idx, row in br2022.iterrows():
-    for col in num_cols:
-        val = row[col]
-        if pd.notna(val) and val != 1:
-            target_val = val
-            br_info = {
-                'BR_RowIndex'   : idx,
-                'BR_BurdenPool' : row['Burden Pool'],
-                'BR_Description': row['Description'],
-                'BR_Column'     : col,
-                'Value'         : val
-            }
-            break
-    if target_val is not None:
-        break
+    # Corporate‑wide Procurement O/H
+    "GENERAL DYNAMICS LAND SYSTEMS ALLOWABLE PROCUREMENT RATE"
+        : ("DELIVERABLE - PRODUCTION FACILITY", "Proc O/H"),
 
-if target_val is None:
-    raise ValueError("No numeric value other than 1 found in 2022 BURDEN_RATE rows.")
+    # Major End‑Item surcharge
+    "DeptNA ALLOWABLE MAJOR END-ITEM RATE"
+        : ("MAJOR END ITEMS",                  "MEI O/H"),
 
-# ── 3) search other_rates 2022 columns for the same value ─
-if other_rates.index.name != 'Burden Pool':
-    other_rates = other_rates.set_index('Burden Pool')
+    # Support surcharge
+    "ALLOWABLE SUPPORT RATE"
+        : ("PASS THRU SPARES",                 "Support"),
 
-yr_cols = [c for c in other_rates.columns if str(ANCHOR_YEAR) in c]  # CY2022, CY2022.1, …
+    # Control‑test surcharge
+    "ALLOWABLE CONTL TEST RATE"
+        : ("OTHER DIRECT COST",                "Contl Test"),
+}
 
-match_info = None
-for col in yr_cols:
-    mask = np.isclose(other_rates[col], target_val, atol=TOLERANCE)
-    if mask.any():
-        pool = other_rates.index[mask].tolist()[0]
-        match_info = {
-            'OR_BurdenPool' : pool,
-            'OR_Column'     : col,
-            'Value'         : target_val
-        }
-        break
+# ─────────────────────────────────────────────────────────
+#  MAIN UPDATE ROUTINE
+# ─────────────────────────────────────────────────────────
+def push_other_rates_into_burden_rate(
+    other_rates: pd.DataFrame,
+    burden_rate: pd.DataFrame,
+    years      = (2022, 2023, 2024, 2025)
+) -> pd.DataFrame:
+    """
+    Copy every CYxxxx value in *other_rates* to its mapped
+    row/column in *burden_rate*.
 
-if match_info is None:
-    raise ValueError(f"Value {target_val} not found in any {ANCHOR_YEAR} column of other_rates.")
+    Returns a **new** DataFrame (does not mutate in place).
+    """
+    br = burden_rate.copy()
 
-# ── 4) show the mapping ──────────────────────────────────
-print(">>> FOUND IN BURDEN_RATE")
-for k, v in br_info.items():
-    print(f"{k:15}: {v}")
+    # make look‑ups quick
+    br.set_index(["Description", "# Date"], inplace=True, drop=False)
 
-print("\n>>> MATCHES IN other_rates")
-for k, v in match_info.items():
-    print(f"{k:15}: {v}")
+    for pool, (br_row_desc, br_col) in MAP.items():
+        for yr in years:
+            col_in_other = f"CY{yr}"
+            if col_in_other not in other_rates.columns:
+                continue                                    # that year isn't present
+            new_val = other_rates.loc[pool, col_in_other]
+
+            # locate the single row (Description == br_row_desc & # Date == yr)
+            key = (br_row_desc, yr)
+            if key not in br.index:
+                raise KeyError(f"Row “{br_row_desc}” / year {yr} not found in BURDEN_RATE")
+
+            br.at[key, br_col] = new_val
+
+    # restore original positional index order
+    br.reset_index(drop=True, inplace=True)
+    return br
+
+
+# ─────────────────────────────────────────────────────────
+#  USAGE
+# ─────────────────────────────────────────────────────────
+BURDEN_RATE = push_other_rates_into_burden_rate(other_rates, BURDEN_RATE)
+
+# (Optional) save the refreshed file
+# BURDEN_RATE.to_excel("updated_BurdenRateImport.xlsx", index=False)
