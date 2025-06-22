@@ -1,38 +1,36 @@
-Shared-Spaces Export-Control Checklist
-(Applies to GDLS operations in the US, Canada, UK, and Australia)
+# Define the matrix based on the visible table in the image
+data = [
+    {"Material": "GFM1", "Segment": "GDLS", "GFM FLAG": "X"},
+    {"Material": "GFM2 GDLS", "Segment": "GDLS", "GFM FLAG": "X"},
+    {"Material": "IST London", "Segment": "CSSC"},
+    {"Material": "IST Other", "Segment": "CSSC"},
+    {"Material": "MATL", "Segment": "Reference Only"},
+    {"Material": "MS1A1 GDLS", "Segment": "GDLS", "SPARES MATL": "X", "REORD POINT": "X", "PCURE GDLS": "X"},
+    {"Material": "MS1A2 CSSC", "Segment": "CSSC", "SPARES MATL": "X", "REORD POINT": "X", "PCURE GDLS": "X", "G&A CSSC": "X"},
+    {"Material": "MS1A2 GDLS", "Segment": "GDLS", "SPARES MATL": "X", "REORD POINT": "X", "PCURE GDLS": "X", "G&A GDLS": "X"},
+    {"Material": "MS1A3 CSSC", "Segment": "CSSC", "SPARES MATL": "X", "REORD POINT": "X", "PCURE GDLS": "X", "G&A CSSC": "X"},
+    {"Material": "MS1A3 GDLS", "Segment": "GDLS", "SPARES MATL": "X", "REORD POINT": "X", "PCURE GDLS": "X", "G&A GDLS": "X"},
+    {"Material": "MS1A4 GDLS", "Segment": "GDLS", "SPARES MATL": "X", "REORD POINT": "X", "PCURE GDLS": "X"},
+    {"Material": "MS1C", "Segment": "GDLS", "PCURE GDLS": "X"},
+    {"Material": "MSPT GDLS", "Segment": "GDLS", "SPARES ALLOCATION": "X"},
 
-⸻
+    # Spares Allocation DOES apply
+    {"Material": "IST London Spares", "Segment": "CSSC", "SPARES MATL": "X", "REORD POINT": "X", "PCURE GDLS": "X", "SPARE ALLOCATION": "X"},
+    {"Material": "MS1D1 GDLS", "Segment": "GDLS", "SPARES MATL": "X", "REORD POINT": "X", "PCURE GDLS": "X", "SPARE ALLOCATION": "X"},
+    {"Material": "MS1D2 GDLS", "Segment": "GDLS", "SPARES MATL": "X", "REORD POINT": "X", "PCURE GDLS": "X", "SPARE ALLOCATION": "X"},
+    {"Material": "MS1D3 GDLS", "Segment": "GDLS", "SPARES MATL": "X", "REORD POINT": "X", "PCURE GDLS": "X", "SPARE ALLOCATION": "X"},
+    {"Material": "MS1D4 GDLS", "Segment": "GDLS", "SPARES MATL": "X", "REORD POINT": "X", "PCURE GDLS": "X", "SPARE ALLOCATION": "X"},
+    {"Material": "MS1C GDLS", "Segment": "GDLS", "PCURE GDLS": "X", "SPARE ALLOCATION": "X"},
 
-	1.	Classify the data
-	•	Assume control if the material is used in design, manufacture, test, or repair (drawings, CAD, models, software, test results, etc.).
-	•	Check the relevant lists: ITAR/EAR (US), EIPA & Canadian ITAR, UK Strategic Export Controls, DSGL / USML / CCL (AU).
-	•	Cost, schedule, and generic parts lists are typically not controlled.
-	•	Unsure? Stop and call Trade Compliance.
-	2.	Confirm you hold a valid authorisation
-	•	Licence, permit, exemption, or agreement must cover every intended recipient and every country of access (e.g., TAA, MLA, DSP-5, EAR licence, OGEL, MA, AUKUS/DEC exemption).
-	•	For AUKUS exemptions, submit notification to Defence Export Controls (DEC) via the MADE portal before release.
-	3.	Verify delegation and NDAs
-	•	You—and anyone you will grant access—must be a named delegate on the authorisation.
-	•	Ensure each user has an NDA that satisfies ITAR or local rules.
-	•	UK uploads: complete a Document Transmittal Form (DTL); the Data Management team performs the actual upload.
-	4.	Prepare and mark the file
-	•	Add to the header or metadata:
-• Authorisation / permit number(s)
-• Control category (e.g., ITAR XI(d), 0E606.a, DSGL Sch 3)
-• Country of origin
-• The banner “EXPORT CONTROLLED”
-	•	Remove or redact any content outside the licence scope.
-	5.	Release only to approved users in approved territories
-	•	Grant KBS access solely to individuals verified in Step 3.
-	•	ITAR data: any re-transfer outside the original licence (e.g., CA→UK, UK→AU) requires a new TAA/MLA.
-	•	Canada: most EAR items may be shared internally; ITAR items may not.
-	6.	Log the transfer
-	•	Record every upload, download, or technical change in the Export-Control database.
-	•	High-volume projects: a weekly summary log is acceptable; sporadic actions require individual entries.
-	7.	Maintain ongoing compliance
-	•	Review licences, delegate lists, and NDAs quarterly; remove departed users immediately.
-	•	Embedding US- or AU-origin technology in another country’s work product can trigger new licensing—validate before further export.
+    # ODCs
+    {"Material": "ODC CSSC", "Segment": "CSSC", "ODC": "X"},
+    {"Material": "ODC GDLS", "Segment": "GDLS", "ODC": "X"},
+    {"Material": "TRVL CSSC", "Segment": "CSSC", "ODC": "X"},
+    {"Material": "TRVL GDLS", "Segment": "GDLS", "ODC": "X"},
+]
 
-⸻
+# Convert to DataFrame
+df = pd.DataFrame(data)
 
-Any uncertainty? STOP and contact Trade Compliance immediately (tradecompliance@ / + [phone]).
+# Display the structured matrix
+import ace_tools as tools; tools.display_dataframe_to_user(name="Cost Element Burdening Matrix", dataframe=df)
