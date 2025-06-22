@@ -1,88 +1,102 @@
-# ----------------- ONE-CELL PIPELINE: update BurdenRateImport from OTHER RATES -----------------
+###############################################################################
+#  UPDATE BurdenRateImport.xlsx WITH THE 9 LINES FROM OTHER RATES             #
+###############################################################################
 import re
 import pandas as pd
 from pathlib import Path
 
-# ────────────────────────────────────────────────────────────────────────────────
-# 1. Helper dictionaries – adjust if your column names ever change
-# ────────────────────────────────────────────────────────────────────────────────
-POOL_KEYWORDS = {             # text to look for  ➜  Burden Pool in BURDEN_RATE
-    "CSSC": "CSSC",
-    "GDLS": "GDLS",
-    "DIVISION": "GDLS"        # “Division General & Adm” rows belong to GDLS pool
+# ─────────────────────────────────────────────────────────────────────────────
+# 0.  Assumes you already ran something like:                                  
+#         other_rates   = RATE_SUM_DATA.parse("OTHER RATES", skiprows=5, ...)
+#         BURDEN_RATE   = pd.read_excel("data/BurdenRateImport.xlsx")          
+#     If not, load them first.                                                 
+# ─────────────────────────────────────────────────────────────────────────────
+
+# 1)  DECLUTTER the “OTHER RATES” sheet  ──────────────────────────────────────
+label_col = other_rates.columns[0]                                # first col → index
+other_rates.columns = [re.sub(r"^#\s*", "", c).strip()            # “# CY2022” → “CY2022”
+                       for c in other_rates.columns]
+other_rates = other_rates.set_index(label_col).dropna(how="all")  # tidy blanks
+
+year_cols  = [c for c in other_rates.columns if re.fullmatch(r"CY\d{4}", c)]
+other_rates = (other_rates[year_cols]           # keep just CY20XX numbers
+                           .ffill(axis=1))      # forward-fill → last value “sticks”
+
+# 2)  QUICK DICTIONARIES THAT TELL THE SCRIPT **WHAT** TO TOUCH  ─────────────
+#
+# Every row in OTHER RATES is matched to:
+#   • one-or-more “Burden Pool” values in BurdenRateImport  (CSSC, GDLS,…)
+#   • one-or-more cost-element **columns** to overwrite      (G&A CSSC, REORD …)
+# If your naming conventions ever change, just tweak these two dicts.
+
+POOL_RULES = {                 # any of these phrases  ➜  write into these pools
+    "CSSC":          ["CSSC"],
+    "GDLS":          ["GDLS"],
+    "GENERAL DYN":   ["GDLS"],
+    "DIVISION":      ["GDLS"],
+    "GDLS & CSSC":   ["GDLS", "CSSC"],          # apply to both
 }
 
-COST_COL_KEYWORDS = {         # text to look for  ➜  cost-element column to update
-    "G & A":            "GRA G & A",
-    "REORDER POINT":    "ROP",
-    "OVERHEAD RATE":    "PROC O/H",
-    "PROCUREMENT RATE": "PCURE GDLS",
-    "MAJOR END-ITEM":   "MAJOR END ITEM",
-    "SUPPORT RATE":     "SUPPORT",
-    "CONTL TEST":       "CONTL TEST RATE"
+COLUMN_RULES = {               # phrase that appears in label  ➜  target-column hints
+    "G & A":            ["G&A", "GRA"],         # picks up “G&A CSSC”, “GRA G & A” …
+    "REORDER POINT":    ["REORD"],
+    "OVERHEAD":         ["OVERHEAD", "PROC O/H", "OH"],
+    "PROCUREMENT":      ["PCURE", "PROCURE"],
+    "MAJOR END-ITEM":   ["MAJOR END"],
+    "SUPPORT":          ["SUPPORT"],
+    "CONTL TEST":       ["CONTL", "TEST"],
 }
 
-# if you only want to write into columns that are called out in your
-# cost_element_burdening_matrix, keep the intersection:
-valid_cost_columns = set(cost_element_df.columns) & set(BURDEN_RATE.columns)
+# 3)  MAKE LIFE EASY: create helpers that turn a row-label into (pools, cols) ─
+def pools_for(label: str) -> list[str]:
+    pools = []
+    for key, val in POOL_RULES.items():
+        if key in label:
+            pools.extend(val)
+    return pools or ["CSSC", "GDLS"]            # default → hit both sets
 
-# ────────────────────────────────────────────────────────────────────────────────
-# 2. Tidy OTHER RATES so we have a clean index + CY20XX numeric columns
-# ────────────────────────────────────────────────────────────────────────────────
-other_rates = (
-    other_rates
-      .dropna(how="all", axis=0)                # remove empty rows
-      .dropna(how="all", axis=1)                # remove empty cols
-)
-# drop the leading “# ” that Jupyter shows and make sure we keep CY columns only
-other_rates.columns = [
-    re.sub(r"^#\s*", "", c).strip()             # “# CY2022” ➜ “CY2022”
-    for c in other_rates.columns
-]
-year_cols = [c for c in other_rates.columns if re.fullmatch(r"CY\d{4}", c)]
-other_rates = other_rates.set_index(other_rates.columns[0])   # first col is the label
+def columns_for(label: str) -> list[str]:
+    hits = []
+    for key, hints in COLUMN_RULES.items():
+        if key in label:
+            for h in hints:
+                hits.extend([c for c in BURDEN_RATE.columns
+                             if h in c.upper()])
+    return list(dict.fromkeys(hits))            # drop dupes, keep order
 
-# ────────────────────────────────────────────────────────────────────────────────
-# 3. Main loop – for every line in OTHER RATES push values to BURDEN_RATE
-# ────────────────────────────────────────────────────────────────────────────────
-for label, row in other_rates[year_cols].iterrows():
+# 4)  MAIN LOOP – push each OTHER RATES line into every matching cell ─────────
+for label, rates in other_rates.iterrows():
+    label_u = label.upper()
 
-    # which burden pool(s) does this line affect?
-    pools = {
-        POOL_KEYWORDS[k] for k in POOL_KEYWORDS if k in label.upper()
-    } or {"GDLS"}   # default to GDLS if no keyword found
-
-    # which cost-element column should be updated?
-    dest_col = next((
-        COST_COL_KEYWORDS[k] for k in COST_COL_KEYWORDS if k in label.upper()
-    ), None)
-    if dest_col is None or dest_col not in valid_cost_columns:
-        # Nothing to update – skip quietly
+    dest_pools   = pools_for(label_u)
+    dest_columns = columns_for(label_u)
+    if not dest_columns:
+        # Nothing in this row maps to a column we know about – skip quietly
         continue
 
-    for pool in pools:
-        for cy_col in year_cols:                       # e.g. “CY2022”
-            yr = int(cy_col[2:])                       # 2022 -> integer
-            mask = (
-                (BURDEN_RATE["Burden Pool"].str.upper() == pool)
-                & (BURDEN_RATE["Date"] == yr)
-            )
-            BURDEN_RATE.loc[mask, dest_col] = row[cy_col]
+    # pre-build a dict {year:int → rate:float}, forward-filled
+    cy_rate = {int(c[2:]): rates[c] for c in year_cols}
+    last_year  = max(k for k, v in cy_rate.items() if pd.notna(v))
+    last_value = cy_rate[last_year]
+    for y in range(last_year+1, BURDEN_RATE["Date"].max()+1):
+        cy_rate[y] = last_value                 # carry last value forward
 
-# ────────────────────────────────────────────────────────────────────────────────
-# 4. Optional rounding (uncomment / tweak to taste)
-# ────────────────────────────────────────────────────────────────────────────────
-for col in valid_cost_columns:
-    if col == "COM":                                       # six decimal places
-        BURDEN_RATE[col] = BURDEN_RATE[col].round(6)
-    else:                                                  # five elsewhere
-        BURDEN_RATE[col] = BURDEN_RATE[col].round(5)
+    # now slam the numbers in
+    for pool in dest_pools:
+        mask_pool = BURDEN_RATE["Burden Pool"].str.upper() == pool
+        for col in dest_columns:
+            # update *all* years present in BURDEN_RATE for this pool
+            for idx, row in BURDEN_RATE[mask_pool].iterrows():
+                yr = int(row["Date"])
+                if yr in cy_rate:
+                    BURDEN_RATE.at[idx, col] = cy_rate[yr]
 
-# ────────────────────────────────────────────────────────────────────────────────
-# 5. Save a clean copy so the original file stays untouched
-# ────────────────────────────────────────────────────────────────────────────────
+# 5)  HOUSE-KEEPING – round the numbers exactly as you asked last time ───────
+for c in BURDEN_RATE.select_dtypes(include="number").columns:
+    BURDEN_RATE[c] = (BURDEN_RATE[c].round(6) if c.startswith("COM")
+                      else BURDEN_RATE[c].round(5))
+
+# 6)  SAVE A CLEAN COPY  ──────────────────────────────────────────────────────
 out_path = Path("data") / "BurdenRateImport_updated.xlsx"
 BURDEN_RATE.to_excel(out_path, index=False)
-
-print(f"✅ Burden rates updated and written to {out_path}")
-# --------------------------------------------------------------------------------
+print(f"✅  Burden rates written to {out_path}")
