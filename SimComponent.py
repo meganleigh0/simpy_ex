@@ -1,43 +1,36 @@
-import re, os, pandas as pd
+import os, re, pandas as pd
 
-# ---------- helper to pull MM-DD-YYYY from the file name ----------
-def get_snapshot_date(path, pattern=r'(\d{2}-\d{2}-\d{4})'):
-    return pd.to_datetime(re.search(pattern, os.path.basename(path)).group(1),
+# ------------ tweak if your date format differs ------------
+DATE_RE = re.compile(r'(\d{2}-\d{2}-\d{4})')   # MM-DD-YYYY in file name
+
+def snap_date(path):
+    """Return a pandas Timestamp extracted from the file path."""
+    return pd.to_datetime(DATE_RE.search(os.path.basename(path)).group(1),
                           format='%m-%d-%Y')
 
-# ---------- choose YOUR exact column names here ----------
-# Oracle workbook columns
-ORACLE_PART_COL = "Item No"
-ORACLE_MB_COL   = "Make/Buy"
-
-# TeamCenter workbook columns
-TC_PART_COL = "PART_NUMBER"
-TC_MB_COL   = "Make or Buy"
-
-# ---------- build a list of tidy DataFrames ----------
 frames = []
 
-# 1️⃣  Oracle files
+# ---------- Oracle ----------
 for path, df in oracle_mboms.items():
-    sub = df[[ORACLE_PART_COL, ORACLE_MB_COL]].copy()
-    sub.columns = ["part_number", "make_buy"]
-    sub["make_buy"]      = sub["make_buy"].astype(str).str.strip().str[0].str.upper()
-    sub["snapshot_date"] = get_snapshot_date(path)
-    sub["system"]        = "Oracle"
-    frames.append(sub)
+    tmp = df[['Item No', 'Make/Buy']].copy()      # ← your exact column names
+    tmp.columns = ['part_number', 'make_buy']
+    tmp['make_buy']      = tmp['make_buy'].astype(str).str.strip().str[0].str.upper()
+    tmp['snapshot_date'] = snap_date(path)
+    tmp['system']        = 'Oracle'
+    frames.append(tmp)
 
-# 2️⃣  TeamCenter files
+# ---------- TeamCenter ----------
 for path, df in tc_mboms.items():
-    sub = df[[TC_PART_COL, TC_MB_COL]].copy()
-    sub.columns = ["part_number", "make_buy"]
-    sub["make_buy"]      = sub["make_buy"].astype(str).str.strip().str[0].str.upper()
-    sub["snapshot_date"] = get_snapshot_date(path)
-    sub["system"]        = "TeamCenter"
-    frames.append(sub)
+    tmp = df[['PART_NUMBER', 'Make or Buy']].copy()   # ← your exact column names
+    tmp.columns = ['part_number', 'make_buy']
+    tmp['make_buy']      = tmp['make_buy'].astype(str).str.strip().str[0].str.upper()
+    tmp['snapshot_date'] = snap_date(path)
+    tmp['system']        = 'TeamCenter'
+    frames.append(tmp)
 
 # ---------- one big tidy table ----------
 all_mboms_long = pd.concat(frames, ignore_index=True)
 
-# quick peek
+# quick sanity-check
 print(all_mboms_long.head())
-print(f"\nTotal rows: {len(all_mboms_long):,}")
+print(f"\nRows: {len(all_mboms_long):,} | Unique parts: {all_mboms_long.part_number.nunique():,}")
