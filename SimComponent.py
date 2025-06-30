@@ -1,71 +1,51 @@
 import os, re, pandas as pd
 
-# ────────────────────────────────────────────────────────────────
-# helper: pull MM-DD-YYYY from the file name
-# ────────────────────────────────────────────────────────────────
-DATE_RE = re.compile(r'(\d{2}-\d{2}-\d{4})')        # match 06-23-2025, etc.
+# ──────────────────────────────────────────────────────────────
+# 1.  helper – pull MM-DD-YYYY from each dictionary key
+# ──────────────────────────────────────────────────────────────
+DATE_RE = re.compile(r'_(\d{2}-\d{2}-\d{4})')   # e.g. _06-23-2025
 
-def snap_date(path):
+def extract_date(path: str) -> pd.Timestamp:
     m = DATE_RE.search(os.path.basename(path))
-    return pd.to_datetime(m.group(1), format='%m-%d-%Y') if m else pd.NaT
+    if not m:
+        raise ValueError(f"No MM-DD-YYYY date in: {path}")
+    return pd.to_datetime(m.group(1), format='%m-%d-%Y')
 
-# ────────────────────────────────────────────────────────────────
-# helper: squash weird spacing / case in column labels
-# ────────────────────────────────────────────────────────────────
-def normalise_cols(df):
-    """
-    'Item No'  ->  'itemno'
-    'Make or Buy' -> 'makeorbuy'
-    """
-    df = df.copy()
-    df.columns = [re.sub(r'[\s_\-]+', '', str(c)).lower() for c in df.columns]
-    return df
+# ──────────────────────────────────────────────────────────────
+# 2.  build one long DataFrame
+# ──────────────────────────────────────────────────────────────
+frames = []
 
-# ────────────────────────────────────────────────────────────────
-# turn one of the dictionaries into a tidy long-form DataFrame
-# ────────────────────────────────────────────────────────────────
-def stack_mboms(mboms_dict, system):
-    frames = []
+# Oracle MBOMs  -------------------------------------------------
+for path, df in oracle_mboms.items():
+    sub = df[['PART_NUMBER', 'Make/Buy']].copy()
+    sub.columns = ['part_number', 'make_buy']
+    sub['make_buy']      = sub['make_buy'].astype(str).str.strip().str[0].str.upper()
+    sub['snapshot_date'] = extract_date(path)
+    sub['system']        = 'Oracle'
+    frames.append(sub)
 
-    for path, df in mboms_dict.items():
-        sdf = normalise_cols(df)
+# TeamCenter MBOMs  --------------------------------------------
+for path, df in tc_mboms.items():
+    sub = df[['PART_NUMBER', 'Make or Buy']].copy()
+    sub.columns = ['part_number', 'make_buy']
+    sub['make_buy']      = sub['make_buy'].astype(str).str.strip().str[0].str.upper()
+    sub['snapshot_date'] = extract_date(path)
+    sub['system']        = 'TeamCenter'
+    frames.append(sub)
 
-        # Oracle files say 'itemno', TeamCenter 'partnumber' → grab whichever exists
-        part_col = next((c for c in sdf.columns if c in ('itemno', 'partnumber')), None)
-        make_col = next((c for c in sdf.columns if 'make' in c and 'buy' in c), None)
+# one big table
+all_mboms_long = pd.concat(frames, ignore_index=True)
 
-        if part_col is None or make_col is None:
-            print(f"⚠️  Skipping {os.path.basename(path)} – missing part/make columns")
-            continue
+# ──────────────────────────────────────────────────────────────
+# 3.  detect flips (M ↔ B) for every part
+# ──────────────────────────────────────────────────────────────
+all_mboms_long.sort_values(['system', 'part_number', 'snapshot_date'], inplace=True)
 
-        tmp = sdf[[part_col, make_col]].copy()
-        tmp.columns = ['part_number', 'make_buy']
-        tmp['make_buy']      = tmp['make_buy'].astype(str).str.strip().str[0].str.upper()
-        tmp['snapshot_date'] = snap_date(path)
-        tmp['system']        = system
-        frames.append(tmp)
-
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-
-# ────────────────────────────────────────────────────────────────
-# 1. build the long table
-# ────────────────────────────────────────────────────────────────
-oracle_long = stack_mboms(oracle_mboms,   'Oracle')
-tc_long     = stack_mboms(tc_mboms,       'TeamCenter')
-all_mboms_long = pd.concat([oracle_long, tc_long], ignore_index=True)
-
-# ────────────────────────────────────────────────────────────────
-# 2. find status flips part-by-part
-# ────────────────────────────────────────────────────────────────
-all_mboms_long = all_mboms_long.dropna(subset=['snapshot_date'])              # safety
-all_mboms_long = all_mboms_long.sort_values(['system','part_number','snapshot_date'])
-
-# previous flag for each part
 all_mboms_long['prev_flag'] = (
-    all_mboms_long.groupby(['system','part_number'])['make_buy'].shift()
+    all_mboms_long.groupby(['system', 'part_number'])['make_buy'].shift()
 )
 
-# rows where flag changed (M→B or B→M)
 flips = all_mboms_long[
     all_mboms_long['prev_flag'].notna() &
     (all_mboms_long['make_buy'] != all_mboms_long['prev_flag'])
@@ -73,21 +53,23 @@ flips = all_mboms_long[
 
 flips['change_dir'] = flips['prev_flag'] + '→' + flips['make_buy']
 
-# ────────────────────────────────────────────────────────────────
-# 3. roll up by calendar week
-# ────────────────────────────────────────────────────────────────
-flips['week'] = flips['snapshot_date'].dt.to_period('W').apply(lambda r: r.start_time)
+# ──────────────────────────────────────────────────────────────
+# 4.  weekly roll-up of flips
+# ──────────────────────────────────────────────────────────────
+flips['week_start'] = flips['snapshot_date'].dt.to_period('W').start_time
 
-weekly_flip_summary = (flips
-        .groupby(['system','week','change_dir'])
-        .agg(parts_changed=('part_number', lambda s: sorted(s.unique())),
-             n_parts       =('part_number', 'nunique'))
-        .reset_index())
+weekly_flip_summary = (
+    flips.groupby(['system', 'week_start', 'change_dir'])
+         .agg(n_parts=('part_number', 'nunique'),
+              parts_changed=('part_number', lambda s: sorted(s.unique())))
+         .reset_index()
+         .sort_values(['system', 'week_start'])
+)
 
-# ────────────────────────────────────────────────────────────────
-# 4. quick sanity-check in the notebook
-# ────────────────────────────────────────────────────────────────
-print("\nAll MBOM rows:", len(all_mboms_long))
-print("Flips detected :", len(flips))
-print("\n=== Sample of weekly flip summary ===")
+# ──────────────────────────────────────────────────────────────
+# 5.  quick sanity-check
+# ──────────────────────────────────────────────────────────────
+print("All MBOM rows:", len(all_mboms_long))
+print("Flips detected:", len(flips))
+print("\nSample weekly summary:")
 display(weekly_flip_summary.head())
