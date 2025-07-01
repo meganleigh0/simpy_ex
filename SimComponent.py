@@ -1,73 +1,73 @@
-import os, re, pandas as pd
+# Databricks / Jupyter – run in ONE cell
+import pandas as pd, glob, os, re
 
-# ───────── 1.  pull MM-DD-YYYY out of each filename ──────────
-DATE_RE = re.compile(r'(\d{2}-\d{2}-\d{4})')     # 06-30-2025 etc.
+BASE_PATH = "data/bronze/boms"          # adjust if your root is different
 
-def snapshot_date(path: str) -> pd.Timestamp | pd.NaT:
-    m = DATE_RE.search(os.path.basename(path))
-    return pd.to_datetime(m.group(1), format='%m-%d-%Y') if m else pd.NaT
+def load_all_mboms(base_path: str = BASE_PATH) -> pd.DataFrame:
+    """Return one long tidy DF: PART_NUMBER | make_buy | source | snapshot_date"""
+    dfs = []
+    for f in glob.glob(os.path.join(base_path, "mbom_*_*.csv")):
+        # expect mbom_oracle_2025-06-30.csv or mbom_tc_2025-06-30.csv
+        m = re.search(r"mbom_(oracle|tc)_(\d{4}-\d{2}-\d{2})", os.path.basename(f))
+        if not m:
+            continue                       # skip anything that doesn't match the pattern
+        src, date_str = m.groups()
+        snap_date = pd.to_datetime(date_str)
 
+        df = pd.read_csv(f)
+        # unify column names
+        if src == "oracle":
+            df = df.rename(columns={"Make/Buy": "make_buy"})
+        else:                              # tc
+            df = df.rename(columns={"Make or Buy": "make_buy"})
 
-# ───────── 2.  build one tidy table from both dictionaries ───
-frames = []
+        df = df[["PART_NUMBER", "make_buy"]].copy()
+        df["source"] = src
+        df["snapshot_date"] = snap_date
+        dfs.append(df)
 
-for system, mboms in [('Oracle', oracle_mboms), ('TeamCenter', tc_mboms)]:
-    for path, df in mboms.items():
+    if not dfs:
+        raise FileNotFoundError("No MBOM files matched the expected patterns.")
+    return pd.concat(dfs, ignore_index=True)
 
-        # find the two columns, ignoring upper/lower/spaces/slashes
-        make_col = next(
-            (c for c in df.columns
-             if 'make' in c.lower() and 'buy' in c.lower()),
-            None
-        )
-        part_col = next(
-            (c for c in df.columns
-             if 'part' in c.lower() and 'num'  in c.lower()),
-            None
-        )
+# ---------- LOAD ----------
+combined = load_all_mboms()
 
-        if make_col is None or part_col is None:
-            print(f"⚠️  {os.path.basename(path)} skipped – column not found")
-            continue
-
-        sub = df[[part_col, make_col]].copy()
-        sub.columns      = ['part_number', 'make_buy']
-        sub['make_buy']  = sub['make_buy'].astype(str).str.strip().str[0].str.upper()
-        sub['system']    = system
-        sub['snapshot_date'] = snapshot_date(path)
-        frames.append(sub)
-
-all_mboms_long = pd.concat(frames, ignore_index=True)
-
-
-# ───────── 3.  detect every Make↔Buy flip per part ───────────
-all_mboms_long.sort_values(['system','part_number','snapshot_date'], inplace=True)
-
-all_mboms_long['prev_flag'] = (
-    all_mboms_long.groupby(['system','part_number'])['make_buy'].shift()
+# ---------- ORACLE vs TC COMPARISON *WITHIN* EACH SNAPSHOT ----------
+same_day_match = (
+    combined[combined["source"] == "oracle"]
+    .merge(
+        combined[combined["source"] == "tc"],
+        on=["PART_NUMBER", "snapshot_date"],
+        suffixes=("_oracle", "_tc"),
+        how="outer",
+    )
+    .assign(match=lambda d: d["make_buy_oracle"] == d["make_buy_tc"])
 )
 
-flips = all_mboms_long[
-    all_mboms_long['prev_flag'].notna() &
-    (all_mboms_long['make_buy'] != all_mboms_long['prev_flag'])
-].copy()
+mismatches = same_day_match[~same_day_match["match"]]
 
-flips['change_dir'] = flips['prev_flag'] + '→' + flips['make_buy']
+# ---------- MAKE-BUY FLIPS *OVER TIME* INSIDE EACH SOURCE ----------
+combined = combined.sort_values(["PART_NUMBER", "source", "snapshot_date"])
+combined["prev_make_buy"] = combined.groupby(["PART_NUMBER", "source"])["make_buy"].shift()
+combined["flipped"] = combined["make_buy"] != combined["prev_make_buy"]
 
+flips = combined[combined["flipped"]]
 
-# ───────── 4.  weekly roll-up of those flips ────────────────
-flips['week_start'] = flips['snapshot_date'].dt.to_period('W').start_time
-
-weekly_flip_summary = (
-    flips.groupby(['system','week_start','change_dir'])
-         .agg(n_parts=('part_number','nunique'),
-              parts_changed=('part_number', lambda s: sorted(s.unique())))
-         .reset_index()
-         .sort_values(['system','week_start'])
+# ---------- OPTIONAL WEEKLY SUMMARY ----------
+weekly_summary = (
+    same_day_match.assign(week=lambda d: d["snapshot_date"].dt.isocalendar().week)
+    .groupby("week")["match"]
+    .agg(total_parts="size", mismatched_parts=lambda s: (~s).sum())
+    .assign(percent_match=lambda d: 100 * (d["total_parts"] - d["mismatched_parts"]) / d["total_parts"])
+    .reset_index()
 )
 
+# ---------- SAVE BACK TO THE LAKE (if desired) ----------
+# spark_df = spark.createDataFrame(combined)   # Databricks: convert to Spark
+# spark_df.write.format("delta").mode("overwrite").save("dbfs:/gold/match_history")
 
-# ───────── 5.  quick sanity-check (feel free to delete) ─────
-print(f"All rows loaded : {len(all_mboms_long):,}")
-print(f"Flips detected  : {len(flips):,}")
-display(weekly_flip_summary.head())
+# ---- Quick sanity prints ----
+print(f"Loaded {combined.shape[0]} total part-records across {combined['snapshot_date'].nunique()} snapshots")
+print(f"{mismatches.shape[0]} mismatches between Oracle and TC on the same day")
+print(f"{flips.shape[0]} make/buy flips within sources over time")
