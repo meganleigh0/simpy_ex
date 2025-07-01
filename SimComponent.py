@@ -1,73 +1,112 @@
-# Databricks / Jupyter – run in ONE cell
-import pandas as pd, glob, os, re
+# ONE-CELL SOLUTION  ──────────────────────────────────────────────────────────
+import pandas as pd, re
+from pathlib import Path
 
-BASE_PATH = "data/bronze/boms"          # adjust if your root is different
+# ── 1. CONFIG ────────────────────────────────────────────────────────────────
+BASE_DIR   = Path("data/bronze_boms")      # change if your root differs
+EXTENSIONS = (".csv", ".xls", ".xlsx", ".xlsm")
 
-def load_all_mboms(base_path: str = BASE_PATH) -> pd.DataFrame:
-    """Return one long tidy DF: PART_NUMBER | make_buy | source | snapshot_date"""
-    dfs = []
-    for f in glob.glob(os.path.join(base_path, "mbom_*_*.csv")):
-        # expect mbom_oracle_2025-06-30.csv or mbom_tc_2025-06-30.csv
-        m = re.search(r"mbom_(oracle|tc)_(\d{4}-\d{2}-\d{2})", os.path.basename(f))
-        if not m:
-            continue                       # skip anything that doesn't match the pattern
-        src, date_str = m.groups()
-        snap_date = pd.to_datetime(date_str)
+# ── 2. DISCOVER & LOAD ───────────────────────────────────────────────────────
+def discover_files(bom_kind: str, source: str) -> list[Path]:
+    """
+    Returns every file whose name looks like
+        <anything>/<bom_kind>_<source>_YYYY-MM-DD.<ext>
+    under BASE_DIR, no matter how deeply nested.
+    """
+    pattern = re.compile(fr"{bom_kind}_{source}_(\d{{4}}-\d{{2}}-\d{{2}})")
+    return [
+        fp for fp in BASE_DIR.rglob(f"*{bom_kind}_{source}_*")
+        if fp.suffix.lower() in EXTENSIONS and pattern.search(fp.name)
+    ]
 
-        df = pd.read_csv(f)
-        # unify column names
-        if src == "oracle":
-            df = df.rename(columns={"Make/Buy": "make_buy"})
-        else:                              # tc
-            df = df.rename(columns={"Make or Buy": "make_buy"})
+def load_bom_set(bom_kind: str, source: str) -> pd.DataFrame:
+    """
+    Loads *all* files in one long tidy frame:
+        PART_NUMBER | make_buy | snapshot_date | source | bom_kind
+    """
+    frames = []
+    for fp in discover_files(bom_kind, source):
+        # pull date from filename
+        date_txt = re.search(r"_(\d{4}-\d{2}-\d{2})", fp.stem).group(1)
+        snap_date = pd.to_datetime(date_txt)
+
+        # read file (Excel or CSV)
+        if fp.suffix.lower() in {".xls", ".xlsx", ".xlsm"}:
+            df = pd.read_excel(fp)
+        else:
+            df = pd.read_csv(fp)
+
+        # ----- column cleanup -------------------------------------------------
+        colmap = {c: c.strip().upper().replace(" ", "_") for c in df.columns}
+        df.rename(columns=colmap, inplace=True)
+
+        # normalise part-number column
+        part_col = [c for c in df.columns if c.startswith("PART")][0]
+        df.rename(columns={part_col: "PART_NUMBER"}, inplace=True)
+
+        # normalise make/buy column
+        if "MAKE/BUY" in df.columns:
+            df.rename(columns={"MAKE/BUY": "make_buy"}, inplace=True)
+        elif "MAKE_OR_BUY" in df.columns:
+            df.rename(columns={"MAKE_OR_BUY": "make_buy"}, inplace=True)
+        else:  # fall-back: grab first col containing "MAKE"
+            mb_col = [c for c in df.columns if "MAKE" in c][0]
+            df.rename(columns={mb_col: "make_buy"}, inplace=True)
 
         df = df[["PART_NUMBER", "make_buy"]].copy()
-        df["source"] = src
+        df["make_buy"] = (df["make_buy"]
+                          .astype(str)
+                          .str.strip()
+                          .str.upper()
+                          .replace({"M": "MAKE", "B": "BUY"}))
+
+        # meta columns
         df["snapshot_date"] = snap_date
-        dfs.append(df)
+        df["source"]        = source
+        df["bom_kind"]      = bom_kind
+        frames.append(df)
 
-    if not dfs:
-        raise FileNotFoundError("No MBOM files matched the expected patterns.")
-    return pd.concat(dfs, ignore_index=True)
+    if not frames:
+        raise FileNotFoundError(f"No files found for {bom_kind}-{source}")
 
-# ---------- LOAD ----------
-combined = load_all_mboms()
+    return pd.concat(frames, ignore_index=True)
 
-# ---------- ORACLE vs TC COMPARISON *WITHIN* EACH SNAPSHOT ----------
-same_day_match = (
-    combined[combined["source"] == "oracle"]
-    .merge(
-        combined[combined["source"] == "tc"],
-        on=["PART_NUMBER", "snapshot_date"],
-        suffixes=("_oracle", "_tc"),
-        how="outer",
-    )
-    .assign(match=lambda d: d["make_buy_oracle"] == d["make_buy_tc"])
-)
+# ── 3. LOAD EnBOMs ───────────────────────────────────────────────────────────
+enbom_oracle = load_bom_set("ebom", "oracle")      # Engineering BOM, Oracle
+enbom_tc     = load_bom_set("ebom", "tc")          # Engineering BOM, TeamCenter
 
-mismatches = same_day_match[~same_day_match["match"]]
+# ── 4. HOW MANY MAKE/BUY FLIPS? ──────────────────────────────────────────────
+def flip_report(df: pd.DataFrame) -> pd.DataFrame:
+    """Return # of flips per part + first/last status for quick triage."""
+    df = df.sort_values(["PART_NUMBER", "snapshot_date"])
+    df["prev_state"] = df.groupby("PART_NUMBER")["make_buy"].shift()
+    df["flipped"]    = df["make_buy"] != df["prev_state"]
 
-# ---------- MAKE-BUY FLIPS *OVER TIME* INSIDE EACH SOURCE ----------
-combined = combined.sort_values(["PART_NUMBER", "source", "snapshot_date"])
-combined["prev_make_buy"] = combined.groupby(["PART_NUMBER", "source"])["make_buy"].shift()
-combined["flipped"] = combined["make_buy"] != combined["prev_make_buy"]
+    return (df.groupby("PART_NUMBER")
+              .agg(
+                  n_snapshots = ("snapshot_date", "size"),
+                  n_flips     = ("flipped", "sum"),
+                  first_state = ("make_buy", "first"),
+                  last_state  = ("make_buy", "last"),
+              )
+              .reset_index()
+              .sort_values("n_flips", ascending=False))
 
-flips = combined[combined["flipped"]]
+oracle_flip_summary = flip_report(enbom_oracle)
+tc_flip_summary     = flip_report(enbom_tc)
 
-# ---------- OPTIONAL WEEKLY SUMMARY ----------
-weekly_summary = (
-    same_day_match.assign(week=lambda d: d["snapshot_date"].dt.isocalendar().week)
-    .groupby("week")["match"]
-    .agg(total_parts="size", mismatched_parts=lambda s: (~s).sum())
-    .assign(percent_match=lambda d: 100 * (d["total_parts"] - d["mismatched_parts"]) / d["total_parts"])
-    .reset_index()
-)
+# ── 5. QUICK LOOK ────────────────────────────────────────────────────────────
+print("Oracle EnBOM – top 10 parts by # flips:")
+print(oracle_flip_summary.head(10), "\n")
 
-# ---------- SAVE BACK TO THE LAKE (if desired) ----------
-# spark_df = spark.createDataFrame(combined)   # Databricks: convert to Spark
-# spark_df.write.format("delta").mode("overwrite").save("dbfs:/gold/match_history")
+print("TeamCenter EnBOM – top 10 parts by # flips:")
+print(tc_flip_summary.head(10))
 
-# ---- Quick sanity prints ----
-print(f"Loaded {combined.shape[0]} total part-records across {combined['snapshot_date'].nunique()} snapshots")
-print(f"{mismatches.shape[0]} mismatches between Oracle and TC on the same day")
-print(f"{flips.shape[0]} make/buy flips within sources over time")
+# ── 6. (OPTIONAL) SAVE TO GOLD LAYER ────────────────────────────────────────
+# spark.createDataFrame(oracle_flip_summary) \
+#      .write.format("delta").mode("overwrite") \
+#      .save("dbfs:/gold/enbom_oracle_flip_summary")
+#
+# spark.createDataFrame(tc_flip_summary) \
+#      .write.format("delta").mode("overwrite") \
+#      .save("dbfs:/gold/enbom_tc_flip_summary")
