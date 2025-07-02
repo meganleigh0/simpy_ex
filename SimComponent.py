@@ -1,65 +1,81 @@
+import glob, os
 import pandas as pd
+import ace_tools as tools
 
-# ------------------------------------------------------------------
-# 0)  ⇨  make sure df exists in memory before you run this cell
-# ------------------------------------------------------------------
-# df  should hold columns:  PART_NUMBER | Make/Buy | Date
-# If you still have your dictionary of DataFrames, concatenate those
-# into `df` first, then run this cell.
+# ────────────────────────────────────────────────────────────────
+# 0)  CONFIG – adjust if your folders / patterns differ
+# ────────────────────────────────────────────────────────────────
+# Example patterns (adjust to match your reality)
+PATTERNS = [
+    "data/bronze_boms/mbom_oracle_*.xlsx",
+    "data/bronze_boms/mbom_tc_*.xlsm"
+]
 
-# ------------------------------------------------------------------
-# 1)  Clean & dedupe
-# ------------------------------------------------------------------
-df_clean = (
-    df.copy()
-      .assign(Date=pd.to_datetime(df['Date']))                # ensure datetime
-      .assign(Make_Buy=(df['Make/Buy']                        # normalise text
-                        .astype(str)
-                        .str.strip()
-                        .str.lower()
-                        .map({'make': 'make', 'buy': 'buy'})))
-      .drop(columns=['Make/Buy'])
-      .rename(columns={'Make_Buy': 'Make/Buy'})
-      .sort_values(['PART_NUMBER', 'Date'])
-      .drop_duplicates(subset=['PART_NUMBER', 'Date'], keep='last')
-      .reset_index(drop=True)
-)
+# Columns we need to keep
+KEEP_COLS = [
+    "PART_NUMBER",          # part id
+    "Make/Buy",             # status
+    "Date",                 # snapshot date (from filename)
+    "Description",          # <- optional
+    "Levels"                # <- optional
+]
 
-# ------------------------------------------------------------------
-# 2)  Detect make ↔ buy flips
-# ------------------------------------------------------------------
-df_clean['previous_status'] = df_clean.groupby('PART_NUMBER')['Make/Buy'].shift()
-flip_log = df_clean[df_clean['Make/Buy'] != df_clean['previous_status']].copy()
+# ────────────────────────────────────────────────────────────────
+# 1)  LOAD & CONCATENATE
+# ────────────────────────────────────────────────────────────────
+dfs = []
+for pattern in PATTERNS:
+    for path in glob.glob(pattern):
+        snap_date = pd.to_datetime(os.path.basename(path).split("_")[-1].split(".")[0])
+        tmp = pd.read_excel(path, dtype=str, engine="openpyxl", usecols=lambda c: c in KEEP_COLS)
+        tmp["Date"] = snap_date
+        dfs.append(tmp)
 
-flip_log['previous_status'] = flip_log['previous_status'].fillna('-')  # first record
-flip_log = (flip_log[['PART_NUMBER', 'Date', 'previous_status', 'Make/Buy']]
+df = pd.concat(dfs, ignore_index=True)
+
+# ────────────────────────────────────────────────────────────────
+# 2)  CLEAN & NORMALISE
+# ────────────────────────────────────────────────────────────────
+df['Date'] = pd.to_datetime(df['Date'])
+df['Make/Buy'] = (df['Make/Buy']
+                    .astype(str).str.strip().str.lower()
+                    .where(lambda s: s.isin(['make', 'buy'])))
+
+df = (df.sort_values(['PART_NUMBER', 'Date'])
+        .drop_duplicates(subset=['PART_NUMBER', 'Date'], keep='last')
+        .reset_index(drop=True))
+
+# ────────────────────────────────────────────────────────────────
+# 3)  DETECT FLIPS
+# ────────────────────────────────────────────────────────────────
+df['previous_status'] = df.groupby('PART_NUMBER')['Make/Buy'].shift()
+mask_flip = (df['Make/Buy'].notna() & df['previous_status'].notna()
+             & df['Make/Buy'].ne(df['previous_status']))
+
+flip_log = (df[mask_flip]
+            .loc[:, ['PART_NUMBER', 'Description', 'Levels', 'Date',
+                     'previous_status', 'Make/Buy']]
             .rename(columns={'Make/Buy': 'new_status'})
             .sort_values(['PART_NUMBER', 'Date'])
             .reset_index(drop=True))
 
-# ------------------------------------------------------------------
-# 3)  Summarise
-# ------------------------------------------------------------------
-switch_counts = (
-    flip_log.groupby('PART_NUMBER', as_index=False)
-            .size()
-            .rename(columns={'size': 'flip_count'})
-            .sort_values('flip_count', ascending=False)
-)
+# ────────────────────────────────────────────────────────────────
+# 4)  WEEKLY SUMMARY
+# ────────────────────────────────────────────────────────────────
+flip_log['week_start'] = flip_log['Date'].dt.to_period('W').apply(lambda r: r.start_time)
+weekly_summary = (flip_log.groupby('week_start')['PART_NUMBER']
+                          .nunique()
+                          .rename('num_parts_changed')
+                          .reset_index()
+                          .sort_values('week_start'))
 
-# ------------------------------------------------------------------
-# 4)  Persist + quick peek
-# ------------------------------------------------------------------
-flip_log.to_csv('make_buy_flip_log.csv', index=False)
+# ────────────────────────────────────────────────────────────────
+# 5)  SAVE + SHOW
+# ────────────────────────────────────────────────────────────────
+csv_path = "make_buy_flip_log.csv"
+flip_log.to_csv(csv_path, index=False)
 
-print("\n=== First 20 flip events ===")
-print(flip_log.head(20).to_string(index=False))
+tools.display_dataframe_to_user("Make-Buy Flip Log (detailed)", flip_log)
+tools.display_dataframe_to_user("Parts changed per week", weekly_summary)
 
-print("\n=== Parts with the most flips ===")
-print(switch_counts.head(20).to_string(index=False))
-
-# ------------------------------------------------------------------
-# 5)  (Optional) – status over time heat-map style
-# ------------------------------------------------------------------
-# status_matrix = df_clean.pivot(index='PART_NUMBER', columns='Date', values='Make/Buy')
-# status_matrix.head()  # gives you a wide view of make/buy status by snapshot
+print(f"\nDetailed log saved to: {csv_path}")
