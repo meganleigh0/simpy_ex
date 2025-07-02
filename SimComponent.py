@@ -1,23 +1,35 @@
 import pandas as pd
-import re
 
-def load_all_mboms_with_metadata(mbom_dict):
-    all_mboms = []
+# --- 0.  starting point -------------------------------------------------
+# df  already has columns:  PART_NUMBER | Make/Buy | Date
 
-    for path, df in mbom_dict.items():
-        # Match MM-DD-YYYY and extension
-        match = re.search(r'(\d{2}-\d{2}-\d{4})\.(xlsx|xlsm)$', path)
-        if match:
-            date_str, ext = match.groups()
-            df = df.copy()
-            df['Date'] = pd.to_datetime(date_str, format='%m-%d-%Y')
-            df['Source'] = 'Oracle' if ext == 'xlsx' else 'TeamCenter'
-            all_mboms.append(df)
-        else:
-            print(f"Warning: No valid date found in path {path}")
+# --- 1.  basic hygiene --------------------------------------------------
+df['Date']      = pd.to_datetime(df['Date'])                     # make sure Date is datetime
+df['Make/Buy']  = (df['Make/Buy']
+                  .str.strip()                                   # remove stray spaces
+                  .str.lower().map({'make':'make', 'buy':'buy'}))# normalise wording
 
-    return pd.concat(all_mboms, ignore_index=True)
+# keep one record per part per day (if duplicates exist, keep the LAST snapshot that day)
+df = (df.sort_values(['PART_NUMBER', 'Date'])
+        .drop_duplicates(subset=['PART_NUMBER', 'Date'],
+                          keep='last'))
 
-# Example usage:
-# mbom_dict = { 'path/to/file_06-01-2025.xlsx': df1, 'path/to/file_06-01-2025.xlsm': df2, ... }
-all_mboms_df = load_all_mboms_with_metadata(mbom_dict)
+# --- 2.  detect status flips -------------------------------------------
+# for each part, compare its status with the previous day it appeared
+df['changed'] = (df.groupby('PART_NUMBER')['Make/Buy']
+                   .apply(lambda s: s.ne(s.shift())))            # True where status ≠ previous
+
+# first row of every part is always True in the test above; mask it out
+df.loc[df.groupby('PART_NUMBER').head(1).index, 'changed'] = False
+
+# --- 3.  summarise ------------------------------------------------------
+switch_counts = (df[df['changed']]
+                 .groupby('PART_NUMBER')
+                 .size()
+                 .rename('switch_count')
+                 .reset_index()
+                 .sort_values('switch_count', ascending=False))
+
+# --- 4.  output ---------------------------------------------------------
+print("Top parts by # Make↔Buy flips")
+print(switch_counts.head(10))
