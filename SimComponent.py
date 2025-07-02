@@ -1,21 +1,13 @@
 import pandas as pd
+import plotly.express as px
 
 # ────────────────────────────────────────────────────────────────
-# 0️⃣  ASSUMPTIONS
-# ────────────────────────────────────────────────────────────────
-# • `df` already exists in memory and contains at least
-#     PART_NUMBER | Make/Buy | Date | Description | Levels
-# • You do NOT want to treat a missing Make/Buy value as a flip
-#   (i.e. we ignore transitions from NaN → make/buy or vice-versa)
-# • Dates are the actual snapshot dates you care about.
-
-# ────────────────────────────────────────────────────────────────
-# 1️⃣  CLEAN & NORMALISE
+# 1)  CLEAN & NORMALISE  (works even if you already ran it earlier)
 # ────────────────────────────────────────────────────────────────
 df_clean = (
     df.copy()
-      .assign(Date=pd.to_datetime(df['Date']))                       # guarantee datetime
-      .assign(Make_Buy=(df['Make/Buy']                               # standardise text
+      .assign(Date=pd.to_datetime(df['Date']))                       # make sure Date is datetime
+      .assign(Make_Buy=(df['Make/Buy']                               # standardise status text
                         .astype(str).str.strip().str.lower()
                         .where(lambda s: s.isin(['make', 'buy']))))  # keep only make/buy
       .drop(columns=['Make/Buy'])
@@ -26,17 +18,18 @@ df_clean = (
 )
 
 # ────────────────────────────────────────────────────────────────
-# 2️⃣  DETECT TRUE FLIPS
+# 2)  DETECT TRUE FLIPS
+#     (ignore NaN → make/buy or make/buy → NaN transitions)
 # ────────────────────────────────────────────────────────────────
 df_clean['previous_status'] = df_clean.groupby('PART_NUMBER')['Make/Buy'].shift()
 
-mask_flip = (
+flip_mask = (
     df_clean['Make/Buy'].notna() &
     df_clean['previous_status'].notna() &
     df_clean['Make/Buy'].ne(df_clean['previous_status'])
 )
 
-flip_log = (df_clean[mask_flip]
+flip_log = (df_clean[flip_mask]
             .loc[:, ['PART_NUMBER', 'Description', 'Levels',
                      'Date', 'previous_status', 'Make/Buy']]
             .rename(columns={'Make/Buy': 'new_status'})
@@ -44,7 +37,7 @@ flip_log = (df_clean[mask_flip]
             .reset_index(drop=True))
 
 # ────────────────────────────────────────────────────────────────
-# 3️⃣  SNAPSHOT-BY-SNAPSHOT SUMMARY
+# 3)  SNAPSHOT-LEVEL SUMMARY  (parts that flipped on each date)
 # ────────────────────────────────────────────────────────────────
 snapshot_summary = (flip_log.groupby('Date')['PART_NUMBER']
                              .nunique()
@@ -53,14 +46,22 @@ snapshot_summary = (flip_log.groupby('Date')['PART_NUMBER']
                              .sort_values('Date'))
 
 # ────────────────────────────────────────────────────────────────
-# 4️⃣  QUICK LOOK
+# 4)  PLOTLY VISUALISATION
 # ────────────────────────────────────────────────────────────────
-print("\n--- First 15 flip events ---")
-display(flip_log.head(15))
+fig = px.line(snapshot_summary,
+              x='Date',
+              y='num_parts_changed',
+              markers=True,
+              title='Distinct Parts Switching Make/Buy Status per Snapshot')
 
-print("\n--- Parts that changed on each snapshot date ---")
-display(snapshot_summary)
+fig.update_layout(
+    xaxis_title='Snapshot Date',
+    yaxis_title='Number of Parts Switched',
+    hovermode='x unified'
+)
 
-# Optional: save for dashboards / further analysis
-flip_log.to_csv('make_buy_flip_log.csv', index=False)
-snapshot_summary.to_csv('make_buy_flip_snapshot_summary.csv', index=False)
+fig.show()
+
+# (Optional) save the detail & summary for dashboards
+# flip_log.to_csv('make_buy_flip_log.csv', index=False)
+# snapshot_summary.to_csv('make_buy_flip_snapshot_summary.csv', index=False)
