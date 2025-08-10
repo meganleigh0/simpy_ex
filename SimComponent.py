@@ -1,26 +1,26 @@
-# rate_files_pipeline_fixed.py
+# rate_files_pipeline_final.py
 from __future__ import annotations
 from pathlib import Path
 import re
 import pandas as pd
 
-# ---------- Paths ----------
+# ---------------- PATHS ----------------
 RATSUM_PATH = Path("data/RATSUM.xlsx")
 RATE_BAND_IMPORT_PATH = Path("data/RateBandImport.xlsx")
 BURDEN_RATE_IMPORT_PATH = Path("data/BurdenRateImport.xlsx")
 OUT_DIR = Path("output")
 
-# ---------- VT ABRAMS targeting ----------
-VT_CODES = {"VB"}                  # 2-char codes (add more if needed)
-VT_DESC_TOKENS = {"VT", "ABRAM"}   # all tokens must appear in Description (case-insensitive)
-VT_REQUIRE_RATE_TYPE = "Units"     # set to None to disable this guard
+# ---------------- VT ABRAMS targeting ----------------
+VT_CODES = {"VB"}                 # add more codes if you have them
+VT_DESC_TOKENS = {"VT", "ABRAM"} # ALL tokens must be present in Description
+VT_REQUIRE_RATE_TYPE = "Units"    # set to None to disable
 
-# ---------- Rounding ----------
+# ---------------- Rounding ----------------
 LABOR_ROUND  = 3
 BURDEN_ROUND = 5
 COM_ROUND    = 6
 
-# ================= Utils =================
+# ---------------- Utilities ----------------
 def _norm(s: str) -> str:
     return re.sub(r"\s+", "", str(s or "")).strip().lower()
 
@@ -52,22 +52,24 @@ def _read_best_skiprows(xls: pd.ExcelFile, sheet: str, tries=range(0, 12)) -> pd
 
 def _collapse_duplicate_named_cols(df: pd.DataFrame) -> pd.DataFrame:
     """
-    If two different source columns normalize to the same name (e.g. '2022' and 'CY 2022' -> 'CY2022'),
-    merge them by taking first non-null values left→right.
+    If multiple columns share the same name, merge them left→right by taking
+    the first non-null per row.
     """
-    newcols = {}
-    for col in df.columns:
-        if col in newcols:
-            newcols[col] = newcols[col].combine_first(df[col])
+    out = pd.DataFrame(index=df.index)
+    # dict.fromkeys preserves order of first appearance
+    for name in dict.fromkeys(df.columns):
+        block = df.loc[:, df.columns == name]  # DataFrame (1..n columns)
+        if block.shape[1] == 1:
+            out[name] = block.iloc[:, 0]
         else:
-            newcols[col] = df[col]
-    return pd.DataFrame(newcols)
+            out[name] = block.bfill(axis=1).iloc[:, 0]
+    return out
 
 def _derive_code_from_text(text) -> str | None:
     """
     EXACT rule: first two characters of BUSINESS UNIT GDLS.
-    - Take first two visible chars, keep [0-9A-Z], uppercase
-    - If single digit, pad: 4 -> '04'
+    - keep only [0-9A-Z], uppercase
+    - if single digit → pad to 2: '4' -> '04'
     """
     s = str(text or "").strip().upper()
     if not s:
@@ -91,12 +93,12 @@ def _find_col(df: pd.DataFrame, tokens: list[str]) -> str | None:
             return c
     return None
 
-# ================= RATSUM readers =================
+# ---------------- Readers ----------------
 def read_simplified_with_codes(xls: pd.ExcelFile) -> pd.DataFrame:
     """
-    Returns DataFrame with:
-      - rate_band : first two characters of BUSINESS UNIT GDLS (zero-padded)
-      - label     : BUSINESS UNIT GDLS
+    Output columns:
+      - rate_band : first two chars of BUSINESS UNIT GDLS (zero-padded)
+      - label     : BUSINESS UNIT GDLS string
       - CY####    : numeric year columns
     """
     sheet = _pick_sheet(xls, "SIMPLIFIED", "RATE")
@@ -104,28 +106,33 @@ def read_simplified_with_codes(xls: pd.ExcelFile) -> pd.DataFrame:
 
     year_cols_raw = _find_year_cols(df)
     if not year_cols_raw:
-        raise ValueError("SIMPLIFIED: no year columns (2022 / CY2022) found")
+        raise ValueError("SIMPLIFIED: no year columns found")
 
-    # choose label column (BUSINESS UNIT GDLS)
-    label_col = next((c for c in df.columns if c not in year_cols_raw and
-                      "BUSINESS" in str(c).upper() and "UNIT" in str(c).upper()), None)
+    # Identify BUSINESS UNIT GDLS (fallback to first non-year column)
+    label_col = next((c for c in df.columns
+                      if c not in year_cols_raw and "BUSINESS" in str(c).upper() and "UNIT" in str(c).upper()), None)
     if label_col is None:
         label_col = [c for c in df.columns if c not in year_cols_raw][0]
 
-    # normalize year headers to CY####
-    rename_map = {c: _normalize_cy(c) for c in year_cols_raw}
-    df = df.rename(columns=rename_map)
-    df = _collapse_duplicate_named_cols(df)    # <— key fix
+    # Normalize year headers and collapse duplicates
+    df = df.rename(columns={c: _normalize_cy(c) for c in year_cols_raw})
+    df = _collapse_duplicate_named_cols(df)
 
-    year_cols = [rename_map[c] for c in year_cols_raw]
-    # Some years might have been dropped by collapse (take intersection)
-    year_cols = [c for c in year_cols if c in df.columns]
+    # Build final list of year columns after collapse
+    year_cols = [c for c in df.columns if re.fullmatch(r"CY20\d{2}", str(c))]
 
+    # Rename label column (if it survived collapse with same name)
+    if label_col not in df.columns:
+        # find something that still looks like the label col
+        label_guess = next((c for c in df.columns if "BUSINESS" in str(c).upper() and "UNIT" in str(c).upper()), None)
+        label_col = label_guess or df.columns[0]
     df = df.rename(columns={label_col: "label"})
+
+    # Derive 2-char code from BUSINESS UNIT GDLS
     df["rate_band"] = df["label"].map(_derive_code_from_text)
     df = df[df["rate_band"].notna()].copy()
 
-    # numeric years
+    # Cast year columns to numeric
     for c in year_cols:
         df.loc[:, c] = pd.to_numeric(df[c], errors="coerce")
 
@@ -152,7 +159,9 @@ def read_allowable_control_test(xls: pd.ExcelFile) -> pd.Series:
 
     df = df.rename(columns={c: _normalize_cy(c) for c in years})
     df = _collapse_duplicate_named_cols(df)
-    s = row.iloc[0][[_normalize_cy(c) for c in years if _normalize_cy(c) in df.columns]].copy()
+
+    keep_years = [c for c in df.columns if re.fullmatch(r"CY20\d{2}", str(c))]
+    s = row.iloc[0][keep_years].copy()
     s = pd.to_numeric(s, errors="coerce").fillna(0.0).round(BURDEN_ROUND)
     s.name = "ACT"
     return s
@@ -193,17 +202,18 @@ def read_com_summary(xls: pd.ExcelFile) -> pd.DataFrame:
     df = df.rename(columns={c: _normalize_cy(c) for c in years})
     df = _collapse_duplicate_named_cols(df)
 
-    first_year_idx = df.columns.get_loc([_normalize_cy(c) for c in years if _normalize_cy(c) in df.columns][0])
+    keep_years = [c for c in df.columns if re.fullmatch(r"CY20\d{2}", str(c))]
+    # figure out “pre-year” block again after collapse
+    first_year_idx = df.columns.get_loc(keep_years[0])
     pre = df.columns[:first_year_idx] if first_year_idx > 0 else [df.columns[0]]
     df["Pool"] = df[pre].astype(str).apply(lambda r: " ".join(x for x in r if x and x != "nan").strip(), axis=1)
 
-    keep_years = [c for c in df.columns if re.fullmatch(r"CY20\d{2}", str(c))]
     long = df.melt(id_vars=["Pool"], value_vars=keep_years, var_name="CY", value_name="COM")
     long["Year"] = long["CY"].astype(str).str.extract(r"(20\d{2})").astype(int)
     long["COM"] = pd.to_numeric(long["COM"], errors="coerce").round(COM_ROUND)
     return long[["Pool", "Year", "COM"]]
 
-# ================= Writers =================
+# ---------------- Writers ----------------
 def update_rate_band_import(simplified: pd.DataFrame, act: pd.Series, rbi_in: Path, rbi_out: Path):
     rbi = pd.read_excel(rbi_in)
 
@@ -215,14 +225,14 @@ def update_rate_band_import(simplified: pd.DataFrame, act: pd.Series, rbi_in: Pa
     if not all([rb_col, base_col, start_col]):
         raise ValueError("RBI missing Rate Band / Base Rate / Start Date")
 
-    # Map (code, year) -> rate from simplified
+    # Build (code, year) -> rate
     year_cols = [c for c in simplified.columns if c not in {"rate_band","label"}]
     long = simplified.melt(id_vars=["rate_band"], value_vars=year_cols, var_name="CY", value_name="Rate")
     long["Year"] = long["CY"].astype(str).str.extract(r"(20\d{2})").astype(int)
     long["Rate"] = pd.to_numeric(long["Rate"], errors="coerce").round(LABOR_ROUND)
     rate_map = {(rb, int(y)): float(r) for rb, y, r in zip(long["rate_band"], long["Year"], long["Rate"])}
 
-    # Base Rate by (RBI code, Start Date year)
+    # Apply Base Rate by (code, StartDate year)
     rbi["_Year"] = pd.to_datetime(rbi[start_col], errors="coerce").dt.year
     def _put(row):
         code = _derive_code_from_rbi_cell(row[rb_col])
@@ -240,14 +250,14 @@ def update_rate_band_import(simplified: pd.DataFrame, act: pd.Series, rbi_in: Pa
             rbi[cy] = pd.NA
 
     code_match = rbi[rb_col].map(_derive_code_from_rbi_cell).isin(VT_CODES) if VT_CODES else pd.Series(False, index=rbi.index)
-    desc_match = pd.Series(False, index=rbi.index)
+    desc_match = pd.Series(True, index=rbi.index)  # all-tokens must be present
     if VT_DESC_TOKENS and desc_col:
         up = rbi[desc_col].astype(str).str.upper()
         for tok in VT_DESC_TOKENS:
-            desc_match = desc_match | up.str.contains(str(tok).upper(), na=False)
-    mask = (code_match | desc_match)
+            desc_match &= up.str.contains(re.escape(tok), na=False)
+    mask = code_match | desc_match
     if VT_REQUIRE_RATE_TYPE and rt_col:
-        mask = mask & rbi[rt_col].astype(str).str.upper().eq(VT_REQUIRE_RATE_TYPE.upper())
+        mask &= rbi[rt_col].astype(str).str.upper().eq(VT_REQUIRE_RATE_TYPE.upper())
 
     rbi.loc[mask, list(act.index)] = list(act.values)
 
@@ -265,7 +275,7 @@ def update_burden_rate_import(overhead_df: pd.DataFrame, com_df: pd.DataFrame, b
     pool_col = _find_col(bri, ["burden","pool"]) or _find_col(bri, ["pool"])
     year_col = _find_col(bri, ["date"]) or _find_col(bri, ["year"])
     if not all([pool_col, year_col]):
-        raise ValueError("BRI missing Burden Pool / Date/Year")
+        raise ValueError("BRI missing Burden Pool / Date or Year")
 
     bcols = [c for c in bri.columns if c not in {pool_col, year_col, "Description", "Effective Date"}]
 
@@ -298,12 +308,12 @@ def update_burden_rate_import(overhead_df: pd.DataFrame, com_df: pd.DataFrame, b
         bri.to_excel(xw, index=False, sheet_name="Burden Rate Import")
     print(f"✅ BurdenRateImport updated → {bri_out.resolve()}")
 
-# ================= Comparison (your exact rule) =================
+# ---------------- Comparison (your exact rule) ----------------
 def write_rateband_comparison(simplified_df: pd.DataFrame, rbi_path_or_df, out_path: Path):
     """
-    Sets based only on:
-      - RATSUM: first two chars of BUSINESS UNIT GDLS (column 'rate_band')
-      - RBI:    first two chars of 'Rate Band' cell after normalization
+    Compare:
+      - RATSUM: first-two-chars from BUSINESS UNIT GDLS ('rate_band')
+      - RBI:    first-two-chars of 'Rate Band' after normalization
     """
     rbi = pd.read_excel(rbi_path_or_df) if isinstance(rbi_path_or_df, (str, Path)) else rbi_path_or_df
     rb_col = _find_col(rbi, ["rate","band"]) or _find_col(rbi, ["rateband"])
@@ -323,15 +333,15 @@ def write_rateband_comparison(simplified_df: pd.DataFrame, rbi_path_or_df, out_p
         pd.DataFrame(only_rbi,    columns=["RateBand Code"]).to_excel(xw, sheet_name="In_RateBand_only", index=False)
     print(f"✅ Comparison report → {out_path.resolve()}")
 
-# ================= Main =================
+# ---------------- Main ----------------
 if __name__ == "__main__":
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     xls = pd.ExcelFile(RATSUM_PATH)
 
-    simplified = read_simplified_with_codes(xls)      # Code = first two chars of BUSINESS UNIT GDLS
-    act        = read_allowable_control_test(xls)     # ACT series
-    overhead   = read_overhead(xls)                   # Pool/Year burdens
-    com_long   = read_com_summary(xls)                # COM (optional)
+    simplified = read_simplified_with_codes(xls)      # ← Code from first two chars of BUSINESS UNIT GDLS
+    act        = read_allowable_control_test(xls)     # ← ACT series
+    overhead   = read_overhead(xls)                   # ← burden pools by year
+    com_long   = read_com_summary(xls)                # ← COM (optional)
 
     rbi_out = OUT_DIR / "RateBandImport_updated.xlsx"
     update_rate_band_import(simplified, act, RATE_BAND_IMPORT_PATH, rbi_out)
