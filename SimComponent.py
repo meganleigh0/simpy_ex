@@ -5,220 +5,219 @@ from decimal import Decimal, ROUND_HALF_UP
 import numpy as np
 import pandas as pd
 
-# ---------- CONFIG ----------
-RATESUM_PATH = "data/RATSUM.xlsx"
-SIMPLIFIED_SHEET = "SIMPLIFIED RATES NON-PSPL"
-SIMPLIFIED_SKIPROWS = 5
-OTHER_RATES_SHEET = "OTHER RATES"
-
-RATEBAND_PATH = "data/RateBandImport.xlsx"
+# ==================== CONFIG ====================
+BURDEN_IMPORT_PATH = "data/BurdenRateImport.xlsx"   # your import template
+RATES_TABLE_PATH   = "data/20220511FPRP_Burden.xlsx"  # your rates table (year + rate columns)
 OUT_DIR = Path("out"); OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-VT_CODE = "VT"
-ABRAMS_TOKENS = ("abrams", "vt abrams", "vtabrams")
-ROUNDING = {"labor dollars": 3, "burdens": 5, "com": 6}
+RATES_SHEET_HINT  = "burden"   # first sheet containing this (case-insensitive)
 
-# ---------- helpers ----------
+# Rounding
+ROUND_COM = 6
+ROUND_OTH = 5
+
+# ==================== HARD-CODED MATRIX LOGIC (from image) ====================
+# We rely on description and burden segment to infer applicability.
+# Core idea from the matrix:
+#  - Two blocks: “Spares Allocation does NOT apply” vs “Spares Allocation DOES apply”.
+#  - G&A and COM are only applied when the row falls in the “DOES apply” block.
+#  - ODC/Travel have G&A/COM applied as well (per bottom ODC block in the image).
+#
+# You can extend/tweak these lists/patterns easily.
+
+# Patterns that mean “this line is a spares allocation line”
+SPARES_KEYWORDS = (
+    r"\bspares?\b", r"\bspare\b", r"\bspares allocation\b",
+    r"\bintra[-\s]?segment deliverable spares\b",
+    r"\bdeliverable spares\b", r"\bnon deliverable spares\b",
+)
+
+# Description tokens that we treat as ODC/Travel lines (bottom block in the matrix)
+ODC_TOKENS  = (r"\bodc\b", r"\bother direct costs?\b")
+TRVL_TOKENS = (r"\btrvl\b", r"\btravel\b")
+
+# PCURE heuristics (lightweight, segment-aware — adjust as needed)
+# If a rate column header contains "pcure gdls" we apply it when segment=GDLS; same for CSSC.
+# “abated pcure” applied for spares rows (visible X’s in the spares block), otherwise off.
+# If your headers differ slightly, the keyizer (below) keeps this robust.
+PCURE_APPLIES_ON_SPARES_ONLY = True
+
+# ==================== HELPERS ====================
+def keyize(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(s).strip().lower()).strip("_")
+
 def round_half_up(x, places):
     if pd.isna(x): return np.nan
     q = Decimal("1").scaleb(-places)
     return float(Decimal(str(x)).quantize(q, rounding=ROUND_HALF_UP))
 
-def year_from_header(h):
-    if h is None or (isinstance(h, float) and np.isnan(h)): return None
-    m = re.search(r"(?:^|\D)(20\d{2})(?:\D|$)", str(h))
-    return int(m.group(1)) if m else None
+def carry_forward(series_by_year: pd.Series, needed_years):
+    if series_by_year is None or series_by_year.empty:
+        return pd.Series(index=needed_years, dtype=float)
+    s = pd.to_numeric(series_by_year, errors="coerce").dropna().sort_index()
+    full_span = list(range(int(s.index.min()), max(int(s.index.max()), max(needed_years)) + 1))
+    return s.reindex(full_span).ffill().reindex(needed_years)
 
-def normalize_band_code(s):
-    s = str(s).strip()
-    two = s[:2]
-    if two.isdigit(): return two.zfill(2)
-    return re.sub(r"[^A-Za-z0-9]", "", two).upper()
+def first_word_code(desc: str) -> str:
+    if not isinstance(desc, str): return ""
+    return re.sub(r"[^A-Za-z0-9]+", "", desc.strip().split()[0]).upper()
 
-def is_valid_band(code):
-    code = normalize_band_code(code)
-    return (code == VT_CODE) or bool(re.match(r'^(?=.*\d)[A-Z0-9]{2}$', code))  # 2 chars, contains a digit (keeps 1D, 39, etc.)
+def bool_any(patterns, text):
+    t = (text or "").lower()
+    return any(re.search(p, t, flags=re.I) for p in patterns)
 
-def pick_business_unit_col(cols):
-    lc = {c.lower(): c for c in cols}
-    for k, orig in lc.items():
-        if "business" in k and "gdls" in k: return orig
-    if "Unnamed: 1" in cols: return "Unnamed: 1"
-    raise ValueError("Could not find BUSINESS UNIT GDLS column")
+# ==================== LOAD: BURDEN IMPORT ====================
+imp = pd.read_excel(BURDEN_IMPORT_PATH, dtype=object)
+imp.columns = [str(c).strip() for c in imp.columns]
+original_cols = imp.columns.tolist()  # preserve exact order for export
 
-def find_col(df, hints):
+# Key columns (tolerant matching)
+def pick_col(df, hints):
     lc = {c.lower(): c for c in df.columns}
     for h in hints:
         for k, orig in lc.items():
             if h in k: return orig
-    raise ValueError(f"Missing any column like: {hints}")
+    raise ValueError(f"Could not find any of {hints} in {list(df.columns)}")
 
-# =========================================================
-# STEP 1 — Build combined_rates (Simplified + ACTR for VT)
-# =========================================================
-xls = pd.ExcelFile(RATESUM_PATH)
+burden_col = pick_col(imp, ("burden",))
+desc_col   = pick_col(imp, ("description", "desc"))
+date_col   = pick_col(imp, ("date",))
+eff_col    = pick_col(imp, ("effective", "effective date"))
 
-# Simplified
-simp = pd.read_excel(xls, SIMPLIFIED_SHEET, skiprows=SIMPLIFIED_SKIPROWS, dtype=object)
-simp.columns = [str(c).strip() for c in simp.columns]
-bu_col = pick_business_unit_col(simp.columns)
-simp.rename(columns={bu_col: "BUSINESS UNIT GDLS"}, inplace=True)
-if str(simp.iloc[0]["BUSINESS UNIT GDLS"]).strip().lower().startswith("business"):
-    simp = simp.iloc[1:].reset_index(drop=True)
-simp = simp.loc[:, ~pd.Index(simp.columns).str.contains("Unnamed", case=False)]
-year_cols = [c for c in simp.columns if year_from_header(c)]
-if not year_cols: raise ValueError("No year columns found in Simplified Rates.")
+# Rate columns: everything to the right of Date that looks like a rate
+date_idx = imp.columns.get_loc(date_col)
+candidate_rate_cols = imp.columns[date_idx+1:]
+rate_cols = []
+for c in candidate_rate_cols:
+    sample = pd.to_numeric(imp[c], errors="coerce")
+    if sample.notna().any() or re.search(r"(g&a|com|pcure|proc|award|fee|major|support|re.?order|spare)", c, flags=re.I):
+        rate_cols.append(c)
 
-simp["BUSINESS UNIT GDLS"] = simp["BUSINESS UNIT GDLS"].astype(str).str.strip()
-simp["rate_band_code"] = simp["BUSINESS UNIT GDLS"].map(normalize_band_code)
-simp_long = (simp.melt(id_vars=["BUSINESS UNIT GDLS","rate_band_code"],
-                       value_vars=year_cols, var_name="year_col", value_name="rate_value")
-               .assign(year=lambda d: d["year_col"].map(year_from_header),
-                       rate_value=lambda d: pd.to_numeric(d["rate_value"], errors="coerce"))
-               .dropna(subset=["rate_band_code","year"])
-               .loc[:, ["rate_band_code","year","rate_value"]])
-simp_long["source"] = "Simplified"
+rate_keys = {c: keyize(c) for c in rate_cols}
 
-# Other Rates -> Allowable Control/Contl Test Rate
-other = pd.read_excel(xls, OTHER_RATES_SHEET, header=None)
-year_cols_idx, years = [], []
-for j in range(other.shape[1]):
-    block = " ".join(other.iloc[0:10, j].astype(str).tolist())
-    m = re.search(r"CY\s*(20\d{2})", block, flags=re.IGNORECASE)
-    if m: year_cols_idx.append(j); years.append(int(m.group(1)))
-if not years:
-    for j in range(other.shape[1]):
-        block = " ".join(other.iloc[0:10, j].astype(str).tolist())
-        m = re.search(r"(20\d{2})", block)
-        if m: year_cols_idx.append(j); years.append(int(m.group(1)))
-if not years: raise ValueError("Year columns not found in OTHER RATES.")
+# Segment, tokens, year
+imp["_seg"]  = imp[burden_col].astype(str).str.extract(r"(CSSC|GDLS)", flags=re.I, expand=False).str.upper().fillna("")
+imp["_desc"] = imp[desc_col].astype(str)
+imp["_code"] = imp["_desc"].apply(first_word_code)
+imp["_year"] = pd.to_numeric(imp[date_col], errors="coerce").astype("Int64")
 
-actr_row_idx = None
-pat = re.compile(r"ALLOWABLE.*(CONTL|CONTROL).*TEST.*RATE", re.IGNORECASE)
-for i in range(other.shape[0]):
-    row_text = " ".join([str(x) for x in other.iloc[i, :].tolist() if pd.notna(x)])
-    if pat.search(row_text): actr_row_idx = i; break
-if actr_row_idx is None: raise ValueError("Missing 'ALLOWABLE ... TEST RATE' row.")
+needed_years = sorted(imp["_year"].dropna().astype(int).unique().tolist())
 
-vt_rows = []
-for j, y in zip(year_cols_idx, years):
-    val = pd.to_numeric(other.iat[actr_row_idx, j], errors="coerce")
-    if pd.notna(val): vt_rows.append({"rate_band_code": VT_CODE, "year": int(y), "rate_value": float(val), "source": "ACTR"})
-vt_df = pd.DataFrame(vt_rows)
+# ==================== LOAD: RATES TABLE ====================
+rt_xls = pd.ExcelFile(RATES_TABLE_PATH)
+sheet = next((s for s in rt_xls.sheet_names if re.search(RATES_SHEET_HINT, s, flags=re.I)), rt_xls.sheet_names[0])
+rt = pd.read_excel(rt_xls, sheet_name=sheet, dtype=object)
+rt.columns = [str(c).strip() for c in rt.columns]
 
-combined_rates = (pd.concat([simp_long, vt_df], ignore_index=True)
-                    .dropna(subset=["rate_band_code","year"])
-                    .astype({"year": int})
-                    .sort_values(["rate_band_code","year","source"])
-                    .drop_duplicates(subset=["rate_band_code","year"], keep="first")
-                    .reset_index(drop=True))
+# Find year column
+year_col = next((c for c in rt.columns if re.fullmatch(r"\d{4}|year|date", c, flags=re.I)), None)
+if year_col is None:
+    for c in rt.columns:
+        vals = pd.to_numeric(rt[c], errors="coerce")
+        if vals.notna().sum() and (vals.head(10).dropna().between(1900, 2100).all()):
+            year_col = c; break
+if year_col is None:
+    raise ValueError("Could not find a Year/Date column in the rates table.")
 
-# =========================================================
-# STEP 2 — Update RateBandImport IN PLACE (no extra columns)
-# =========================================================
-rb = pd.read_excel(RATEBAND_PATH, dtype=object)
-rb.columns = [str(c).strip() for c in rb.columns]
-original_cols = rb.columns.tolist()
+rt[year_col] = pd.to_numeric(rt[year_col], errors="coerce").astype("Int64")
+rt_keyed = rt.copy()
+rt_keyed.columns = [year_col] + [keyize(c) for c in rt.columns if c != year_col]
 
-rate_band_col = find_col(rb, ("rate band","rateband"))
-start_col     = find_col(rb, ("start", "effective start"))
-end_col       = find_col(rb, ("end", "effective end"))
-desc_col      = next((c for c in rb.columns if "desc" in c.lower() or "program" in c.lower() or "platform" in c.lower()), None)
+# Build series per rate_key
+ratekey_to_series = {}
+for c in rt_keyed.columns:
+    if c == year_col: continue
+    s = rt_keyed.set_index(year_col)[c]
+    s = pd.to_numeric(s, errors="coerce").dropna()
+    if not s.empty:
+        ratekey_to_series[c] = s
 
-base_col      = next((c for c in rb.columns if "base rate" in c.lower()), None)
-ld_col        = next((c for c in rb.columns if "labor dollars" in c.lower()), None)
-bur_col       = next((c for c in rb.columns if "burden" in c.lower()), None)
-com_col       = next((c for c in rb.columns if re.search(r"\bcom\b", c.lower())), None)
+# Pre carry-forward
+ratekey_to_cf = {rk: carry_forward(s, needed_years) for rk, s in ratekey_to_series.items()}
 
-rb["_band_raw"]      = rb[rate_band_col].astype(str).str.strip()
-rb["rate_band_code"] = rb["_band_raw"].map(normalize_band_code)
-rb["_start"] = pd.to_datetime(rb[start_col], errors="coerce")
-rb["_end"]   = pd.to_datetime(rb[end_col], errors="coerce")
-rb = rb.dropna(subset=["_start","_end"]).copy()
-rb["_year"] = rb["_start"].dt.year.astype(int)
-rb["_is_vt_abrams"] = (rb["rate_band_code"].eq(VT_CODE) |
-                       (rb[desc_col].astype(str).str.lower().str.contains("|".join(ABRAMS_TOKENS), na=False)
-                        if desc_col else False))
+def value_for(rk: str, year: int):
+    s = ratekey_to_cf.get(rk)
+    if s is None: return np.nan
+    return float(s.get(year, np.nan))
 
-# lookup with carry-forward
-band_to_series = {b: g.set_index("year")["rate_value"].sort_index()
-                  for b, g in combined_rates.groupby("rate_band_code")}
+# ==================== MATRIX RULES ENGINE ====================
+def applies_mask_for_row(seg: str, desc: str, code: str) -> dict:
+    """
+    Return a dict {rate_key: True/False} describing whether each rate column applies for this row,
+    based on the hard-coded matrix logic visible in the image.
+    """
+    seg = (seg or "").upper()
+    d = (desc or "")
+    # Is this a 'Spares Allocation DOES apply' row?
+    is_spares = bool_any(SPARES_KEYWORDS, d)
 
-def lookup_rate(band, year):
-    s = band_to_series.get(band)
-    if s is None or s.empty: return np.nan
-    if year in s.index: return float(s.loc[year])
-    prev = s.index[s.index <= year]
-    return float(s.loc[int(prev.max())]) if len(prev) else np.nan
+    # Is this ODC or TRAVEL?
+    is_odc  = bool_any(ODC_TOKENS, d) or code.startswith("ODC")
+    is_trvl = bool_any(TRVL_TOKENS, d) or code.startswith("TRVL")
 
-vals = rb.apply(lambda r: lookup_rate(r["rate_band_code"], int(r["_year"])), axis=1)
+    mask = {}
+    for col, rk in rate_keys.items():
+        rk_l = rk.lower()
 
-# assign + round (keep shape)
-if base_col:
-    rb.loc[vals.notna(), base_col] = [
-        round_half_up(v, 0 if vt else 3)
-        for v, vt in zip(vals[vals.notna()], rb.loc[vals.notna(), "_is_vt_abrams"])
-    ]
-if ld_col:
-    rb.loc[vals.notna(), ld_col]  = [round_half_up(v, ROUNDING["labor dollars"]) for v in vals[vals.notna()]]
-if bur_col:
-    rb.loc[vals.notna(), bur_col] = [round_half_up(v, ROUNDING["burdens"]) for v in vals[vals.notna()]]
-if com_col:
-    rb.loc[vals.notna(), com_col] = [round_half_up(v, ROUNDING["com"]) for v in vals[vals.notna()]]
+        # G&A and COM only on spares or ODC/Travel (per matrix bottom block footnote)
+        if "g_a_cssc" in rk_l or "ga_cssc" in rk_l:
+            mask[rk] = (seg == "CSSC") and (is_spares or is_odc or is_trvl)
+        elif "g_a_gdls" in rk_l or "ga_gdls" in rk_l:
+            mask[rk] = (seg == "GDLS") and (is_spares or is_odc or is_trvl)
+        elif re.search(r"\bcom_cssc\b", rk_l):
+            mask[rk] = (seg == "CSSC") and (is_spares or is_odc or is_trvl)
+        elif re.search(r"\bcom_gdls\b", rk_l):
+            mask[rk] = (seg == "GDLS") and (is_spares or is_odc or is_trvl)
 
-rb_export = rb.loc[:, original_cols]  # exact same columns/order as import
+        # Spare Allocation column itself (if present): apply only when spares row
+        elif "spare_allocation" in rk_l or "spares_allocation" in rk_l:
+            mask[rk] = is_spares
 
-# ---- write + enforce Excel number formats (so you see ≥ required decimals) ----
-from openpyxl.utils import get_column_letter
+        # PCURE per segment (visible columns in the matrix)
+        elif "pcure_gdls" in rk_l:
+            mask[rk] = (seg == "GDLS") and (is_spares if PCURE_APPLIES_ON_SPARES_ONLY else True)
+        elif "pcure_cssc" in rk_l or "pcure_css" in rk_l:
+            mask[rk] = (seg == "CSSC") and (is_spares if PCURE_APPLIES_ON_SPARES_ONLY else True)
+        elif "abated_pcure" in rk_l or "abat_pcure" in rk_l or "abate_pcure" in rk_l:
+            mask[rk] = is_spares  # X’s are shown in the spares block in the matrix
 
-update_path = OUT_DIR / "RateBandImportUpdate.xlsx"
-with pd.ExcelWriter(update_path, engine="openpyxl") as xw:
-    rb_export.to_excel(xw, sheet_name="update", index=False)
-    ws = xw.book["update"]
+        # Reorder point / flags / misc columns (leave values as-is if rates table supplies them)
+        elif re.search(r"re_?ord|reorder|flag|major_end|support|award|fee|proc", rk_l):
+            mask[rk] = True  # keep data if rate exists; otherwise 0 will be written below
 
-    # locate column indexes (1-based)
-    def col_idx(colname):
-        return rb_export.columns.get_loc(colname) + 1 if colname in rb_export.columns else None
+        else:
+            # default: not applied unless a rate exists and we prefer to pass it through
+            mask[rk] = True
 
-    base_idx = col_idx(base_col)
-    ld_idx   = col_idx(ld_col)
-    bur_idx  = col_idx(bur_col)
-    com_idx  = col_idx(com_col)
+    return mask
 
-    # set whole-column formats for LD/BUR/COM
-    if ld_idx:
-        for r in range(2, ws.max_row + 1): ws.cell(r, ld_idx).number_format  = "0.000"
-    if bur_idx:
-        for r in range(2, ws.max_row + 1): ws.cell(r, bur_idx).number_format = "0.00000"
-    if com_idx:
-        for r in range(2, ws.max_row + 1): ws.cell(r, com_idx).number_format = "0.000000"
+# ==================== UPDATE ====================
+for idx, row in imp.iterrows():
+    year = row["_year"]
+    if pd.isna(year): 
+        continue
+    year = int(year)
+    seg  = row["_seg"] if row["_seg"] else ""
+    desc = row["_desc"]
+    code = row["_code"]
 
-    # base rate: default 3 dp, but VT/Abrams rows = whole dollars
-    if base_idx:
-        vt_flags = rb["_is_vt_abrams"].to_list()
-        for i, is_vt in enumerate(vt_flags, start=2):   # row 2..N (skip header)
-            ws.cell(i, base_idx).number_format = "0" if is_vt else "0.000"
+    mask = applies_mask_for_row(seg, desc, code)
 
-print(f"✅ Wrote update identical to import columns → {update_path}")
+    for col in rate_cols:
+        rk = rate_keys[col]
+        # Only write a value if the column is known in the rates table
+        if rk not in ratekey_to_cf:
+            continue
 
-# =========================================================
-# STEP 3 — Comparison (two sheets only; sub-headers removed)
-# =========================================================
-# Gather filtered band sets (remove alpha-only subheaders like IN/BU/NA)
-bands_cr = set(code for code in combined_rates["rate_band_code"].dropna().map(normalize_band_code).unique() if is_valid_band(code))
-rb_full = pd.read_excel(RATEBAND_PATH, dtype=object)
-rb_full["rate_band_code"] = rb_full[find_col(rb_full, ("rate band","rateband"))].map(normalize_band_code)
-bands_rb = set(code for code in rb_full["rate_band_code"].dropna().unique() if is_valid_band(code))
+        applies = bool(mask.get(rk, False))
+        v = value_for(rk, year) if applies else 0.0
 
-only_in_ratesum   = sorted(list(bands_cr - bands_rb))
-only_in_ratebands = sorted(list(bands_rb - bands_cr))
+        # Rounding: COM to 6; others to 5
+        places = ROUND_COM if re.search(r"\bcom\b", col, flags=re.I) else ROUND_OTH
+        imp.at[idx, col] = round_half_up(v, places)
 
-compare_path = OUT_DIR / "comparison_report.xlsx"
-with pd.ExcelWriter(compare_path, engine="openpyxl") as xw:
-    pd.DataFrame({"rate_band_code": only_in_ratesum}).to_excel(
-        xw, sheet_name="in_ratesum_not_in_ratebands", index=False)
-    pd.DataFrame({"rate_band_code": only_in_ratebands}).to_excel(
-        xw, sheet_name="in_ratebands_not_in_ratesum", index=False)
-
-print(f"✅ Wrote cleaned two-tab comparison → {compare_path}")
-print(f"   In RateSum not in RateBands: {len(only_in_ratesum)} | In RateBands not in RateSum: {len(only_in_ratebands)}")
+# Drop helpers and export in exact original shape
+imp_export = imp.loc[:, original_cols]
+out_path = OUT_DIR / "BurdenRateImportUpdate.xlsx"
+imp_export.to_excel(out_path, sheet_name="update", index=False)
+print(f"✅ BurdenRateImportUpdate → {out_path}")
