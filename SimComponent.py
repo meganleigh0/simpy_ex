@@ -1,135 +1,159 @@
 import re
 from pathlib import Path
-import pandas as pd
+from decimal import Decimal, ROUND_HALF_UP
 import numpy as np
+import pandas as pd
 
-RATESUM_PATH = "data/RATSUM.xlsx"
-SIMPLIFIED_SHEET = "SIMPLIFIED RATES NON-PSPL"
-SIMPLIFIED_SKIPROWS = 5
-OTHER_RATES_SHEET = "OTHER RATES"
+RATEBAND_PATH = "data/RateBandImport.xlsx"
+OUT_DIR = Path("out"); OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# --- helpers -------------------------------------------------------
-def pick_business_unit_col(cols):
-    """Find the 'BUSINESS UNIT _ GDLS' column by tokens (robust to underscores/spacing)."""
-    lc = {c.lower(): c for c in cols}
-    for k, orig in lc.items():
-        if "business" in k and "gdls" in k:
-            return orig
-    # fallback seen in your notebook
-    if "Unnamed: 1" in cols:
-        return "Unnamed: 1"
-    raise ValueError(f"Could not find BUSINESS UNIT GDLS column in: {list(cols)}")
-
-def get_year_from_header(h):
-    """Accepts '2024', 'CY2024', or ' # CY2024 ' -> 2024; else None."""
-    if h is None or (isinstance(h, float) and np.isnan(h)):
-        return None
-    m = re.search(r"(?:^|\D)(20\d{2})(?:\D|$)", str(h))
-    return int(m.group(1)) if m else None
+# ---------- helpers ----------
+def round_half_up(x, places):
+    if pd.isna(x): 
+        return np.nan
+    q = Decimal("1").scaleb(-places)
+    return float(Decimal(str(x)).quantize(q, rounding=ROUND_HALF_UP))
 
 def first_two_chars(s):
     s = str(s).strip()
-    return s[:2] if s else ""
+    return s[:2].upper() if s else ""
 
-# --- load SIMPLIFIED RATES ----------------------------------------
-xls = pd.ExcelFile(RATESUM_PATH)
-simp = pd.read_excel(xls, SIMPLIFIED_SHEET, skiprows=SIMPLIFIED_SKIPROWS, dtype=object)
-simp.columns = [str(c).strip() for c in simp.columns]
+def pick_col(df, hints):
+    lc = {c.lower(): c for c in df.columns}
+    for h in hints:
+        for k, orig in lc.items():
+            if h in k:
+                return orig
+    raise ValueError(f"Missing any column like: {hints}")
 
-# normalize BU column name
-bu_col = pick_business_unit_col(simp.columns)
-simp.rename(columns={bu_col: "BUSINESS UNIT GDLS"}, inplace=True)
+# ---------- load the RateBandImport ----------
+rb = pd.read_excel(RATEBAND_PATH, dtype=object)
+rb.columns = [str(c).strip() for c in rb.columns]
 
-# drop repeated header row if present
-if str(simp.iloc[0]["BUSINESS UNIT GDLS"]).strip().lower().startswith("business"):
-    simp = simp.iloc[1:].reset_index(drop=True)
+rate_band_col = pick_col(rb, ("rate band", "rateband"))
+start_col     = pick_col(rb, ("start", "effective start"))
+end_col       = pick_col(rb, ("end", "effective end"))
+desc_col      = next((c for c in rb.columns if "desc" in c.lower() or "program" in c.lower() or "platform" in c.lower()), None)
 
-# drop 'Unnamed' junk columns
-simp = simp.loc[:, ~pd.Index(simp.columns).str.contains("Unnamed", case=False)]
+# numeric "base rate" style column (falls back if LD/Burdens/COM not present)
+base_col = next((c for c in rb.columns if "base rate" in c.lower()), None)
 
-# find year columns (e.g., 2022, 2023, 2024, 2025)
-year_cols = [c for c in simp.columns if get_year_from_header(c)]
-if not year_cols:
-    raise ValueError("No year columns found in Simplified Rates sheet.")
+# normalize key fields
+rb["_band_raw"] = rb[rate_band_col].astype(str).str.strip()
+rb["rate_band_code"] = rb["_band_raw"].map(first_two_chars)
+rb["_start"] = pd.to_datetime(rb[start_col], errors="coerce")
+rb["_end"]   = pd.to_datetime(rb[end_col], errors="coerce")
+if desc_col:
+    rb["_desc"] = rb[desc_col].astype(str).str.lower()
+else:
+    rb["_desc"] = ""
 
-# derive rate band code from first two characters
-simp["BUSINESS UNIT GDLS"] = simp["BUSINESS UNIT GDLS"].astype(str).str.strip()
-simp["rate_band_code"] = simp["BUSINESS UNIT GDLS"].map(first_two_chars)
+rb = rb.dropna(subset=["_start","_end"]).copy()
+rb["_start_year"] = rb["_start"].dt.year.astype(int)
+rb["_end_year"]   = rb["_end"].dt.year.astype(int)
 
-# melt to tidy
-simp_long = simp.melt(
-    id_vars=["BUSINESS UNIT GDLS", "rate_band_code"],
-    value_vars=year_cols,
-    var_name="year_col",
-    value_name="rate_value"
-)
-simp_long["year"] = simp_long["year_col"].map(get_year_from_header)
-simp_long["rate_value"] = pd.to_numeric(simp_long["rate_value"], errors="coerce")
-simp_long = (simp_long
-             .dropna(subset=["rate_band_code", "year"])
-             .drop(columns=["year_col"])
-             .sort_values(["rate_band_code", "year"]))
+# ---------- prep: fast lookup from combined_rates with carry-forward ----------
+# Expecting combined_rates from Step 1: columns ['rate_band_code','year','rate_value','source']
+if "combined_rates" not in globals():
+    raise RuntimeError("`combined_rates` is not defined. Run Step 1 first to build it from RATSUM.")
 
-# keep first non-null per band-year
-simp_long = (simp_long
-             .drop_duplicates(subset=["rate_band_code", "year"], keep="first")
-             .loc[:, ["rate_band_code", "year", "rate_value"]])
-simp_long["source"] = "Simplified"
+# Keep the latest value per band-year (already deduped in Step 1)
+cr = combined_rates.dropna(subset=["rate_band_code","year"]).copy()
+cr["year"] = cr["year"].astype(int)
 
-# --- load OTHER RATES (Allowable Control Test Rate) ----------------
-# We'll scan for a row containing 'ALLOWABLE' and 'TEST' and 'RATE' (handles 'CONTL/CONTROL')
-other = pd.read_excel(xls, OTHER_RATES_SHEET, header=None)
+band_to_series = {}
+for band, g in cr.groupby("rate_band_code"):
+    s = g.set_index("year")["rate_value"].sort_index()
+    band_to_series[band] = s
 
-# determine which columns are CY-years
-year_cols_idx = []
-years = []
-for j in range(other.shape[1]):
-    y = get_year_from_header(other.iloc[0, j]) or get_year_from_header(other.iloc[1, j]) or get_year_from_header(other.iloc[2, j])
-    # the "Rounded" header row in your screenshot typically places CY headers on a single row;
-    # be permissive across the first few rows
-    if y and str(other.iloc[0:5, j].astype(str).str.cat(sep=" ")).upper().find("CY") != -1:
-        year_cols_idx.append(j)
-        years.append(y)
-# fallback: anywhere CY#### appears
-if not years:
-    for j in range(other.shape[1]):
-        cell_block = " ".join(other.iloc[0:10, j].astype(str).tolist()).upper()
-        m = re.search(r"CY\s*(20\d{2})", cell_block)
-        if m:
-            year_cols_idx.append(j)
-            years.append(int(m.group(1)))
+def rate_for(band, year):
+    """Return value for band at year, carrying forward from the last <= year."""
+    s = band_to_series.get(band)
+    if s is None or s.empty:
+        return np.nan, None
+    # exact hit
+    if year in s.index:
+        return float(s.loc[year]), "exact"
+    # carry-forward from last <= year
+    prev_years = s.index[s.index <= year]
+    if len(prev_years) == 0:
+        return np.nan, None
+    y0 = int(prev_years.max())
+    return float(s.loc[y0]), f"ffill_from_{y0}"
 
-if not years:
-    raise ValueError("Could not locate CY20xx year columns in OTHER RATES.")
+# ---------- expand RB rows to years and attach values ----------
+rows = []
+for ridx, r in rb.iterrows():
+    b = r["rate_band_code"]
+    y0, y1 = int(r["_start_year"]), int(r["_end_year"])
+    for y in range(y0, y1 + 1):
+        val, how = rate_for(b, y)
+        rows.append({
+            "_ridx": ridx,
+            "rate_band_code": b,
+            "Year": y,
+            "value_raw": val,
+            "value_how": how
+        })
+rb_y = pd.DataFrame(rows)
 
-# find the ACTR row index
-actr_row_idx = None
-pattern = re.compile(r"ALLOWABLE.*TEST.*RATE", re.IGNORECASE)  # matches 'ALLOWABLE CONTL TEST RATE' or 'CONTROL'
-for i in range(other.shape[0]):
-    row_txt = " ".join([str(x) for x in other.iloc[i, :].tolist() if pd.notna(x)])
-    if pattern.search(row_txt):
-        actr_row_idx = i
-        break
-if actr_row_idx is None:
-    raise ValueError("Could not find 'ALLOWABLE ... TEST RATE' row in OTHER RATES.")
+# annotate VT/Abrams flag (for whole-dollar rounding)
+rb["_is_vt_abrams"] = (rb["rate_band_code"] == "VT") | rb["_desc"].str.contains("abrams", na=False)
 
-# build VT rows from ACTR
-vt_rows = []
-for j, y in zip(year_cols_idx, years):
-    val = pd.to_numeric(other.iat[actr_row_idx, j], errors="coerce")
-    if pd.notna(val):
-        vt_rows.append({"rate_band_code": "VT", "year": int(y), "rate_value": float(val), "source": "ACTR"})
+# join flags back onto per-year grid
+rb_y = rb_y.merge(rb[["_ridx","_is_vt_abrams"]], left_on="_ridx", right_index=True, how="left")
 
-vt_df = pd.DataFrame(vt_rows)
+# ---------- rounding + column mapping ----------
+# Column targets (create only if present)
+ld_col   = next((c for c in rb.columns if "labor dollars" in c.lower()), None)
+bur_col  = next((c for c in rb.columns if "burden" in c.lower()), None)
+com_col  = next((c for c in rb.columns if re.search(r"\bcom\b", c.lower())), None)
 
-# --- combined dataset for the importer ----------------------------
-combined_rates = pd.concat([simp_long, vt_df], ignore_index=True).sort_values(["rate_band_code", "year"])
-combined_rates.reset_index(drop=True, inplace=True)
+def compute_outputs(val, is_vt):
+    # base rate logic: VT/Abrams -> whole dollars from ACTR; else 3dp
+    base3 = round_half_up(val, 0 if is_vt else 3)
+    out = {"_base_out": base3}
+    if ld_col:  out["LD_out"]  = round_half_up(val, 3)
+    if bur_col: out["BUR_out"] = round_half_up(val, 5)
+    if com_col: out["COM_out"] = round_half_up(val, 6)
+    return out
 
-# quick sanity prints (you can remove later)
-print("Bands (sample):", combined_rates["rate_band_code"].drop_duplicates().head(10).tolist())
-print("Years span:", combined_rates["year"].min(), "→", combined_rates["year"].max())
-print("VT preview:\n", combined_rates[combined_rates["rate_band_code"] == "VT"].head())
+outs = rb_y.apply(lambda r: compute_outputs(r["value_raw"], bool(r["_is_vt_abrams"])), axis=1, result_type="expand")
+rb_y = pd.concat([rb_y, outs], axis=1)
 
-# `combined_rates` is the single source of truth you’ll join to RateBandImport on (rate_band_code, year).
-combined_rates.head(12)
+# ---------- fold back to RB shape (one row per original record per Year) ----------
+# If original file already has one row per year, this is 1:1; if not, you'll get multiple rows per original record (one per year)
+rb_update = (rb
+    .drop(columns=[c for c in ["_start_year","_end_year"] if c in rb.columns])
+    .merge(rb_y.drop(columns=["value_how"]), left_index=True, right_on="_ridx", how="left"))
+
+# write updated numeric columns
+if base_col:
+    rb_update[base_col] = rb_update["_base_out"]
+if ld_col:
+    rb_update[ld_col] = rb_update["LD_out"]
+if bur_col:
+    rb_update[bur_col] = rb_update["BUR_out"]
+if com_col:
+    rb_update[com_col] = rb_update["COM_out"]
+
+# nice ordering
+lead_cols = [rate_band_col, "rate_band_code", desc_col] if desc_col else [rate_band_col, "rate_band_code"]
+lead_cols += [start_col, end_col, "Year"]
+num_cols = [c for c in [base_col, ld_col, bur_col, com_col] if c]
+keep = [c for c in lead_cols + num_cols if c in rb_update.columns] + \
+       [c for c in rb_update.columns if c not in lead_cols + num_cols and not c.startswith("_")]
+
+rb_update = rb_update.loc[:, keep].sort_values([rate_band_col, "Year", start_col])
+
+# ---------- export ----------
+out_path = OUT_DIR / "RateBandImportUpdate.xlsx"
+with pd.ExcelWriter(out_path, engine="openpyxl") as xw:
+    rb_update.to_excel(xw, sheet_name="update", index=False)
+
+# quick stats
+n_vt = int(rb_update.loc[rb_update["rate_band_code"].eq("VT") | 
+                         (rb_update.get(desc_col, "").astype(str).str.lower().str.contains("abrams", na=False)), :].shape[0])
+print(f"✅ RateBandImportUpdate written to: {out_path}")
+print(f"Rows updated: {rb_update.shape[0]} | VT/Abrams rows: {n_vt}")
+rb_update.head(12)
