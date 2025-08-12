@@ -1,353 +1,476 @@
-# rate_files_pipeline_final.py
+# -*- coding: utf-8 -*-
+"""
+Bulletproof Rates Pipeline
+
+Inputs:
+- ratesum_path: Excel with sheets "Simplified Rates" and "Other Rates"
+  * Simplified Rates columns: "Business Unit GDLS", then one col per YEAR (e.g., 2023, 2024, ...)
+  * Other Rates contains a row named "Allowable Control Test Rate" with year columns
+- rate_band_path: Excel/CSV with columns including:
+  * "Rate Band" (or similar), "Start Date", "End Date"
+  * Optional description/name columns (to detect 'Abrams')
+  * Optional measure columns (e.g., "Labor Dollars", "Burdens", "COM") for rounding
+
+Outputs:
+- rate_band_import_update.xlsx
+- comparison_report.xlsx
+
+Author: (you)
+"""
 from __future__ import annotations
-from pathlib import Path
+
 import re
+import sys
+import json
+import math
+import logging
+from dataclasses import dataclass, field
+from decimal import Decimal, ROUND_HALF_UP
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Iterable, Set
+
 import pandas as pd
+import numpy as np
 
-# ---------------- PATHS ----------------
-RATSUM_PATH = Path("data/RATSUM.xlsx")
-RATE_BAND_IMPORT_PATH = Path("data/RateBandImport.xlsx")
-BURDEN_RATE_IMPORT_PATH = Path("data/BurdenRateImport.xlsx")
-OUT_DIR = Path("output")
 
-# ---------------- VT ABRAMS targeting ----------------
-VT_CODES = {"VB"}                 # add more codes if you have them
-VT_DESC_TOKENS = {"VT", "ABRAM"} # ALL tokens must be present in Description
-VT_REQUIRE_RATE_TYPE = "Units"    # set to None to disable
+# ------------------------- Configuration -------------------------
 
-# ---------------- Rounding ----------------
-LABOR_ROUND  = 3
-BURDEN_ROUND = 5
-COM_ROUND    = 6
+@dataclass
+class PipelineConfig:
+    # Sheet names (partial, case-insensitive ok)
+    simplified_rates_sheet_hint: str = "simplified"
+    other_rates_sheet_hint: str = "other"
 
-# ---------------- Utilities ----------------
-def _norm(s: str) -> str:
-    return re.sub(r"\s+", "", str(s or "")).strip().lower()
+    # Key phrases (case-insensitive)
+    business_unit_col_hints: Tuple[str, ...] = ("business unit gdls", "business unit - gdls", "business unit")
+    rate_band_col_hints: Tuple[str, ...] = ("rate band", "rateband", "band")
+    start_date_col_hints: Tuple[str, ...] = ("start date", "start", "effective start")
+    end_date_col_hints: Tuple[str, ...] = ("end date", "end", "effective end")
+    description_col_hints: Tuple[str, ...] = ("description", "name", "program", "platform")
 
-def _normalize_cy(c) -> str:
-    m = re.search(r"(20\d{2})", str(c))
-    return f"CY{m.group(1)}" if m else str(c)
+    # Row label to pull from Other Rates
+    allowable_control_test_label: str = "allowable control test rate"
 
-def _find_year_cols(df: pd.DataFrame):
-    pat = r"(?:CY)?\s*20\d{2}"
-    return [c for c in df.columns if re.fullmatch(pat, str(c).strip(), flags=re.I)]
+    # VT/Abrams override logic
+    vt_codes: Set[str] = field(default_factory=lambda: {"VT"})
+    abrams_phrase: str = "abrams"  # used against description/name columns
 
-def _pick_sheet(xls: pd.ExcelFile, *tokens: str) -> str:
-    toks = [t.upper() for t in tokens]
-    for s in xls.sheet_names:
-        if all(t in s.upper() for t in toks):
-            return s
-    raise ValueError(f"No sheet with tokens {toks}. Available: {xls.sheet_names}")
+    # Rounding rules applied to output columns if present
+    rounding_rules: Dict[str, int] = field(default_factory=lambda: {
+        "labor dollars": 3,
+        "burdens": 5,
+        "com": 6,
+    })
 
-def _read_best_skiprows(xls: pd.ExcelFile, sheet: str, tries=range(0, 12)) -> pd.DataFrame:
-    best, score = None, -1
-    for k in tries:
-        df = pd.read_excel(xls, sheet_name=sheet, skiprows=k).dropna(how="all").dropna(axis=1, how="all")
-        yc = _find_year_cols(df)
-        if len(yc) > score:
-            best, score = df.reset_index(drop=True), len(yc)
-    if best is None:
-        raise ValueError(f"Could not parse a grid from '{sheet}'")
-    return best
+    # Output filenames
+    out_update_filename: str = "rate_band_import_update.xlsx"
+    out_compare_filename: str = "comparison_report.xlsx"
 
-def _collapse_duplicate_named_cols(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    If multiple columns share the same name, merge them left→right by taking
-    the first non-null per row.
-    """
-    out = pd.DataFrame(index=df.index)
-    # dict.fromkeys preserves order of first appearance
-    for name in dict.fromkeys(df.columns):
-        block = df.loc[:, df.columns == name]  # DataFrame (1..n columns)
-        if block.shape[1] == 1:
-            out[name] = block.iloc[:, 0]
-        else:
-            out[name] = block.bfill(axis=1).iloc[:, 0]
-    return out
+    # Logging
+    log_level: int = logging.INFO
 
-def _derive_code_from_text(text) -> str | None:
-    """
-    EXACT rule: first two characters of BUSINESS UNIT GDLS.
-    - keep only [0-9A-Z], uppercase
-    - if single digit → pad to 2: '4' -> '04'
-    """
-    s = str(text or "").strip().upper()
-    if not s:
-        return None
-    two = re.sub(r"[^0-9A-Z]", "", s[:2])
-    if not two:
-        return None
-    if len(two) == 1 and two.isdigit():
-        two = f"0{two}"
-    return two[:2]
 
-def _derive_code_from_rbi_cell(val) -> str | None:
-    s = str("" if val is None else val).strip().upper()
-    if s.isdigit():
-        return s.zfill(2)[:2]
-    return _derive_code_from_text(s)
+# ------------------------- Utilities -------------------------
 
-def _find_col(df: pd.DataFrame, tokens: list[str]) -> str | None:
+def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+def _lc(s: str) -> str:
+    return str(s).strip().lower()
+
+def _find_sheet_name(xls: pd.ExcelFile, hint: str) -> str:
+    hint_lc = hint.lower()
+    for name in xls.sheet_names:
+        if hint_lc in name.lower():
+            return name
+    # fallback: exact if present
+    for name in xls.sheet_names:
+        if name.lower() == hint_lc:
+            return name
+    raise ValueError(f"Could not find a sheet matching hint '{hint}' in {xls.sheet_names}")
+
+def _find_col(df: pd.DataFrame, hints: Iterable[str]) -> str:
+    lc_map = {c.lower(): c for c in df.columns}
+    for h in hints:
+        for c_lc, c in lc_map.items():
+            if h in c_lc:
+                return c
+    raise ValueError(f"Could not find any column matching hints: {hints}. Columns: {list(df.columns)}")
+
+def _year_cols(df: pd.DataFrame) -> List[str]:
+    years = []
     for c in df.columns:
-        if all(t in _norm(c) for t in tokens):
-            return c
-    return None
-
-# ---------------- Readers ----------------
-def read_simplified_with_codes(xls: pd.ExcelFile) -> pd.DataFrame:
-    """
-    Output columns:
-      - rate_band : first two chars of BUSINESS UNIT GDLS (zero-padded)
-      - label     : BUSINESS UNIT GDLS string
-      - CY####    : numeric year columns
-    """
-    sheet = _pick_sheet(xls, "SIMPLIFIED", "RATE")
-    df = _read_best_skiprows(xls, sheet)
-
-    year_cols_raw = _find_year_cols(df)
-    if not year_cols_raw:
-        raise ValueError("SIMPLIFIED: no year columns found")
-
-    # Identify BUSINESS UNIT GDLS (fallback to first non-year column)
-    label_col = next((c for c in df.columns
-                      if c not in year_cols_raw and "BUSINESS" in str(c).upper() and "UNIT" in str(c).upper()), None)
-    if label_col is None:
-        label_col = [c for c in df.columns if c not in year_cols_raw][0]
-
-    # Normalize year headers and collapse duplicates
-    df = df.rename(columns={c: _normalize_cy(c) for c in year_cols_raw})
-    df = _collapse_duplicate_named_cols(df)
-
-    # Build final list of year columns after collapse
-    year_cols = [c for c in df.columns if re.fullmatch(r"CY20\d{2}", str(c))]
-
-    # Rename label column (if it survived collapse with same name)
-    if label_col not in df.columns:
-        # find something that still looks like the label col
-        label_guess = next((c for c in df.columns if "BUSINESS" in str(c).upper() and "UNIT" in str(c).upper()), None)
-        label_col = label_guess or df.columns[0]
-    df = df.rename(columns={label_col: "label"})
-
-    # Derive 2-char code from BUSINESS UNIT GDLS
-    df["rate_band"] = df["label"].map(_derive_code_from_text)
-    df = df[df["rate_band"].notna()].copy()
-
-    # Cast year columns to numeric
-    for c in year_cols:
-        df.loc[:, c] = pd.to_numeric(df[c], errors="coerce")
-
-    return df[["rate_band", "label"] + year_cols]
-
-def read_allowable_control_test(xls: pd.ExcelFile) -> pd.Series:
-    sheet = _pick_sheet(xls, "OTHER", "RATE")
-    df = _read_best_skiprows(xls, sheet)
-    years = _find_year_cols(df)
+        s = str(c).strip()
+        if re.fullmatch(r"\d{4}", s):
+            years.append(c)
     if not years:
-        raise ValueError("OTHER RATES: no CY columns")
+        # also allow 'FY2025' patterns
+        for c in df.columns:
+            s = str(c).strip()
+            m = re.fullmatch(r"(?:fy|FY)?(\d{4})", s)
+            if m:
+                years.append(c)
+    if not years:
+        raise ValueError("No year columns (e.g., 2024, 2025) found.")
+    return years
 
-    first_year_idx = df.columns.get_loc(years[0])
-    pre = df.columns[:first_year_idx] if first_year_idx > 0 else [df.columns[0]]
-    df["desc"] = df[pre].astype(str).apply(lambda r: " ".join(x for x in r if x and x != "nan").strip(), axis=1)
+def _first_two_letters(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    # Take first two alphabetic characters
+    letters = re.findall(r"[A-Za-z]", text)
+    return "".join(letters[:2]).upper()
 
-    def _is_act(t: str) -> bool:
-        u = re.sub(r"\s+", " ", str(t or "")).upper()
-        return ("ALLOWABLE" in u) and (("CONTROL" in u) or ("CONTL" in u)) and ("TEST" in u)
+def _to_decimal(val) -> Optional[Decimal]:
+    if pd.isna(val):
+        return None
+    try:
+        return Decimal(str(val))
+    except Exception:
+        return None
 
-    row = df.loc[df["desc"].map(_is_act)]
-    if row.empty:
-        raise ValueError("OTHER RATES: Allowable Control/Contl Test row not found")
+def _round_half_up(x: Optional[Decimal], places: int) -> Optional[Decimal]:
+    if x is None:
+        return None
+    q = Decimal("1").scaleb(-places)  # e.g., places=3 -> Decimal('0.001')
+    return x.quantize(q, rounding=ROUND_HALF_UP)
 
-    df = df.rename(columns={c: _normalize_cy(c) for c in years})
-    df = _collapse_duplicate_named_cols(df)
+def _parse_date(val) -> pd.Timestamp:
+    if pd.isna(val) or val == "":
+        return pd.NaT
+    return pd.to_datetime(val, errors="coerce")
 
-    keep_years = [c for c in df.columns if re.fullmatch(r"CY20\d{2}", str(c))]
-    s = row.iloc[0][keep_years].copy()
-    s = pd.to_numeric(s, errors="coerce").fillna(0.0).round(BURDEN_ROUND)
-    s.name = "ACT"
-    return s
+def _safe_int_year(val) -> Optional[int]:
+    if pd.isna(val):
+        return None
+    try:
+        return int(val)
+    except Exception:
+        try:
+            return int(float(val))
+        except Exception:
+            return None
 
-def read_overhead(xls: pd.ExcelFile) -> pd.DataFrame:
-    sheet = _pick_sheet(xls, "OVERHEAD")
-    df = _read_best_skiprows(xls, sheet)
-    ycol = next((c for c in df.columns if str(c).strip().lower() in {"date", "year"}), None)
-    pcol = next((c for c in df.columns if str(c).strip().lower() in
-                 {"burden pool","pool","segment","description","descr"}), df.columns[0])
 
-    if not ycol:
-        yc = _find_year_cols(df)
-        if yc:
-            long = df.melt(id_vars=[pcol], value_vars=yc, var_name="CY", value_name="Rate")
-            long["Year"] = long["CY"].astype(str).str.extract(r"(20\d{2})").astype(int)
-            long = long.rename(columns={pcol: "Pool"})
-            long["Rate"] = pd.to_numeric(long["Rate"], errors="coerce").round(BURDEN_ROUND)
-            return long[["Pool", "Year", "Rate"]]
-        raise ValueError("OVERHEAD: no Year/Date or CY columns")
+# ------------------------- Core Steps -------------------------
 
-    meta = {pcol, ycol}
-    bcols = [c for c in df.columns if c not in meta]
-    out = df[[pcol, ycol] + bcols].copy().rename(columns={pcol: "Pool", ycol: "Year"})
-    out["Year"] = pd.to_numeric(out["Year"], errors="coerce").astype("Int64")
-    for c in bcols:
-        out[c] = pd.to_numeric(out[c], errors="coerce")
-        out[c] = out[c].round(COM_ROUND if "COM" in str(c).upper() else BURDEN_ROUND)
+def load_ratesum_sheets(ratesum_path: Path, cfg: PipelineConfig) -> Tuple[pd.DataFrame, pd.Series]:
+    xls = pd.ExcelFile(ratesum_path)
+    simp_name = _find_sheet_name(xls, cfg.simplified_rates_sheet_hint)
+    other_name = _find_sheet_name(xls, cfg.other_rates_sheet_hint)
+
+    df_simp = pd.read_excel(xls, sheet_name=simp_name, dtype=object)
+    df_other = pd.read_excel(xls, sheet_name=other_name, dtype=object)
+
+    df_simp = _normalize_cols(df_simp)
+    df_other = _normalize_cols(df_other)
+
+    # Identify columns
+    bu_col = _find_col(df_simp, tuple(h for h in cfg.business_unit_col_hints))
+    year_cols = _year_cols(df_simp)
+
+    # Build simplified long (rate_band, year -> value)
+    df_simp["_rate_band"] = df_simp[bu_col].astype(str).map(_first_two_letters)
+    melted = df_simp.melt(
+        id_vars=[bu_col, "_rate_band"],
+        value_vars=year_cols,
+        var_name="year_col",
+        value_name="value",
+    )
+    # Normalize year as int
+    melted["year"] = melted["year_col"].astype(str).str.extract(r"(\d{4})").iloc[:, 0].astype(int)
+    # Deduplicate: if same band/year appears multiple times, take first non-null
+    melted["value"] = pd.to_numeric(melted["value"], errors="coerce")
+    melted = (melted
+              .dropna(subset=["_rate_band", "year"])
+              .sort_values([ "_rate_band", "year"])
+              .drop_duplicates(subset=["_rate_band", "year"], keep="first"))
+
+    # Create mapping band->year->value
+    # We'll carry-forward within the full needed year span later.
+    simp_map = (melted
+                .set_index(["_rate_band", "year"])["value"]
+                .sort_index())
+
+    # Parse Other Rates -> Allowable Control Test Rate by year
+    # Find the row whose "label cell" equals allowable_control_test_label
+    df_other_lc = df_other.applymap(lambda x: _lc(x) if isinstance(x, str) else x)
+
+    # Try to find a column that acts like a label column (first non-year column)
+    possible_label_cols = [c for c in df_other.columns if c not in _year_cols(df_other)]
+    actr_row = None
+    for c in possible_label_cols:
+        # find first row where this col matches the label
+        mask = df_other_lc[c].astype(str).str.strip().str.lower().eq(cfg.allowable_control_test_label)
+        if mask.any():
+            actr_row = df_other.loc[mask].iloc[0]
+            break
+    if actr_row is None:
+        # Fallback: search entire frame
+        mask = df_other_lc.applymap(lambda v: isinstance(v, str) and v.strip().lower() == cfg.allowable_control_test_label)
+        if mask.any().any():
+            i, j = np.where(mask.values)
+            actr_row = df_other.iloc[i[0]]
+        else:
+            raise ValueError(f"Could not find row '{cfg.allowable_control_test_label}' in Other Rates sheet.")
+
+    other_year_cols = _year_cols(df_other)
+    actr_by_year = {}
+    for c in other_year_cols:
+        y = int(re.search(r"(\d{4})", str(c)).group(1))
+        val = pd.to_numeric(actr_row[c], errors="coerce")
+        if not pd.isna(val):
+            actr_by_year[y] = float(val)
+
+    if not actr_by_year:
+        raise ValueError("Allowable Control Test Rate row found, but no numeric year values detected.")
+
+    actr_series = pd.Series(actr_by_year, name="allowable_control_test_rate").sort_index()
+
+    return simp_map, actr_series
+
+
+def load_rate_band(rate_band_path: Path, cfg: PipelineConfig) -> pd.DataFrame:
+    p = Path(rate_band_path)
+    if p.suffix.lower() in (".xlsx", ".xlsm", ".xls"):
+        xls = pd.ExcelFile(p)
+        # pick the first sheet unless 'rate' hint appears
+        sheet = None
+        for name in xls.sheet_names:
+            if "rate" in name.lower():
+                sheet = name
+                break
+        if sheet is None:
+            sheet = xls.sheet_names[0]
+        df_rb = pd.read_excel(xls, sheet_name=sheet, dtype=object)
+    else:
+        df_rb = pd.read_csv(p, dtype=object)
+
+    df_rb = _normalize_cols(df_rb)
+
+    # Identify key columns
+    band_col = _find_col(df_rb, cfg.rate_band_col_hints)
+    start_col = _find_col(df_rb, cfg.start_date_col_hints)
+    end_col = _find_col(df_rb, cfg.end_date_col_hints)
+
+    # Optional description column
+    desc_col = None
+    for h in cfg.description_col_hints:
+        try:
+            desc_col = _find_col(df_rb, (h,))
+            break
+        except Exception:
+            continue
+
+    # Normalize datatypes
+    df_rb["_band"] = df_rb[band_col].astype(str).str.strip()
+    df_rb["_band_code"] = df_rb["_band"].apply(lambda s: re.sub(r"[^A-Za-z]", "", s)[:2].upper())
+    df_rb["_start"] = df_rb[start_col].apply(_parse_date)
+    df_rb["_end"] = df_rb[end_col].apply(_parse_date)
+    if desc_col:
+        df_rb["_desc"] = df_rb[desc_col].astype(str).str.strip().str.lower()
+    else:
+        df_rb["_desc"] = ""
+
+    # Validate dates
+    bad_dates = df_rb[df_rb["_start"].isna() | df_rb["_end"].isna()]
+    if not bad_dates.empty:
+        logging.warning("Some rate band rows have invalid start/end dates; they will be skipped.")
+        df_rb = df_rb.dropna(subset=["_start", "_end"])
+
+    # Compute year spans
+    df_rb["_start_year"] = df_rb["_start"].dt.year
+    df_rb["_end_year"] = df_rb["_end"].dt.year
+
+    # Keep original column names to round later (if present)
+    df_rb.attrs["original_columns"] = list(df_rb.columns)
+
+    return df_rb
+
+
+def build_needed_years(df_rb: pd.DataFrame) -> List[int]:
+    y_min = int(df_rb["_start_year"].min())
+    y_max = int(df_rb["_end_year"].max())
+    return list(range(y_min, y_max + 1))
+
+
+def carry_forward(series_by_year: pd.Series, needed_years: List[int]) -> pd.Series:
+    """Given a Series indexed by year with some gaps, return values for all needed_years,
+    forward-filling using the last available <= year."""
+    if series_by_year.empty:
+        return pd.Series(index=needed_years, dtype=float)
+
+    s = series_by_year.sort_index()
+    # reindex with full span (from min to max provided), then ffill
+    full_span = list(range(min(s.index), max(max(s.index), max(needed_years)) + 1))
+    s_full = s.reindex(full_span)
+    s_full = s_full.fillna(method="ffill")
+
+    # Now pick only needed_years; if needed years precede the first known year, we cannot backfill—leave NaN
+    out = s_full.reindex(needed_years)
+    # For years < first provided year, leave NaN
     return out
 
-def read_com_summary(xls: pd.ExcelFile) -> pd.DataFrame:
-    sheet = _pick_sheet(xls, "COM", "SUMMARY")
-    df = _read_best_skiprows(xls, sheet)
-    years = _find_year_cols(df)
-    if not years:
-        return pd.DataFrame(columns=["Pool", "Year", "COM"])
 
-    df = df.rename(columns={c: _normalize_cy(c) for c in years})
-    df = _collapse_duplicate_named_cols(df)
+def make_comparison_sets(df_simplified_bands: Set[str], df_rate_bands: Set[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    only_in_simplified = sorted(list(df_simplified_bands - df_rate_bands))
+    only_in_ratebands = sorted(list(df_rate_bands - df_simplified_bands))
+    a = pd.DataFrame({"rate_band_code": only_in_simplified})
+    b = pd.DataFrame({"rate_band_code": only_in_ratebands})
+    return a, b
 
-    keep_years = [c for c in df.columns if re.fullmatch(r"CY20\d{2}", str(c))]
-    # figure out “pre-year” block again after collapse
-    first_year_idx = df.columns.get_loc(keep_years[0])
-    pre = df.columns[:first_year_idx] if first_year_idx > 0 else [df.columns[0]]
-    df["Pool"] = df[pre].astype(str).apply(lambda r: " ".join(x for x in r if x and x != "nan").strip(), axis=1)
 
-    long = df.melt(id_vars=["Pool"], value_vars=keep_years, var_name="CY", value_name="COM")
-    long["Year"] = long["CY"].astype(str).str.extract(r"(20\d{2})").astype(int)
-    long["COM"] = pd.to_numeric(long["COM"], errors="coerce").round(COM_ROUND)
-    return long[["Pool", "Year", "COM"]]
+def update_rates(
+    df_rb: pd.DataFrame,
+    simp_map: pd.Series,            # index: (band, year) -> value
+    actr_series: pd.Series,         # index: year -> value
+    cfg: PipelineConfig
+) -> pd.DataFrame:
+    needed_years = build_needed_years(df_rb)
 
-# ---------------- Writers ----------------
-def update_rate_band_import(simplified: pd.DataFrame, act: pd.Series, rbi_in: Path, rbi_out: Path):
-    rbi = pd.read_excel(rbi_in)
+    # Build per-band series from simplified map, then carry-forward
+    bands_in_simplified = set([k[0] for k in simp_map.index])
+    band_to_series: Dict[str, pd.Series] = {}
+    for band in bands_in_simplified:
+        s = simp_map.xs(band).sort_index()  # Series indexed by year
+        band_to_series[band] = carry_forward(s, needed_years)
 
-    rb_col   = _find_col(rbi, ["rate","band"]) or _find_col(rbi, ["rateband"])
-    base_col = _find_col(rbi, ["base","rate"])
-    start_col= _find_col(rbi, ["start","date"])
-    desc_col = _find_col(rbi, ["desc"])        # optional
-    rt_col   = _find_col(rbi, ["rate","type"]) # optional
-    if not all([rb_col, base_col, start_col]):
-        raise ValueError("RBI missing Rate Band / Base Rate / Start Date")
+    # Carry-forward ACTR too
+    actr_cf = carry_forward(actr_series, needed_years)
 
-    # Build (code, year) -> rate
-    year_cols = [c for c in simplified.columns if c not in {"rate_band","label"}]
-    long = simplified.melt(id_vars=["rate_band"], value_vars=year_cols, var_name="CY", value_name="Rate")
-    long["Year"] = long["CY"].astype(str).str.extract(r"(20\d{2})").astype(int)
-    long["Rate"] = pd.to_numeric(long["Rate"], errors="coerce").round(LABOR_ROUND)
-    rate_map = {(rb, int(y)): float(r) for rb, y, r in zip(long["rate_band"], long["Year"], long["Rate"])}
+    # Make sets for comparison report
+    bands_in_rb = set(df_rb["_band_code"].unique().tolist())
+    comp_a, comp_b = make_comparison_sets(bands_in_simplified, bands_in_rb)
 
-    # Apply Base Rate by (code, StartDate year)
-    rbi["_Year"] = pd.to_datetime(rbi[start_col], errors="coerce").dt.year
-    def _put(row):
-        code = _derive_code_from_rbi_cell(row[rb_col])
-        yr = int(row["_Year"]) if pd.notna(row["_Year"]) else None
-        if code and yr is not None:
-            v = rate_map.get((code, yr))
-            if v is not None:
-                row[base_col] = round(v, LABOR_ROUND)
-        return row
-    rbi = rbi.apply(_put, axis=1).drop(columns=["_Year"])
+    # Expand rate band rows to per-year rows
+    records = []
+    for idx, row in df_rb.iterrows():
+        band_code = row["_band_code"]
+        desc = row.get("_desc", "")
+        y0 = int(row["_start_year"])
+        y1 = int(row["_end_year"])
+        years = list(range(y0, y1 + 1))
 
-    # ACT → VT ABRAMS rows only
-    for cy in act.index:
-        if cy not in rbi.columns:
-            rbi[cy] = pd.NA
+        # Determine source series for this row
+        use_actr = (band_code in cfg.vt_codes) or (cfg.abrams_phrase in str(desc).lower())
 
-    code_match = rbi[rb_col].map(_derive_code_from_rbi_cell).isin(VT_CODES) if VT_CODES else pd.Series(False, index=rbi.index)
-    desc_match = pd.Series(True, index=rbi.index)  # all-tokens must be present
-    if VT_DESC_TOKENS and desc_col:
-        up = rbi[desc_col].astype(str).str.upper()
-        for tok in VT_DESC_TOKENS:
-            desc_match &= up.str.contains(re.escape(tok), na=False)
-    mask = code_match | desc_match
-    if VT_REQUIRE_RATE_TYPE and rt_col:
-        mask &= rbi[rt_col].astype(str).str.upper().eq(VT_REQUIRE_RATE_TYPE.upper())
+        for y in years:
+            if use_actr:
+                rate_val = actr_cf.get(y, np.nan)
+            else:
+                s = band_to_series.get(band_code)
+                rate_val = s.get(y, np.nan) if s is not None else np.nan
 
-    rbi.loc[mask, list(act.index)] = list(act.values)
+            records.append({
+                "row_id": idx,
+                "rate_band_code": band_code,
+                "year": y,
+                "start_date": row["_start"],
+                "end_date": row["_end"],
+                "description": desc,
+                "rate_value": rate_val
+            })
 
-    # Round CY#### burden columns
-    cy_cols = [c for c in rbi.columns if re.fullmatch(r"CY20\d{2}", str(c))]
-    rbi[cy_cols] = rbi[cy_cols].apply(pd.to_numeric, errors="coerce").round(BURDEN_ROUND)
+    df_update = pd.DataFrame.from_records(records)
 
-    rbi_out.parent.mkdir(parents=True, exist_ok=True)
-    with pd.ExcelWriter(rbi_out, engine="openpyxl") as xw:
-        rbi.to_excel(xw, index=False, sheet_name="Rate Band Import")
-    print(f"✅ RateBandImport updated → {rbi_out.resolve()}")
+    # Apply rounding rules if the target file expects separate measure columns.
+    # If your rate band import wants *one* column, we'll keep 'rate_value' and also
+    # create optional columns if they exist in the original RB file.
+    orig_cols = df_rb.attrs.get("original_columns", [])
+    orig_cols_lc = [c.lower() for c in orig_cols]
 
-def update_burden_rate_import(overhead_df: pd.DataFrame, com_df: pd.DataFrame, bri_in: Path, bri_out: Path):
-    bri = pd.read_excel(bri_in)
-    pool_col = _find_col(bri, ["burden","pool"]) or _find_col(bri, ["pool"])
-    year_col = _find_col(bri, ["date"]) or _find_col(bri, ["year"])
-    if not all([pool_col, year_col]):
-        raise ValueError("BRI missing Burden Pool / Date or Year")
+    # Decide which measure columns exist; create them if present in input
+    for colname, places in cfg.rounding_rules.items():
+        # find matching column in original RB file (case-insensitive, contains)
+        candidates = [orig_cols[i] for i, lc in enumerate(orig_cols_lc) if colname in lc]
+        if candidates:
+            out_col = candidates[0]  # use the first match
+            # Round 'rate_value' to 'places' and put into this column
+            df_update[out_col] = df_update["rate_value"].apply(lambda v: float(_round_half_up(_to_decimal(v), places)) if pd.notna(v) else np.nan)
 
-    bcols = [c for c in bri.columns if c not in {pool_col, year_col, "Description", "Effective Date"}]
+    # Always keep a nicely rounded generic value too (3 decimals as general default)
+    df_update["rate_value_rounded"] = df_update["rate_value"].apply(
+        lambda v: float(_round_half_up(_to_decimal(v), 3)) if pd.notna(v) else np.nan
+    )
 
-    target = overhead_df.copy()
-    if not com_df.empty:
-        cmap = com_df.set_index(["Pool","Year"])["COM"].to_dict()
-        target["_COM_fill_"] = [cmap.get((p,y)) for p,y in zip(target["Pool"], target["Year"])]
+    # Attach comparison frames for later save
+    df_update.attrs["comparison_in_ratesum_not_in_ratebands"] = comp_a
+    df_update.attrs["comparison_in_ratebands_not_in_ratesum"] = comp_b
 
-    bri[year_col] = pd.to_numeric(bri[year_col], errors="coerce").astype("Int64")
-    idx = {(_norm(p), int(y)): r for p, y, r in zip(target["Pool"], target["Year"], target.index)}
+    return df_update
 
-    def _apply(row):
-        key = (_norm(row[pool_col]), int(row[year_col])) if pd.notna(row[year_col]) else None
-        if key and key in idx:
-            src = target.loc[idx[key]]
-            for c in bcols:
-                if c in src:
-                    row[c] = src[c]
-                elif c.upper().startswith("COM") and "_COM_fill_" in src:
-                    row[c] = src["_COM_fill_"]
-        return row
-    bri = bri.apply(_apply, axis=1)
 
-    for c in bcols:
-        bri[c] = pd.to_numeric(bri[c], errors="coerce")
-        bri[c] = bri[c].round(COM_ROUND if "COM" in str(c).upper() else BURDEN_ROUND)
+def save_outputs(
+    df_update: pd.DataFrame,
+    cfg: PipelineConfig,
+    out_dir: Path
+) -> Tuple[Path, Path]:
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    bri_out.parent.mkdir(parents=True, exist_ok=True)
-    with pd.ExcelWriter(bri_out, engine="openpyxl") as xw:
-        bri.to_excel(xw, index=False, sheet_name="Burden Rate Import")
-    print(f"✅ BurdenRateImport updated → {bri_out.resolve()}")
+    # 1) Update export
+    update_path = out_dir / cfg.out_update_filename
+    with pd.ExcelWriter(update_path, engine="openpyxl") as xw:
+        # Keep a clean set of columns in logical order
+        base_cols = ["rate_band_code", "year", "start_date", "end_date", "description", "rate_value", "rate_value_rounded"]
+        measure_cols = [c for c in df_update.columns if c not in base_cols and c not in ("row_id")]
+        cols = base_cols + measure_cols
+        cols = [c for c in cols if c in df_update.columns]
+        df_update.loc[:, cols].to_excel(xw, sheet_name="rate_band_update", index=False)
 
-# ---------------- Comparison (your exact rule) ----------------
-def write_rateband_comparison(simplified_df: pd.DataFrame, rbi_path_or_df, out_path: Path):
-    """
-    Compare:
-      - RATSUM: first-two-chars from BUSINESS UNIT GDLS ('rate_band')
-      - RBI:    first-two-chars of 'Rate Band' after normalization
-    """
-    rbi = pd.read_excel(rbi_path_or_df) if isinstance(rbi_path_or_df, (str, Path)) else rbi_path_or_df
-    rb_col = _find_col(rbi, ["rate","band"]) or _find_col(rbi, ["rateband"])
-    if rb_col is None:
-        raise ValueError("RBI: can't find Rate Band column")
+    # 2) Comparison export
+    comp_path = out_dir / cfg.out_compare_filename
+    comp_a = df_update.attrs.get("comparison_in_ratesum_not_in_ratebands", pd.DataFrame())
+    comp_b = df_update.attrs.get("comparison_in_ratebands_not_in_ratesum", pd.DataFrame())
 
-    ratsum_codes = set(simplified_df["rate_band"].dropna().astype(str).str.upper().str.strip())
-    rbi_codes = set(rbi[rb_col].dropna().map(_derive_code_from_rbi_cell))
-    rbi_codes.discard(None)
+    with pd.ExcelWriter(comp_path, engine="openpyxl") as xw:
+        comp_a.to_excel(xw, sheet_name="in_ratesum_not_in_ratebands", index=False)
+        comp_b.to_excel(xw, sheet_name="in_ratebands_not_in_ratesum", index=False)
 
-    only_ratsum = sorted(ratsum_codes - rbi_codes)
-    only_rbi    = sorted(rbi_codes - ratsum_codes)
+    return update_path, comp_path
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with pd.ExcelWriter(out_path, engine="openpyxl") as xw:
-        pd.DataFrame(only_ratsum, columns=["RateBand Code"]).to_excel(xw, sheet_name="In_RatSum_only", index=False)
-        pd.DataFrame(only_rbi,    columns=["RateBand Code"]).to_excel(xw, sheet_name="In_RateBand_only", index=False)
-    print(f"✅ Comparison report → {out_path.resolve()}")
 
-# ---------------- Main ----------------
+# ------------------------- Main entrypoint -------------------------
+
+def run_pipeline(
+    ratesum_path: str,
+    rate_band_path: str,
+    out_dir: str = ".",
+    config: Optional[PipelineConfig] = None
+) -> Tuple[Path, Path]:
+    cfg = config or PipelineConfig()
+    logging.basicConfig(level=cfg.log_level, format="%(levelname)s: %(message)s")
+
+    ratesum_path = Path(ratesum_path)
+    rate_band_path = Path(rate_band_path)
+    out_dir = Path(out_dir)
+
+    logging.info("Loading RateSum sheets...")
+    simp_map, actr_series = load_ratesum_sheets(ratesum_path, cfg)
+
+    logging.info("Loading Rate Band file...")
+    df_rb = load_rate_band(rate_band_path, cfg)
+
+    logging.info("Updating rates across date ranges...")
+    df_update = update_rates(df_rb, simp_map, actr_series, cfg)
+
+    logging.info("Writing outputs...")
+    update_path, comp_path = save_outputs(df_update, cfg, out_dir)
+
+    logging.info(f"Done.\n - Update: {update_path}\n - Compare: {comp_path}")
+    return update_path, comp_path
+
+
 if __name__ == "__main__":
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    xls = pd.ExcelFile(RATSUM_PATH)
+    # Example CLI usage:
+    # python rates_pipeline.py "RateSum.xlsx" "RateBands.xlsx" --out "./out"
+    import argparse
 
-    simplified = read_simplified_with_codes(xls)      # ← Code from first two chars of BUSINESS UNIT GDLS
-    act        = read_allowable_control_test(xls)     # ← ACT series
-    overhead   = read_overhead(xls)                   # ← burden pools by year
-    com_long   = read_com_summary(xls)                # ← COM (optional)
+    parser = argparse.ArgumentParser(description="Run rates pipeline.")
+    parser.add_argument("ratesum_path", help="Path to RateSum Excel file")
+    parser.add_argument("rate_band_path", help="Path to Rate Band file (Excel or CSV)")
+    parser.add_argument("--out", dest="out_dir", default=".", help="Output directory (default: current)")
+    args = parser.parse_args()
 
-    rbi_out = OUT_DIR / "RateBandImport_updated.xlsx"
-    update_rate_band_import(simplified, act, RATE_BAND_IMPORT_PATH, rbi_out)
-
-    bri_out = OUT_DIR / "BurdenRateImport_updated.xlsx"
-    update_burden_rate_import(overhead, com_long, BURDEN_RATE_IMPORT_PATH, bri_out)
-
-    write_rateband_comparison(simplified, rbi_out, OUT_DIR / "RateBand_Comparison.xlsx")
-    print("🎉 Process complete.")
+    run_pipeline(args.ratesum_path, args.rate_band_path, args.out_dir)
