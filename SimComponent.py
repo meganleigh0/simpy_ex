@@ -1,255 +1,326 @@
 # -*- coding: utf-8 -*-
-import re, calendar, datetime as dt
+"""
+Unified BOM pipeline: load -> clean -> compare -> visualize
+- Programs can be switched by changing PROGRAM_CONFIG at the top or via widgets at the bottom.
+- Sources:
+    Oracle MBOM: data/bronze_boms/{program}/{program}_mbom_oracle_{DATE}.xlsx
+    TC MBOM    : data/bronze_boms_{program}/{program}_mbom_tc_{DATE}.xlsm
+    TC EBOM    : data/bronze_boms_{program}/{program}_ebom_tc_{DATE}.xlsm
+"""
+
 from pathlib import Path
-from decimal import Decimal, ROUND_HALF_UP
-import numpy as np
 import pandas as pd
+import numpy as np
 
-# ---------- CONFIG ----------
-RATESUM_PATH = "data/RATSUM.xlsx"
-SIMPLIFIED_SHEET = "SIMPLIFIED RATES NON-PSPL"
-SIMPLIFIED_SKIPROWS = 5
-OTHER_RATES_SHEET = "OTHER RATES"
+# -----------------------------
+# CONFIG
+# -----------------------------
+BASE = Path("data/bronze_boms")
 
-RATEBAND_PATH = "data/RateBandImport.xlsx"
-OUT_DIR = Path("out"); OUT_DIR.mkdir(parents=True, exist_ok=True)
+# Fill this with your programs + dates (keep your existing lists):
+PROGRAM_CONFIG = {
+    # "xm30": {
+    #     "dates": ["02-12-2025", "02-20-2025", ...],
+    #     "no_header_dates": set(["02-12-2025","02-20-2025","02-26-2025","03-05-2025","03-17-2025"])
+    # },
+    "m10": {
+        "dates": [
+            "03-05-2025","03-17-2025","03-26-2025","03-27-2025",
+            "04-02-2025","04-09-2025","04-22-2025","05-07-2025",
+            "06-04-2025","06-09-2025","06-23-2025","06-30-2025",
+            "07-07-2025","07-21-2025","07-28-2025","08-04-2025","08-11-2025"
+        ],
+        "no_header_dates": set(["02-12-2025","02-20-2025","02-26-2025","03-05-2025","03-17-2025"])  # keep your exception list here
+    },
+    # "cuas": {
+    #     "dates": [...],
+    #     "no_header_dates": set([...])
+    # }
+}
 
-VT_CODE = "VT"
-ABRAMS_TOKENS = ("abrams", "vt abrams", "vtabrams")
-ROUNDING = {"labor dollars": 3, "burdens": 5, "com": 6}
+# Column name harmonization across files
+COLMAP = {
+    "Part Number": "PART_NUMBER",
+    "PART_NUMBER": "PART_NUMBER",
+    "Part Number*": "PART_NUMBER",
 
-# ---------- helpers ----------
-def round_half_up(x, places):
-    if pd.isna(x): return np.nan
-    q = Decimal("1").scaleb(-places)
-    return float(Decimal(str(x)).quantize(q, rounding=ROUND_HALF_UP))
+    "Item Name": "Description",
+    "ITEM_NAME": "Description",
 
-def year_from_header(h):
-    if h is None or (isinstance(h, float) and np.isnan(h)): return None
-    m = re.search(r"(?:^|\D)(20\d{2})(?:\D|$)", str(h))
-    return int(m.group(1)) if m else None
+    "Make or Buy": "Make/Buy",
+    "Make/Buy": "Make/Buy",
+    "Make / Buy": "Make/Buy",
+    "MAKE_OR_BUY": "Make/Buy",
+    "Make /Buy": "Make/Buy",
+    "Make/ Buy": "Make/Buy",
 
-def normalize_band_code(s):
-    s = str(s).strip()
-    two = s[:2]
-    if two.isdigit(): return two.zfill(2)
-    return re.sub(r"[^A-Za-z0-9]", "", two).upper()
+    "Level": "Levels",
+    "# Level": "Levels",
+    "# Levels": "Levels",
+    "LEVEL": "Levels",
+}
 
-def is_valid_band(code):
-    code = normalize_band_code(code)
-    return (code == VT_CODE) or bool(re.match(r'^(?=.*\d)[A-Z0-9]{2}$', code))  # 2 chars, contains a digit
+KEEP_COLS = ["PART_NUMBER", "Description", "Make/Buy", "Levels", "Date"]
 
-def pick_business_unit_col(cols):
-    lc = {c.lower(): c for c in cols}
-    for k, orig in lc.items():
-        if "business" in k and "gdls" in k: return orig
-    if "Unnamed: 1" in cols: return "Unnamed: 1"
-    raise ValueError("Could not find BUSINESS UNIT GDLS column")
 
-def find_col(df, hints):
-    lc = {c.lower(): c for c in df.columns}
-    for h in hints:
-        for k, orig in lc.items():
-            if h in k: return orig
-    raise ValueError(f"Missing any column like: {hints}")
+# -----------------------------
+# HELPERS
+# -----------------------------
+def _read_oracle(program: str, date: str, no_header_dates: set) -> pd.DataFrame:
+    """Oracle MBOM for a given snapshot."""
+    p = BASE / program / f"{program}_mbom_oracle_{date}.xlsx"
+    if not p.exists():
+        return pd.DataFrame(columns=KEEP_COLS)
 
-# --- explicit date parsing (no inference warnings) ---
-def _parse_date_cell(x, role="start"):
-    """Parse 'MM/YYYY', 'MM/DD/YYYY', or Excel serials. role='start' -> first day, 'end' -> last day."""
-    if pd.isna(x): return pd.NaT
-    if isinstance(x, (pd.Timestamp, dt.date, dt.datetime)): return pd.Timestamp(x)
+    # some dates come without header row
+    if date in no_header_dates:
+        df = pd.read_excel(p, engine="openpyxl")
+    else:
+        df = pd.read_excel(p, engine="openpyxl", header=5)
 
-    # Excel serial number
-    if isinstance(x, (int, float)) and not np.isnan(x):
-        try:
-            return pd.to_datetime(x, unit="D", origin="1899-12-30")
-        except Exception:
-            pass
+    df = df.rename(columns=COLMAP, errors="ignore")
+    # standardize set of columns we care about
+    wanted = [c for c in ["PART_NUMBER","Part-Number","PART_NUMBER.","PART_NUMBER*","Item Name","Description","Make/Buy","Make or Buy","Level","Levels"] if c in df.columns]
+    df = df[wanted].copy()
 
-    s = str(x).strip()
+    df.rename(columns=COLMAP, inplace=True)
+    df["Date"] = pd.to_datetime(date)
+    return df[KEEP_COLS].drop_duplicates()
 
-    # MM/YYYY
-    m = re.fullmatch(r"(\d{1,2})[/-](\d{4})", s)
-    if m:
-        mo, yr = int(m.group(1)), int(m.group(2))
-        day = 1 if role == "start" else calendar.monthrange(yr, mo)[1]
-        return pd.Timestamp(yr, mo, day)
 
-    # MM/DD/YYYY (or 2-digit year)
-    m = re.fullmatch(r"(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})", s)
-    if m:
-        mo, da, yr = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        if yr < 100: yr += 2000 if yr < 50 else 1900
-        return pd.Timestamp(yr, mo, da)
+def _read_tc_mbom(program: str, date: str) -> pd.DataFrame:
+    """Teamcenter MBOM."""
+    p = Path(f"data/bronze_boms_{program}") / f"{program}_mbom_tc_{date}.xlsm"
+    if not p.exists():
+        return pd.DataFrame(columns=KEEP_COLS)
 
-    return pd.NaT
+    df = pd.read_excel(p, engine="openpyxl")
+    df = df.rename(columns=COLMAP, errors="ignore")
+    wanted = [c for c in ["PART_NUMBER","Part Number","Item Name","Description","Make/Buy","Make or Buy","Level","Levels"] if c in df.columns]
+    df = df[wanted].copy()
+    df.rename(columns=COLMAP, inplace=True)
+    df["Date"] = pd.to_datetime(date)
+    return df[KEEP_COLS].drop_duplicates()
 
-def parse_date_col(series, role="start"):
-    return series.apply(lambda v: _parse_date_cell(v, role))
 
-# =========================================================
-# STEP 1 — Build combined_rates (Simplified + ACTR for VT)
-# =========================================================
-xls = pd.ExcelFile(RATESUM_PATH)
+def _read_tc_ebom(program: str, date: str) -> pd.DataFrame:
+    """Teamcenter EBOM."""
+    p = Path(f"data/bronze_boms_{program}") / f"{program}_ebom_tc_{date}.xlsm"
+    if not p.exists():
+        return pd.DataFrame(columns=KEEP_COLS)
 
-# Simplified
-simp = pd.read_excel(xls, SIMPLIFIED_SHEET, skiprows=SIMPLIFIED_SKIPROWS, dtype=object)
-simp.columns = [str(c).strip() for c in simp.columns]
-bu_col = pick_business_unit_col(simp.columns)
-simp.rename(columns={bu_col: "BUSINESS UNIT GDLS"}, inplace=True)
-if str(simp.iloc[0]["BUSINESS UNIT GDLS"]).strip().lower().startswith("business"):
-    simp = simp.iloc[1:].reset_index(drop=True)
-simp = simp.loc[:, ~pd.Index(simp.columns).str.contains("Unnamed", case=False)]
-year_cols = [c for c in simp.columns if year_from_header(c)]
-if not year_cols: raise ValueError("No year columns found in Simplified Rates.")
+    df = pd.read_excel(p, engine="openpyxl")
+    df = df.rename(columns=COLMAP, errors="ignore")
+    wanted = [c for c in ["PART_NUMBER","Part Number","Item Name","Description","Make/Buy","Make or Buy","Level","Levels"] if c in df.columns]
+    df = df[wanted].copy()
+    df.rename(columns=COLMAP, inplace=True)
+    df["Date"] = pd.to_datetime(date)
+    return df[KEEP_COLS].drop_duplicates()
 
-simp["BUSINESS UNIT GDLS"] = simp["BUSINESS UNIT GDLS"].astype(str).str.strip()
-simp["rate_band_code"] = simp["BUSINESS UNIT GDLS"].map(normalize_band_code)
-simp_long = (simp.melt(id_vars=["BUSINESS UNIT GDLS","rate_band_code"],
-                       value_vars=year_cols, var_name="year_col", value_name="rate_value")
-               .assign(year=lambda d: d["year_col"].map(year_from_header),
-                       rate_value=lambda d: pd.to_numeric(d["rate_value"], errors="coerce"))
-               .dropna(subset=["rate_band_code","year"])
-               .loc[:, ["rate_band_code","year","rate_value"]])
-simp_long["source"] = "Simplified"
 
-# Other Rates -> Allowable Control/Contl Test Rate
-other = pd.read_excel(xls, OTHER_RATES_SHEET, header=None)
-year_cols_idx, years = [], []
-for j in range(other.shape[1]):
-    block = " ".join(other.iloc[0:10, j].astype(str).tolist())
-    m = re.search(r"CY\s*(20\d{2})", block, flags=re.IGNORECASE)
-    if m: year_cols_idx.append(j); years.append(int(m.group(1)))
-if not years:
-    for j in range(other.shape[1]):
-        block = " ".join(other.iloc[0:10, j].astype(str).tolist())
-        m = re.search(r"(20\d{2})", block)
-        if m: year_cols_idx.append(j); years.append(int(m.group(1)))
-if not years: raise ValueError("Year columns not found in OTHER RATES.")
+def _clean_make_buy(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize Make/Buy text and sort for time-series logic."""
+    if df.empty:
+        return df.assign(previous_status=pd.Series(dtype="str"))
 
-actr_row_idx = None
-pat = re.compile(r"ALLOWABLE.*(CONTL|CONTROL).*TEST.*RATE", re.IGNORECASE)
-for i in range(other.shape[0]):
-    row_text = " ".join([str(x) for x in other.iloc[i, :].tolist() if pd.notna(x)])
-    if pat.search(row_text): actr_row_idx = i; break
-if actr_row_idx is None: raise ValueError("Missing 'ALLOWABLE ... TEST RATE' row.")
+    out = (
+        df.copy()
+          .assign(Date=lambda d: pd.to_datetime(d["Date"]))
+          .assign(**{
+              "Make/Buy": lambda d: (
+                  d["Make/Buy"]
+                  .astype(str).str.strip().str.lower()
+                  .replace({"nan": np.nan})
+                  .where(lambda s: s.isin(["make","buy"]))
+              )
+          })
+          .sort_values(["PART_NUMBER","Date"])
+          .drop_duplicates(subset=["PART_NUMBER","Date"], keep="last")
+          .reset_index(drop=True)
+    )
+    # previous_status per part across snapshots
+    out["previous_status"] = out.groupby("PART_NUMBER")["Make/Buy"].shift(1)
+    return out
 
-vt_rows = []
-for j, y in zip(year_cols_idx, years):
-    val = pd.to_numeric(other.iat[actr_row_idx, j], errors="coerce")
-    if pd.notna(val): vt_rows.append({"rate_band_code": VT_CODE, "year": int(y), "rate_value": float(val), "source": "ACTR"})
-vt_df = pd.DataFrame(vt_rows)
 
-combined_rates = (pd.concat([simp_long, vt_df], ignore_index=True)
-                    .dropna(subset=["rate_band_code","year"])
-                    .astype({"year": int})
-                    .sort_values(["rate_band_code","year","source"])
-                    .drop_duplicates(subset=["rate_band_code","year"], keep="first")
-                    .reset_index(drop=True))
+def detect_flips(df: pd.DataFrame, source_name: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Return (flip_log, snapshot_summary) where:
+      flip_log: rows where Make/Buy changed vs previous snapshot per part
+      snapshot_summary: count of parts changed by Date
+    """
+    if df.empty:
+        return (
+            pd.DataFrame(columns=["PART_NUMBER","Description","Levels","Date","previous_status","new_status","Source"]),
+            pd.DataFrame(columns=["Date","num_parts_changed","Source"]),
+        )
 
-# =========================================================
-# STEP 2 — Update RateBandImport IN PLACE (no extra columns)
-# =========================================================
-rb = pd.read_excel(RATEBAND_PATH, dtype=object)
-rb.columns = [str(c).strip() for c in rb.columns]
-original_cols = rb.columns.tolist()
+    mask = df["Make/Buy"].notna() & df["previous_status"].notna() & df["Make/Buy"].ne(df["previous_status"])
+    flip_log = (
+        df.loc[mask, ["PART_NUMBER","Description","Levels","Date","previous_status","Make/Buy"]]
+          .rename(columns={"Make/Buy":"new_status"})
+          .assign(Source=source_name)
+          .sort_values(["Date","PART_NUMBER"])
+          .reset_index(drop=True)
+    )
+    snapshot_summary = (
+        flip_log.groupby(["Date"], as_index=False)["PART_NUMBER"]
+                .nunique()
+                .rename(columns={"PART_NUMBER":"num_parts_changed"})
+                .assign(Source=source_name)
+                .sort_values("Date")
+    )
+    return flip_log, snapshot_summary
 
-rate_band_col = find_col(rb, ("rate band","rateband"))
-start_col     = find_col(rb, ("start", "effective start"))
-end_col       = find_col(rb, ("end", "effective end"))
-desc_col      = next((c for c in rb.columns if "desc" in c.lower() or "program" in c.lower() or "platform" in c.lower()), None)
 
-base_col      = next((c for c in rb.columns if "base rate" in c.lower()), None)
-ld_col        = next((c for c in rb.columns if "labor dollars" in c.lower()), None)
-bur_col       = next((c for c in rb.columns if "burden" in c.lower()), None)
-com_col       = next((c for c in rb.columns if re.search(r"\bcom\b", c.lower())), None)
+def compare_sources_per_date(oracle_df, tc_m_df, tc_e_df) -> pd.DataFrame:
+    """
+    For each Date:
+      - in_oracle_not_tc_m
+      - in_tc_m_not_oracle
+      - in_tc_e_not_tc_m
+      - common_all
+    Returns tidy dataframe for plotting.
+    """
+    all_dates = sorted(set(oracle_df["Date"]) | set(tc_m_df["Date"]) | set(tc_e_df["Date"]))
+    rows = []
 
-rb["_band_raw"]      = rb[rate_band_col].astype(str).str.strip()
-rb["rate_band_code"] = rb["_band_raw"].map(normalize_band_code)
+    for dt in all_dates:
+        o = set(oracle_df.loc[oracle_df["Date"].eq(dt), "PART_NUMBER"])
+        m = set(tc_m_df.loc[tc_m_df["Date"].eq(dt), "PART_NUMBER"])
+        e = set(tc_e_df.loc[tc_e_df["Date"].eq(dt), "PART_NUMBER"])
 
-# EXPLICIT date parsing (removes 'could not infer format' warnings)
-rb["_start"] = parse_date_col(rb[start_col], role="start")
-rb["_end"]   = parse_date_col(rb[end_col],   role="end")
+        rows.append({"Date": dt, "metric": "in_oracle_not_tc_m", "count": len(o - m)})
+        rows.append({"Date": dt, "metric": "in_tc_m_not_oracle", "count": len(m - o)})
+        rows.append({"Date": dt, "metric": "in_tc_e_not_tc_m", "count": len(e - m)})
+        rows.append({"Date": dt, "metric": "common_all", "count": len(o & m & e)})
 
-rb = rb.dropna(subset=["_start","_end"]).copy()
-rb["_year"] = rb["_start"].dt.year.astype(int)
-rb["_is_vt_abrams"] = (rb["rate_band_code"].eq(VT_CODE) |
-                       (rb[desc_col].astype(str).str.lower().str.contains("|".join(ABRAMS_TOKENS), na=False)
-                        if desc_col else False))
+    return pd.DataFrame(rows).sort_values(["Date","metric"]).reset_index(drop=True)
 
-# lookup with carry-forward
-band_to_series = {b: g.set_index("year")["rate_value"].sort_index()
-                  for b, g in combined_rates.groupby("rate_band_code")}
 
-def lookup_rate(band, year):
-    s = band_to_series.get(band)
-    if s is None or s.empty: return np.nan
-    if year in s.index: return float(s.loc[year])
-    prev = s.index[s.index <= year]
-    return float(s.loc[int(prev.max())]) if len(prev) else np.nan
+def load_program(program: str, dates: list[str], no_header_dates: set) -> dict:
+    """Load + clean + detect flips + compare for a single program."""
+    oracle = []
+    tc_m = []
+    tc_e = []
 
-vals = rb.apply(lambda r: lookup_rate(r["rate_band_code"], int(r["_year"])), axis=1)
+    for d in dates:
+        oracle.append(_read_oracle(program, d, no_header_dates))
+        tc_m.append(_read_tc_mbom(program, d))
+        tc_e.append(_read_tc_ebom(program, d))
 
-# assign + round (keep shape)
-if base_col:
-    rb.loc[vals.notna(), base_col] = [
-        round_half_up(v, 0 if vt else 3)
-        for v, vt in zip(vals[vals.notna()], rb.loc[vals.notna(), "_is_vt_abrams"])
-    ]
-if ld_col:
-    rb.loc[vals.notna(), ld_col]  = [round_half_up(v, ROUNDING["labor dollars"]) for v in vals[vals.notna()]]
-if bur_col:
-    rb.loc[vals.notna(), bur_col] = [round_half_up(v, ROUNDING["burdens"]) for v in vals[vals.notna()]]
-if com_col:
-    rb.loc[vals.notna(), com_col] = [round_half_up(v, ROUNDING["com"]) for v in vals[vals.notna()]]
+    oracle = pd.concat(oracle, ignore_index=True) if oracle else pd.DataFrame(columns=KEEP_COLS)
+    tc_m = pd.concat(tc_m, ignore_index=True) if tc_m else pd.DataFrame(columns=KEEP_COLS)
+    tc_e = pd.concat(tc_e, ignore_index=True) if tc_e else pd.DataFrame(columns=KEEP_COLS)
 
-rb_export = rb.loc[:, original_cols]  # exact same columns/order as import
+    # Clean & flip detection
+    oracle_c = _clean_make_buy(oracle)
+    tc_m_c   = _clean_make_buy(tc_m)
+    tc_e_c   = _clean_make_buy(tc_e)
 
-# ---- write + enforce Excel number formats (so you see ≥ required decimals) ----
-update_path = OUT_DIR / "RateBandImportUpdate.xlsx"
-with pd.ExcelWriter(update_path, engine="openpyxl") as xw:
-    rb_export.to_excel(xw, sheet_name="update", index=False)
-    ws = xw.book["update"]
+    oracle_flips, oracle_flip_summary = detect_flips(oracle_c, "Oracle MBOM")
+    tc_m_flips,  tc_m_flip_summary    = detect_flips(tc_m_c,  "TC MBOM")
+    tc_e_flips,  tc_e_flip_summary    = detect_flips(tc_e_c,  "TC EBOM")
 
-    def col_idx(colname):
-        return rb_export.columns.get_loc(colname) + 1 if colname in rb_export.columns else None
+    compare_tidy = compare_sources_per_date(oracle, tc_m, tc_e)
 
-    base_idx = col_idx(base_col)
-    ld_idx   = col_idx(ld_col)
-    bur_idx  = col_idx(bur_col)
-    com_idx  = col_idx(com_col)
+    return {
+        "oracle": oracle,
+        "tc_mbom": tc_m,
+        "tc_ebom": tc_e,
+        "oracle_flips": oracle_flips,
+        "tc_m_flips": tc_m_flips,
+        "tc_e_flips": tc_e_flips,
+        "flip_summary": pd.concat([oracle_flip_summary, tc_m_flip_summary, tc_e_flip_summary], ignore_index=True),
+        "compare_tidy": compare_tidy,
+    }
 
-    if ld_idx:
-        for r in range(2, ws.max_row + 1): ws.cell(r, ld_idx).number_format  = "0.000"
-    if bur_idx:
-        for r in range(2, ws.max_row + 1): ws.cell(r, bur_idx).number_format = "0.00000"
-    if com_idx:
-        for r in range(2, ws.max_row + 1): ws.cell(r, com_idx).number_format = "0.000000"
 
-    if base_idx:
-        vt_flags = rb["_is_vt_abrams"].to_list()
-        for i, is_vt in enumerate(vt_flags, start=2):
-            ws.cell(i, base_idx).number_format = "0" if is_vt else "0.000"
+# -----------------------------
+# DRIVER (non-interactive)
+# -----------------------------
+def run_pipeline(program: str) -> dict:
+    cfg = PROGRAM_CONFIG[program]
+    return load_program(program, cfg["dates"], cfg.get("no_header_dates", set()))
 
-print(f"✅ Wrote update identical to import columns → {update_path}")
 
-# =========================================================
-# STEP 3 — Comparison (two sheets only; sub-headers removed)
-# =========================================================
-bands_cr = set(code for code in combined_rates["rate_band_code"].dropna().map(normalize_band_code).unique() if is_valid_band(code))
-rb_full = pd.read_excel(RATEBAND_PATH, dtype=object)
-rb_full["rate_band_code"] = rb_full[find_col(rb_full, ("rate band","rateband"))].map(normalize_band_code)
-bands_rb = set(code for code in rb_full["rate_band_code"].dropna().unique() if is_valid_band(code))
+# -----------------------------
+# VISUALIZATION (Plotly)
+# -----------------------------
+# If you prefer Matplotlib, adapt this section; keeping Plotly since your notebook already uses it.
+import plotly.express as px
+import ipywidgets as W
+from IPython.display import display
 
-only_in_ratesum   = sorted(list(bands_cr - bands_rb))
-only_in_ratebands = sorted(list(bands_rb - bands_cr))
+def make_figs(result: dict, title_prefix: str = ""):
+    # 1) Flip counts by date (stacked by Source)
+    if not result["flip_summary"].empty:
+        f1 = px.bar(
+            result["flip_summary"],
+            x="Date", y="num_parts_changed", color="Source",
+            barmode="group",
+            title=f"{title_prefix}Make/Buy flips by snapshot"
+        )
+    else:
+        f1 = None
 
-compare_path = OUT_DIR / "comparison_report.xlsx"
-with pd.ExcelWriter(compare_path, engine="openpyxl") as xw:
-    pd.DataFrame({"rate_band_code": only_in_ratesum}).to_excel(
-        xw, sheet_name="in_ratesum_not_in_ratebands", index=False)
-    pd.DataFrame({"rate_band_code": only_in_ratebands}).to_excel(
-        xw, sheet_name="in_ratebands_not_in_ratesum", index=False)
+    # 2) Coverage comparison per snapshot
+    if not result["compare_tidy"].empty:
+        f2 = px.line(
+            result["compare_tidy"],
+            x="Date", y="count", color="metric",
+            markers=True,
+            title=f"{title_prefix}Cross-source comparison (per snapshot)"
+        )
+    else:
+        f2 = None
 
-print(f"✅ Wrote cleaned two-tab comparison → {compare_path}")
-print(f"   In RateSum not in RateBands: {len(only_in_ratesum)} | In RateBands not in RateSum: {len(only_in_ratebands)}")
+    # 3) Make/Buy composition by snapshot for each source (optional)
+    comp_rows = []
+    for label, df in [("Oracle MBOM", result["oracle"]), ("TC MBOM", result["tc_mbom"]), ("TC EBOM", result["tc_ebom"])]:
+        if df.empty: 
+            continue
+        tmp = (df.assign(n=1)
+                 .groupby(["Date","Make/Buy"], as_index=False)["n"].sum()
+                 .assign(Source=label))
+        comp_rows.append(tmp)
+    comp = pd.concat(comp_rows, ignore_index=True) if comp_rows else pd.DataFrame(columns=["Date","Make/Buy","n","Source"])
+
+    if not comp.empty:
+        f3 = px.bar(comp, x="Date", y="n", color="Make/Buy", facet_row="Source",
+                    title=f"{title_prefix}Make/Buy composition per snapshot")
+    else:
+        f3 = None
+
+    return [f for f in [f1, f2, f3] if f is not None]
+
+
+# -----------------------------
+# Simple program selector UI
+# -----------------------------
+def interactive_dashboard():
+    prog_dd = W.Dropdown(options=list(PROGRAM_CONFIG.keys()), description="Program:", value=list(PROGRAM_CONFIG.keys())[0])
+    out = W.Output()
+
+    def _render(change=None):
+        with out:
+            out.clear_output()
+            res = run_pipeline(prog_dd.value)
+            figs = make_figs(res, title_prefix=f"{prog_dd.value}: ")
+            if figs:
+                for fig in figs:
+                    fig.show()
+            else:
+                display("No data to plot for this selection.")
+
+            # also show the flip log table for traceability
+            flip_log_all = pd.concat([res["oracle_flips"], res["tc_m_flips"], res["tc_e_flips"]], ignore_index=True)
+            if not flip_log_all.empty:
+                display(flip_log_all.sort_values(["Date","Source","PART_NUMBER"]).reset_index(drop=True))
+
+    prog_dd.observe(_render, names="value")
+    display(prog_dd)
+    _render()
+
+# Call this in a notebook cell to use:
+# interactive_dashboard()
