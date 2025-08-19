@@ -6,17 +6,17 @@ from pathlib import Path
 import pandas as pd
 
 # ------------------------------ CONFIG ---------------------------------------
-BASE = Path("data")                 # root folder that contains bronze_boms_<program>
+BASE = Path("data")                 # root that contains bronze_boms_<program>
 OUT  = Path("mb_output"); OUT.mkdir(exist_ok=True)
 
-# File naming templates (adjust if yours differ)
+# File naming templates (edit if yours differ)
 PATTERN = {
     "tc_mbm":     "{base}/bronze_boms_{program}/{program}_mbom_tc_{date}.xlsm",
     "tc_ebom":    "{base}/bronze_boms_{program}/{program}_ebom_tc_{date}.xlsm",
     "oracle_mbm": "{base}/bronze_boms_{program}/{program}_mbom_oracle_{date}.xlsx",
 }
 
-# Oracle snapshots that already have the real header on row 1 (no offset)
+# Oracle snapshots that already have headers on row 1 (no offset)
 NO_HEADER_DATES = {"02-12-2025","02-20-2025","02-26-2025","03-05-2025","03-17-2025"}
 
 DATE_FMT = "%m-%d-%Y"
@@ -78,6 +78,10 @@ def _normalize(raw: pd.DataFrame, date: str) -> pd.DataFrame:
 
     # keep only the columns we need (if present)
     keep = [c for c in ["PART_NUMBER","Description","Make/Buy","Levels"] if c in df.columns]
+    if not keep:
+        # nothing useful; return empty frame with expected schema
+        return pd.DataFrame(columns=["PART_NUMBER","Description","Make/Buy","Levels","Date"])
+
     df = df[keep].copy()
 
     # collapse any duplicated names produced by the rename step
@@ -95,25 +99,40 @@ def _normalize(raw: pd.DataFrame, date: str) -> pd.DataFrame:
         )
     df["Date"] = pd.to_datetime(date, format=DATE_FMT, errors="coerce")
 
-    # remove blanks & de-dupe by part/date
+    # remove blanks & de-dupe by whatever keys exist
     if "PART_NUMBER" in df.columns:
         df = df[df["PART_NUMBER"].astype(str).str.strip().ne("")]
-    df = (df.sort_values(["PART_NUMBER","Date"])
-            .drop_duplicates(["PART_NUMBER","Date"], keep="last")
-            .reset_index(drop=True))
+    sort_keys = [c for c in ["PART_NUMBER","Date"] if c in df.columns]
+    dedup_keys = [c for c in ["PART_NUMBER","Date"] if c in df.columns]
+    if sort_keys:
+        df = (df.sort_values(sort_keys)
+                .drop_duplicates(dedup_keys, keep="last")
+                .reset_index(drop=True))
+    else:
+        df = df.reset_index(drop=True)
     return df
 
 # ------------------------------ IO / LOADING ---------------------------------
-def _read_one(program: str, date: str, source: str) -> pd.DataFrame | None:
-    """Read one snapshot; return None if file missing (handled upstream)."""
+def _read_one(program: str, date: str, source: str):
+    """Read one snapshot; return (df, reason). df=None means skip with reason."""
     path = _path_for(program, date, source)
     if not path.exists():
-        return None
+        return None, "missing file"
+
     header = 0
     if source == "oracle_mbm" and date not in NO_HEADER_DATES:
         header = 5  # historical Oracle dumps with title rows above headers
     raw = pd.read_excel(path, engine="openpyxl", header=header)
-    return _normalize(raw, date)
+
+    df = _normalize(raw, date)
+
+    # Require PART_NUMBER and Make/Buy to detect flips
+    missing = [c for c in ["PART_NUMBER","Make/Buy"] if c not in df.columns]
+    if missing:
+        return None, f"missing required columns: {missing}"
+    if df.empty:
+        return None, "no usable rows after normalization"
+    return df, None
 
 def load_boms(program: str, dates, sources, align_sources: bool=False) -> pd.DataFrame:
     """
@@ -123,19 +142,21 @@ def load_boms(program: str, dates, sources, align_sources: bool=False) -> pd.Dat
     if dates == "auto" or dates is None:
         dates = infer_dates(program, sources, mode="intersection" if align_sources else "union")
 
-    missing, frames = [], []
+    skipped = []   # (source, date, reason)
+    frames  = []
+
     for source in sources:
         for d in dates:
-            df = _read_one(program, d, source)
+            df, reason = _read_one(program, d, source)
             if df is None:
-                missing.append((source, d))
+                skipped.append((source, d, reason))
                 continue
             df["Source"] = source
             frames.append(df)
 
-    if missing:
-        txt = ", ".join([f"{s}:{d}" for s, d in missing])
-        print(f"⚠️  Skipped missing files ({len(missing)}): {txt}")
+    if skipped:
+        note = "; ".join([f"{s}:{d} -> {r}" for s, d, r in skipped])
+        print(f"⚠️  Skipped {len(skipped)} snapshots: {note}")
 
     if not frames:
         return pd.DataFrame(columns=["PART_NUMBER","Description","Levels","Make/Buy","Date","Source"])
@@ -194,24 +215,23 @@ def write_outputs(program: str, flip_log, snapshot_summary, per_part_counts):
     per_part_counts.to_csv(out_dir / "make_buy_flip_counts_by_part.csv", index=False)
     print(f"✅ Wrote outputs to {out_dir}")
 
-# ------------------------------ RUN EXAMPLES ---------------------------------
+# ------------------------------ RUN EXAMPLE ----------------------------------
 if __name__ == "__main__":
-    # Pick your program and sources
     program = "cuas"
-    sources = ["tc_mbm"]                 # any of: ["tc_mbm","tc_ebom","oracle_mbm"]
+    sources = ["tc_mbm"]        # any of: ["tc_mbm","tc_ebom","oracle_mbm"]
 
     # Option A: auto-discover dates that exist for these sources
-    dates = "auto"                       # use align_sources=True to require common dates only
+    dates = "auto"              # set align_sources=True to require common dates across sources
     all_boms = load_boms(program, dates, sources, align_sources=False)
 
-    # Option B: or specify explicit dates (skips any missing with a warning)
+    # Option B: explicit dates (any missing/bad files are skipped with a reason)
     # dates = ["03-05-2025","03-17-2025","04-02-2025","04-09-2025","04-16-2025","06-30-2025"]
     # all_boms = load_boms(program, dates, sources)
 
     flip_log, snapshot_summary, per_part_counts = detect_flips(all_boms)
     write_outputs(program, flip_log, snapshot_summary, per_part_counts)
 
-    # quick peek
+    # Quick peek
     print(flip_log.head(10))
     print(snapshot_summary.tail(10))
     print(per_part_counts.head(10))
