@@ -1,43 +1,47 @@
-# ======================= Make/Buy Flip Pipeline (robust) ======================
-# Requirements: pandas, openpyxl
+# ================== Make/Buy Flip Pipeline (header + warnings fixed) ==================
 from __future__ import annotations
-import re, warnings
+import re
 from glob import glob
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 import pandas as pd
 
-# Silence noisy engine warnings (we avoid deprecated behavior below)
-warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
-
-# ------------------------------ CONFIG ---------------------------------------
-BASE = Path("data")                 # folder that contains bronze_boms_<program>
+# ---------------------------- CONFIG -----------------------------------------
+BASE = Path("data")                 # folder containing bronze_boms_<program>
 OUT  = Path("mb_output"); OUT.mkdir(exist_ok=True)
 
-# File naming templates (adjust if yours differ)
+# File naming templates (edit if yours differ)
 PATTERN = {
     "tc_mbm":     "{base}/bronze_boms_{program}/{program}_mbom_tc_{date}.xlsm",
     "tc_ebom":    "{base}/bronze_boms_{program}/{program}_ebom_tc_{date}.xlsm",
     "oracle_mbm": "{base}/bronze_boms_{program}/{program}_mbom_oracle_{date}.xlsx",
 }
 
-# Oracle snapshots that already have headers on row 1 (no offset)
+# If an Oracle dump truly uses row 1 as header, list its date here (kept for compatibility)
 NO_HEADER_DATES = {"02-12-2025","02-20-2025","02-26-2025","03-05-2025","03-17-2025"}
 
 DATE_FMT = "%m-%d-%Y"
 DATE_RE  = re.compile(r"_(\d{2}-\d{2}-\d{4})\.(?:xlsx|xlsm)$")
 
-# Candidate column names
+# Canonical header candidates (we compare after lowercasing + stripping non-alnum)
 PART_CANDS  = ["PART_NUMBER","Part Number","PART NUMBER","Part_Number","PartNumber","Part No","PartNo"]
 DESC_CANDS  = ["Item Name","Description","Part Description","Part Desc","ItemName"]
 MABU_CANDS  = ["Make/Buy","Make or Buy","Make or Buy:","MAKE/BUY","MakeBuy"]
 LEVEL_CANDS = ["# Level","Level","Levels","Structure Level","Indent","Indented Level","Lvl","#Level","Level #"]
 
-# ------------------------------ PATH / DATES ---------------------------------
+def _norm(s) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(s).strip().lower())
+
+PART_KEYS  = {_norm(x) for x in PART_CANDS}
+DESC_KEYS  = {_norm(x) for x in DESC_CANDS}
+MABU_KEYS  = {_norm(x) for x in MABU_CANDS}
+LEVEL_KEYS = {_norm(x) for x in LEVEL_CANDS}
+
+# ---------------------------- PATHS / DATES ----------------------------------
 def _path_for(program: str, date: str, source: str) -> Path:
     return Path(PATTERN[source].format(base=BASE, program=program, date=date))
 
-def available_dates(program: str, source: str) -> list[str]:
+def available_dates(program: str, source: str) -> List[str]:
     pat = str(_path_for(program, "******", source)).replace("******", "*")
     dates = []
     for f in glob(pat):
@@ -45,145 +49,148 @@ def available_dates(program: str, source: str) -> list[str]:
         if m: dates.append(m.group(1))
     return sorted(set(dates), key=lambda d: pd.to_datetime(d, format=DATE_FMT))
 
-def infer_dates(program: str, sources: list[str], mode: str = "union") -> list[str]:
+def infer_dates(program: str, sources: List[str], mode: str = "union") -> List[str]:
     sets = [set(available_dates(program, s)) for s in sources]
     if not sets: return []
     dates = set.union(*sets) if mode == "union" else set.intersection(*sets)
     return sorted(dates, key=lambda d: pd.to_datetime(d, format=DATE_FMT))
 
-# ------------------------------ HELPERS --------------------------------------
-def _find_col(cols, candidates):
-    norm = {re.sub(r"[^a-z0-9]", "", c.lower()): c for c in cols}
-    for cand in candidates:
-        key = re.sub(r"[^a-z0-9]", "", cand.lower())
-        if key in norm: return norm[key]
-    return None
-
-def _coalesce_dupes_no_warning(df: pd.DataFrame, col: str) -> pd.DataFrame:
-    """If duplicate canonical names exist, keep the first non-null without using bfill/ffill."""
-    same = [c for c in df.columns if c == col]
-    if len(same) > 1:
-        block = df[same].astype("object")
-        # Treat empty strings as NA
-        block = block.mask(block.applymap(lambda x: isinstance(x, str) and x.strip() == ""))
-        # First non-null value per row (leftmost)
-        first_vals = block.apply(lambda r: next((v for v in r if pd.notna(v)), pd.NA), axis=1)
-        df[col] = first_vals
-        df.drop(columns=same[1:], inplace=True)
-    return df
-
+# ---------------------------- HEADER DETECTION --------------------------------
 def _detect_header_row(sample: pd.DataFrame) -> Optional[int]:
-    """Find a row likely to be the header by searching for a Part Number candidate."""
-    for i in range(min(30, len(sample))):  # scan top 30 rows
-        row_vals = [str(v) for v in sample.iloc[i].tolist()]
-        if any(re.sub(r"[^a-z0-9]", "", v.lower()) in
-               {re.sub(r"[^a-z0-9]", "", c.lower()) for c in PART_CANDS}
-               for v in row_vals):
+    """
+    Scan the first ~40 rows; consider a row a header if it contains a Part Number
+    candidate AND at least one of (Description/MakeBuy/Level).
+    """
+    limit = min(40, len(sample))
+    for i in range(limit):
+        vals = [_norm(v) for v in sample.iloc[i].tolist()]
+        s = set(vals)
+        if (len(s & PART_KEYS) >= 1) and (len(s & (DESC_KEYS | MABU_KEYS | LEVEL_KEYS)) >= 1):
             return i
     return None
 
-def _read_excel_dynamic(path: Path, oracle_source: bool, date: str) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
-    """
-    Robust Excel reader:
-    - If Oracle and date not in NO_HEADER_DATES -> try header=5 first
-    - Else: auto-detect header row & sheet by scanning top rows for Part Number
-    Returns (DataFrame, None) or (None, reason)
-    """
+# ---------------------------- READERS / NORMALIZATION -------------------------
+def _first_non_null_across_cols(df: pd.DataFrame) -> pd.Series:
+    """Row-wise first non-null/blank among the provided columns (no applymap/bfill)."""
+    arr = df.astype("object").to_numpy()
+    out = []
+    for row in arr:
+        v = pd.NA
+        for x in row:
+            if x is not None and not (isinstance(x, float) and pd.isna(x)):
+                if not (isinstance(x, str) and x.strip() == ""):
+                    v = x
+                    break
+        out.append(v)
+    return pd.Series(out, index=df.index, dtype="object")
+
+def _coalesce_dupes(df: pd.DataFrame, name: str) -> pd.DataFrame:
+    """Collapse duplicate columns named `name` by keeping the first non-null across them."""
+    cols = [c for c in df.columns if c == name]
+    if len(cols) > 1:
+        df[name] = _first_non_null_across_cols(df[cols])
+        df.drop(columns=cols[1:], inplace=True)
+    return df
+
+def _rename_to_canonical(raw: pd.DataFrame) -> pd.DataFrame:
+    """Rename fuzzily matched headers to canonical names."""
+    def _find(cands):
+        norm_map = {_norm(c): c for c in raw.columns}
+        for cand in cands:
+            k = _norm(cand)
+            if k in norm_map:
+                return norm_map[k]
+        return None
+
+    part  = _find(PART_CANDS)
+    desc  = _find(DESC_CANDS)
+    mabu  = _find(MABU_CANDS)
+    level = _find(LEVEL_CANDS)
+
+    ren = {}
+    if part:  ren[part]  = "PART_NUMBER"
+    if desc:  ren[desc]  = "Description"
+    if mabu:  ren[mabu]  = "Make/Buy"
+    if level: ren[level] = "Levels"
+
+    df = raw.rename(columns=ren)
+    keep = [c for c in ["PART_NUMBER","Description","Make/Buy","Levels"] if c in df.columns]
+    if not keep:
+        return pd.DataFrame(columns=["PART_NUMBER","Description","Make/Buy","Levels"])
+    df = df[keep].copy()
+
+    for c in ["PART_NUMBER","Description","Make/Buy","Levels"]:
+        if c in df.columns: df = _coalesce_dupes(df, c)
+    return df
+
+def _read_with_detect(path: Path) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+    """Read any Excel (xlsm/xlsx), detect the right sheet + header row."""
     try:
         xls = pd.ExcelFile(path, engine="openpyxl")
     except Exception as e:
         return None, f"open error: {e}"
 
-    # candidate (sheet, header_row) pairs to try
-    attempts = []
-    # 1) If we know Oracle offset, try that first on first sheet
-    if oracle_source and date not in NO_HEADER_DATES:
-        attempts.append((xls.sheet_names[0], 5))
-
-    # 2) For each sheet, try auto-detect header row
+    # Try each sheet: read without header first, detect header row, then rebuild with that row as header
     for sh in xls.sheet_names:
-        sample = pd.read_excel(xls, sheet_name=sh, nrows=30, header=None)
-        hdr = _detect_header_row(sample)
-        if hdr is not None:
-            attempts.append((sh, hdr))
-
-    # 3) Fallback: first sheet, header=0
-    attempts.append((xls.sheet_names[0], 0))
-
-    # Try attempts until one yields a frame with a recognizable part column
-    for sh, hdr in attempts:
         try:
-            df = pd.read_excel(xls, sheet_name=sh, header=hdr)
+            sample = pd.read_excel(xls, sheet_name=sh, header=None, nrows=50)
         except Exception:
             continue
-        # If this looks like a real table, return it
-        if any(_find_col(df.columns, PART_CANDS) for _ in [0]):
-            return df, None
+        hdr = _detect_header_row(sample)
+        if hdr is None:
+            continue
 
-    return None, "could not locate a header row with a Part Number column"
+        # Read the full sheet once (header=None), then set columns from the detected header row
+        full = pd.read_excel(xls, sheet_name=sh, header=None)
+        header_values = full.iloc[hdr].astype(str).tolist()
+        table = full.iloc[hdr+1:].copy()
+        table.columns = header_values
+        # Drop empty rows
+        table = table.dropna(how="all")
+        # If we found PART_NUMBER etc. after renaming, return
+        canon = _rename_to_canonical(table)
+        if "PART_NUMBER" in canon.columns:
+            return canon, None
 
-def _normalize(raw: pd.DataFrame, date: str) -> pd.DataFrame:
-    """Rename to canonical names, collapse dups, clean values, and de-dupe."""
-    part  = _find_col(raw.columns, PART_CANDS)
-    desc  = _find_col(raw.columns, DESC_CANDS)
-    mabu  = _find_col(raw.columns, MABU_CANDS)
-    level = _find_col(raw.columns, LEVEL_CANDS)
+    return None, "could not find a valid header row/columns in any sheet"
 
-    rename = {}
-    if part:  rename[part]  = "PART_NUMBER"
-    if desc:  rename[desc]  = "Description"
-    if mabu:  rename[mabu]  = "Make/Buy"
-    if level: rename[level] = "Levels"
+def _normalize(df: pd.DataFrame, date: str) -> pd.DataFrame:
+    """Clean values and de-duplicate records by PART_NUMBER+Date."""
+    if df.empty:
+        return df
 
-    df = raw.rename(columns=rename)
-
-    keep = [c for c in ["PART_NUMBER","Description","Make/Buy","Levels"] if c in df.columns]
-    if not keep:
-        return pd.DataFrame(columns=["PART_NUMBER","Description","Make/Buy","Levels","Date"])
-
-    df = df[keep].copy()
-
-    # Collapse duplicates safely (no FutureWarnings)
-    for col in ["PART_NUMBER","Description","Make/Buy","Levels"]:
-        if col in df.columns:
-            df = _coalesce_dupes_no_warning(df, col)
-
-    # Clean Make/Buy
+    # Clean Make/Buy if present
     if "Make/Buy" in df.columns:
-        df["Make/Buy"] = (
-            df["Make/Buy"]
-            .astype(str).str.strip().str.lower()
-            .replace({
-                "m":"make","b":"buy",
-                "make":"make","buy":"buy",
-                "mk":"make","bu":"buy"
-            })
-            .where(df["Make/Buy"].isin(["make","buy"]))
-        )
+        s = (df["Make/Buy"].astype(str).str.strip().str.lower()
+             .replace({"m":"make","mk":"make","b":"buy","bu":"buy"}))
+        df["Make/Buy"] = s.where(s.isin(["make","buy"]))
 
+    # attach snapshot date
     df["Date"] = pd.to_datetime(date, format=DATE_FMT, errors="coerce")
 
-    # Remove blank parts and de-dupe per part/date
+    # drop blank part numbers
     if "PART_NUMBER" in df.columns:
-        df = df[df["PART_NUMBER"].astype(str).str.strip().ne("")]
-    df = (df.sort_values([c for c in ["PART_NUMBER","Date"] if c in df.columns])
-            .drop_duplicates([c for c in ["PART_NUMBER","Date"] if c in df.columns], keep="last")
-            .reset_index(drop=True))
-    return df
+        mask = df["PART_NUMBER"].astype(str).str.strip() != ""
+        df = df.loc[mask]
 
-# ------------------------------ IO / LOADING ---------------------------------
+    if {"PART_NUMBER","Date"}.issubset(df.columns):
+        df = (df.sort_values(["PART_NUMBER","Date"])
+                .drop_duplicates(["PART_NUMBER","Date"], keep="last"))
+
+    return df.reset_index(drop=True)
+
+# ---------------------------- LOAD / FLIP LOGIC ------------------------------
 def _read_one(program: str, date: str, source: str) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
-    path = _path_for(program, date, source)
-    if not path.exists():
+    p = _path_for(program, date, source)
+    if not p.exists():
         return None, "missing file"
 
-    oracle = (source == "oracle_mbm")
-    raw, why = _read_excel_dynamic(path, oracle_source=oracle, date=date)
+    # robust read (sheet+header detection)
+    raw, why = _read_with_detect(p)
     if raw is None:
         return None, why
 
     df = _normalize(raw, date)
-    # Require PART_NUMBER + Make/Buy for flip detection
     need = [c for c in ["PART_NUMBER","Make/Buy"] if c not in df.columns]
     if need:
         return None, f"missing required columns after normalize: {need}"
@@ -196,20 +203,21 @@ def load_boms(program: str, dates, sources, align_sources: bool=False) -> pd.Dat
         dates = infer_dates(program, sources, mode="intersection" if align_sources else "union")
 
     skipped, frames = [], []
-    for source in sources:
+    for src in sources:
         for d in dates:
-            df, reason = _read_one(program, d, source)
+            df, reason = _read_one(program, d, src)
             if df is None:
-                skipped.append((source, d, reason))
+                skipped.append((src, d, reason))
                 continue
-            df["Source"] = source
+            df["Source"] = src
             frames.append(df)
 
     if skipped:
-        msg = " ; ".join([f"{s}:{d} -> {r}" for s, d, r in skipped])
-        print(f"⚠️  Skipped {len(skipped)} snapshots: {msg}")
+        note = " ; ".join(f"{s}:{d} -> {r}" for s, d, r in skipped)
+        print(f"⚠️  Skipped {len(skipped)} snapshots: {note}")
 
     if not frames:
+        # expected schema to avoid downstream key errors
         return pd.DataFrame(columns=["PART_NUMBER","Description","Levels","Make/Buy","Date","Source"])
 
     all_df = (pd.concat(frames, ignore_index=True)
@@ -218,7 +226,6 @@ def load_boms(program: str, dates, sources, align_sources: bool=False) -> pd.Dat
                 .reset_index(drop=True))
     return all_df
 
-# ------------------------------ FLIP DETECTION -------------------------------
 def detect_flips(all_df: pd.DataFrame):
     if all_df.empty:
         return all_df, all_df, all_df
@@ -236,37 +243,34 @@ def detect_flips(all_df: pd.DataFrame):
                       .reset_index(drop=True))
 
     snapshot_summary = (flip_log.groupby(["Source","Date"])["PART_NUMBER"]
-                        .nunique().rename("# num_parts_changed").reset_index()
+                        .nunique()
+                        .rename("# num_parts_changed")
+                        .reset_index()
                         .sort_values(["Source","Date"]))
 
     per_part_counts = (flip_log.groupby(["Source","PART_NUMBER"])
-                       .size().rename("num_flips").reset_index()
+                       .size()
+                       .rename("num_flips")
+                       .reset_index()
                        .sort_values(["Source","num_flips","PART_NUMBER"], ascending=[True,False,True]))
 
     return flip_log, snapshot_summary, per_part_counts
 
-# ------------------------------ OUTPUTS --------------------------------------
 def write_outputs(program: str, flip_log, snapshot_summary, per_part_counts):
-    out_dir = OUT / program
-    out_dir.mkdir(parents=True, exist_ok=True)
-    flip_log.to_csv(out_dir / "make_buy_flip_log.csv", index=False)
-    snapshot_summary.to_csv(out_dir / "make_buy_flip_summary_by_date.csv", index=False)
-    per_part_counts.to_csv(out_dir / "make_buy_flip_counts_by_part.csv", index=False)
-    print(f"✅ Wrote outputs to {out_dir}")
+    out = OUT / program
+    out.mkdir(parents=True, exist_ok=True)
+    flip_log.to_csv(out / "make_buy_flip_log.csv", index=False)
+    snapshot_summary.to_csv(out / "make_buy_flip_summary_by_date.csv", index=False)
+    per_part_counts.to_csv(out / "make_buy_flip_counts_by_part.csv", index=False)
+    print(f"✅ Wrote outputs to {out}")
 
-# ------------------------------ RUN EXAMPLE ----------------------------------
+# --------------------------------- RUN ---------------------------------------
 if __name__ == "__main__":
     program = "cuas"
-    sources = ["tc_mbm"]            # choose from: "tc_mbm", "tc_ebom", "oracle_mbm"
+    sources = ["tc_mbm"]      # choose: "tc_mbm", "tc_ebom", "oracle_mbm"
+    dates   = "auto"          # or supply a list like ["03-05-2025","03-17-2025",...]
 
-    # A) auto-discover valid dates for the chosen sources
-    dates = "auto"                  # set align_sources=True to require common dates across sources
     all_boms = load_boms(program, dates, sources, align_sources=False)
-
-    # B) or specify dates explicitly (skips any that don't exist / normalize)
-    # dates = ["03-05-2025","03-17-2025","04-02-2025","04-09-2025","04-16-2025","06-30-2025"]
-    # all_boms = load_boms(program, dates, sources)
-
     flip_log, snapshot_summary, per_part_counts = detect_flips(all_boms)
     write_outputs(program, flip_log, snapshot_summary, per_part_counts)
 
