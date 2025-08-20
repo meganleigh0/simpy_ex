@@ -1,33 +1,23 @@
-MRR Labeling Process
 
-Run MRR Report in Cognos
+⸻
 
-Go to: SCM Data Model Folder > SCM Reporting > MRR Report
+MRR Update Process
 
-Run the MRR by group code.
+1. Run MRR Report in Cognos (by group code)
+	•	Add “Month” and “Year” columns from Order Promised Date.
+	•	If Order Promised Date is missing, use Need By Date.
+	•	Add a “Promise Dates” flag column (Boolean = Yes/No) to indicate whether an Order Promised Date exists.
 
-Run SCM Requisition Report
+2. Run SCM Requisition Report to add Requisition Status
+	•	Navigate: SCM Data Model Folder → SCM Reporting → SCM Requisition Report.
+	•	Use Project Code (Column E), set as task, beginning at the most recent received date of material.
+	•	Match MCPR Order Number (Column J) to Req # (Column B).
+	•	Exclude rejected and returned material.
 
-Go to: SCM Data Model Folder > SCM Reporting > SCM Requisition Report
+3. Pull open order report from SCM portal to add VPP Billing
+	•	Match MCPR Order Number to Requisition Number.
+	•	Populate data from VPP Billing Rate.
 
-Begin at the latest received date of material.
+⸻
 
-Exclude rejected and returned material (Column E = Project Code).
-
-Match Orders
-
-Match MCPR Order Number (Column J) with Requisition # (Column B).
-
-Keep only true planned replenishments and commitments.
-
-Pull Open Order Report
-
-From the SCM portal, run the Open Order Report.
-
-Match MCPR Order Number (Column J).
-
-Identify vendor progress payments based on MCPR Order Numbers.
-
-Result
-
-Output = Labeled MRR (with validated requisitions, commitments, and progress payments).
+Output: Updated MRR with added columns 
