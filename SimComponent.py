@@ -1,7 +1,20 @@
+MRR Update
+
+Summary
+
+Goal: Update the MRR by adding new columns that provide better visibility into order dates, requisition status, and billing. This ensures we have a single, enhanced MRR that consolidates key information without requiring separate manual checks.
+
+New Columns to be Added:
+	1.	Month / Year – Derived from Order Promised Date (or Need By Date if not available).
+	2.	Promise Dates Flag – Boolean (Yes/No) showing if an Order Promised Date exists.
+	3.	Requisition Status – Pulled from SCM Requisition Report.
+	4.	VPP Billing Rate – Pulled from SCM Portal open order report.
+
+Output: A refreshed MRR with added columns (the “Labeled MRR”).
 
 ⸻
 
-MRR Update Process
+Process Steps
 
 1. Run MRR Report in Cognos (by group code)
 	•	Add “Month” and “Year” columns from Order Promised Date.
@@ -17,7 +30,3 @@ MRR Update Process
 3. Pull open order report from SCM portal to add VPP Billing
 	•	Match MCPR Order Number to Requisition Number.
 	•	Populate data from VPP Billing Rate.
-
-⸻
-
-Output: Updated MRR with added columns 
