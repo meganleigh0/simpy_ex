@@ -1,4 +1,4 @@
-# --- FULL WORD CLUSTERING ANALYSIS PIPELINE ---
+# --- FULL WORD CLUSTERING ANALYSIS PIPELINE (compatible across sklearn versions) ---
 # Make sure DATA is already loaded like:
 # DATA = pd.read_json("data/fm_mine.json")
 
@@ -13,8 +13,9 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import TruncatedSVD
 from sklearn.preprocessing import normalize
 from sklearn.neighbors import NearestNeighbors
-from sklearn.cluster import AgglomerativeClustering
 from sklearn.metrics import silhouette_score
+from sklearn.metrics.pairwise import cosine_distances
+from sklearn.cluster import AgglomerativeClustering
 
 # Optional (PowerPoint output, if installed)
 try:
@@ -56,17 +57,18 @@ nbrs = NearestNeighbors(n_neighbors=5, metric="cosine").fit(term_vectors)
 distances, _ = nbrs.kneighbors(term_vectors)
 nn_sim = 1 - distances[:, 1]  # cosine similarity with 1st neighbor
 
-# keep 60–80% of words
+# keep 60–80% of words (choose threshold adaptively)
 threshold = np.quantile(nn_sim, 0.3)
 clusterable_idx = np.where(nn_sim >= threshold)[0]
 Y = term_vectors[clusterable_idx]
 
-# === 5. Choose number of clusters ===
+# === 5. Choose number of clusters using precomputed distances ===
+D = cosine_distances(Y)
 best_k, best_sil = None, -1
 for k in range(5, min(40, len(Y))):
     try:
-        model = AgglomerativeClustering(n_clusters=k, affinity="cosine", linkage="average")
-        labels_tmp = model.fit_predict(Y)
+        model = AgglomerativeClustering(n_clusters=k, affinity="precomputed", linkage="average")
+        labels_tmp = model.fit_predict(D)
         if len(set(labels_tmp)) > 1:
             sil = silhouette_score(Y, labels_tmp, metric="cosine")
             if sil > best_sil:
@@ -77,10 +79,10 @@ if best_k is None:
     best_k = 10
 
 # === 6. Final clustering ===
-model = AgglomerativeClustering(n_clusters=best_k, affinity="cosine", linkage="average")
-labels = model.fit_predict(Y)
+model = AgglomerativeClustering(n_clusters=best_k, affinity="precomputed", linkage="average")
+labels = model.fit_predict(D)
 
-# assign cluster labels
+# assign cluster labels back to the vocab
 cluster_labels = np.full(len(terms), -1)
 cluster_labels[clusterable_idx] = labels
 
