@@ -1,209 +1,234 @@
-# === FAST WORD CLUSTERING: MULTI-METHOD COMPARISON (single cell) ===
-# Outputs (in ./out):
-#   summary.csv                                   -> runtime, coverage, silhouette per method
-#   word_clusters_<method>_k<k>.csv               -> labels + examples for each method tried
+# --- Word Usage Clustering (single cell) --------------------------------------
+# Clusters unique words by the *contexts* they appear in. Words can belong to
+# multiple clusters (soft membership), and low-signal words can remain unassigned.
 
-import re, math, time
-from pathlib import Path
+import re
+import math
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.decomposition import TruncatedSVD
+from collections import Counter, defaultdict
+from sklearn.feature_extraction.text import TfidfVectorizer, ENGLISH_STOP_WORDS
+from sklearn.decomposition import NMF
 from sklearn.preprocessing import normalize
-from sklearn.neighbors import NearestNeighbors
-from sklearn.cluster import MiniBatchKMeans, Birch, AgglomerativeClustering
-from sklearn.metrics import silhouette_score
-from sklearn.metrics.pairwise import cosine_similarity, cosine_distances
 
-# --------------------- CONFIG (tweak for speed/quality) ---------------------
-TEXT_COL         = "og"
-MAX_FEATURES     = 30000        # cap vocabulary
-MIN_DF           = 2            # ignore singletons
-N_COMPONENTS     = 100          # LSA dimensions (50–200 is typical)
-NN_FOR_MASK      = 6            # neighborhood size for "clusterable" check
-TARGET_COVERAGE  = 0.70         # aim ~70% words assigned (within 60–80%)
-SAMPLE_FOR_SCORE = 2000         # sample size for silhouette scoring
-K_GRID_FACTOR    = 1.0          # multiply the auto k guesses by this
-OUT_DIR          = Path("out"); OUT_DIR.mkdir(parents=True, exist_ok=True)
+# ------------------------------------------------------------------------------
+# 0) CONFIG (tweak these to taste)
+# ------------------------------------------------------------------------------
+CONTEXT_WINDOW = 5          # +/- tokens around a target word to define its context
+MIN_WORD_LEN = 3            # ignore very short tokens
+MIN_WORD_FREQ = 20          # only model words that appear at least this many times
+MAX_CONTEXTS_PER_WORD = 60  # cap contexts per word to keep runtime sane
+N_TOPICS = 20               # number of usage clusters to learn
+MAX_FEATURES = 30000        # TF-IDF max features for contexts
+MIN_MEMBERSHIP = 0.18       # absolute min topic score to consider an assignment
+RELATIVE_KEEP = 0.60        # keep topics within this fraction of a word's max score
+TOP_K_WORDS_PER_TOPIC = 40  # for reporting which words best represent each topic
+TOKEN_PATTERN = r"[a-zA-Z][a-zA-Z\-']+"  # keep alphabetic words with hyphen/'
 
-assert TEXT_COL in DATA.columns, f"DATA must have a '{TEXT_COL}' column."
+# ------------------------------------------------------------------------------
+# 1) Basic text helpers
+# ------------------------------------------------------------------------------
+_stop = set(ENGLISH_STOP_WORDS)
 
-# --------------------- 1) Clean text ---------------------
-def clean_text(s: str) -> str:
-    s = s.lower()
-    s = re.sub(r"(\d)([a-zA-Z])", r"\1 \2", s)  # 1200rpm -> 1200 rpm
-    s = re.sub(r"[^a-zA-Z\- ]+", " ", s)        # keep letters & hyphens
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+def sentence_split(text: str):
+    # lightweight sentence splitter
+    return re.split(r"(?<=[\.\?\!])\s+|\n+", text)
 
-texts = DATA[TEXT_COL].astype(str).map(clean_text).tolist()
+def tokenize(text: str):
+    # lower + regex + basic filtering
+    toks = re.findall(TOKEN_PATTERN, (text or "").lower())
+    return [t for t in toks if len(t) >= MIN_WORD_LEN]
 
-# --------------------- 2) TF-IDF ---------------------
-vect = TfidfVectorizer(
-    lowercase=True,
+# ------------------------------------------------------------------------------
+# 2) Build (word, DID, context_text) rows by sliding window over sentences
+# ------------------------------------------------------------------------------
+def build_context_rows(df: pd.DataFrame):
+    rows = []
+    word_counts = Counter()
+
+    # first pass: count words (for MIN_WORD_FREQ filtering later)
+    for _, r in df[["DID", "OG"]].itertuples(index=False):
+        for sent in sentence_split(r):
+            toks = tokenize(sent)
+            for tok in toks:
+                if tok not in _stop:
+                    word_counts[tok] += 1
+
+    vocab_words = {w for w, c in word_counts.items() if c >= MIN_WORD_FREQ}
+
+    # second pass: collect contexts, capped per word
+    per_word_added = Counter()
+    for did, text in df[["DID", "OG"]].itertuples(index=False):
+        for sent in sentence_split(text):
+            toks = tokenize(sent)
+            if not toks:
+                continue
+            for i, w in enumerate(toks):
+                if w in _stop or w not in vocab_words:
+                    continue
+                if per_word_added[w] >= MAX_CONTEXTS_PER_WORD:
+                    continue
+                lo = max(0, i - CONTEXT_WINDOW)
+                hi = min(len(toks), i + CONTEXT_WINDOW + 1)
+                context_tokens = toks[lo:i] + toks[i+1:hi]
+                # drop stopwords inside the context to sharpen signal
+                context_tokens = [t for t in context_tokens if t not in _stop]
+                if not context_tokens:
+                    continue
+                context_text = " ".join(context_tokens)
+                rows.append((w, did, context_text))
+                per_word_added[w] += 1
+
+    ctx_df = pd.DataFrame(rows, columns=["word", "DID", "context"])
+    return ctx_df, sorted(vocab_words)
+
+# Expect an existing DataFrame 'data' with columns DID, OG
+assert isinstance(data, pd.DataFrame) and {"DID","OG"}.issubset(data.columns), \
+    "Expected a DataFrame named `data` with columns ['DID','OG']."
+
+context_df, vocab_words = build_context_rows(data)
+print(f"Built {len(context_df):,} (word,context) samples for {len(vocab_words):,} words.")
+
+# If very large, consider sampling contexts to speed up experimentation:
+# context_df = context_df.sample(n=min(len(context_df), 150_000), random_state=1)
+
+# ------------------------------------------------------------------------------
+# 3) TF-IDF of contexts and NMF topic model (usage clusters)
+# ------------------------------------------------------------------------------
+tfidf = TfidfVectorizer(
     stop_words="english",
-    token_pattern=r"(?u)\b[a-zA-Z][a-zA-Z\-]{2,}\b",
-    max_df=0.95,
-    min_df=MIN_DF,
     max_features=MAX_FEATURES,
+    token_pattern=TOKEN_PATTERN,
+    lowercase=True,
+    ngram_range=(1,2)  # include some bigrams to capture local collocations
 )
-X = vect.fit_transform(texts)                         # docs x terms
-terms = np.array(vect.get_feature_names_out())
-doc_freq = np.asarray((X > 0).sum(axis=0)).ravel()
+X = tfidf.fit_transform(context_df["context"])
 
-# --------------------- 3) LSA term embeddings ---------------------
-svd = TruncatedSVD(n_components=min(N_COMPONENTS, max(10, X.shape[1]//2)), random_state=0)
-svd.fit(X)
-Y_all = svd.components_.T * svd.singular_values_      # term vectors
-Y_all = normalize(Y_all)                              # unit-length -> cosine == dot
+nmf = NMF(
+    n_components=N_TOPICS,
+    init="nndsvda",
+    random_state=42,
+    max_iter=500,
+    alpha_W=0.0,
+    alpha_H=0.0,
+    l1_ratio=0.0
+)
+W = nmf.fit_transform(X)   # (num_contexts x N_TOPICS): topic mix per context
+H = nmf.components_        # (N_TOPICS x vocab_size): top terms per topic
 
-# --------------------- 4) Pick clusterable words (hit ~70% target) ---------------------
-nbrs = NearestNeighbors(n_neighbors=min(NN_FOR_MASK, len(terms)), metric="cosine").fit(Y_all)
-dist, _ = nbrs.kneighbors(Y_all)
-nn_sim = 1 - dist[:, 1]
-# choose threshold so coverage ~TARGET_COVERAGE (clipped to 0.60–0.80 window)
-q = np.quantile(nn_sim, 1 - TARGET_COVERAGE)
-mask = nn_sim >= q
-coverage = mask.mean()
-if coverage < 0.60 or coverage > 0.80:
-    # nudge inside band
-    q = np.quantile(nn_sim, 0.40) if coverage < 0.60 else np.quantile(nn_sim, 0.20)
-    mask = nn_sim >= q
-cluster_idx = np.where(mask)[0]
-Y = Y_all[cluster_idx]
-terms_used = terms[cluster_idx]
-doc_freq_used = doc_freq[cluster_idx]
+# Normalize W so topic weights are comparable
+W = normalize(W, norm="l1", axis=1)
 
-# --------------------- 5) Helper: choose K & simple evaluators ---------------------
-m = len(Y)
-if m < 10: raise ValueError("Not enough clusterable words; relax MIN_DF or lower threshold.")
+# ------------------------------------------------------------------------------
+# 4) Aggregate context-topic mixtures up to the *word* level (soft membership)
+# ------------------------------------------------------------------------------
+# We average topic mixtures over all contexts of a given word.
+word_topic_sum = defaultdict(lambda: np.zeros(N_TOPICS, dtype=np.float32))
+word_counts = Counter()
 
-def auto_k_grid(n):
-    base = max(6, int(np.sqrt(n)))
-    grid = sorted(set([max(2, int(base * s * K_GRID_FACTOR)) for s in (0.5, 1.0, 1.5, 2.0)]))
-    return [k for k in grid if k < n]
+for (w, _did), row_w in zip(context_df[["word","DID"]].itertuples(index=False, name=None), W):
+    word_topic_sum[w] += row_w
+    word_counts[w] += 1
 
-def sample_for_score(Y, labels, max_n=SAMPLE_FOR_SCORE):
-    n = len(Y)
-    if n <= max_n:
-        return silhouette_score(Y, labels, metric="cosine")
-    idx = np.random.RandomState(0).choice(n, size=max_n, replace=False)
-    return silhouette_score(Y[idx], labels[idx], metric="cosine")
+words = []
+word_topic = []
+for w in word_topic_sum:
+    avg = word_topic_sum[w] / word_counts[w]
+    words.append(w)
+    word_topic.append(avg)
 
-def coverage_threshold(sims, target=0.70, band=(0.60, 0.80)):
-    # choose threshold to keep ~target fraction with band tolerance
-    q = np.quantile(sims, 1 - target)
-    cov = (sims >= q).mean()
-    if cov < band[0]: q = np.quantile(sims, 1 - band[0])
-    if cov > band[1]: q = np.quantile(sims, 1 - band[1])
-    return q
+word_topic = np.vstack(word_topic)  # (num_words x N_TOPICS)
 
-def finalize_labels_from_centers(Y, labels, centers):
-    # cosine sim to own center; drop below threshold to get ~target coverage
-    centers = normalize(centers)
-    sims = np.sum(Y * centers[labels], axis=1)        # since all unit-norm
-    thr = coverage_threshold(sims, TARGET_COVERAGE)
-    keep = sims >= thr
-    lab_fin = labels.copy()
-    lab_fin[~keep] = -1
-    return lab_fin, sims, thr
+# ------------------------------------------------------------------------------
+# 5) Assign words to clusters with soft rules (multi-membership + unassigned)
+# ------------------------------------------------------------------------------
+assignments = defaultdict(list)  # topic -> list[(word, score)]
+unassigned = []
 
-# --------------------- 6) Methods ---------------------
-results = []
-labels_by_method = {}
+for i, w in enumerate(words):
+    vec = word_topic[i]
+    max_score = float(vec.max())
+    if max_score < MIN_MEMBERSHIP:
+        unassigned.append(w)
+        continue
+    # keep topics close to the best one, and above absolute floor
+    keep_idx = np.where((vec >= MIN_MEMBERSHIP) & (vec >= RELATIVE_KEEP * max_score))[0]
+    if len(keep_idx) == 0:
+        unassigned.append(w)
+        continue
+    for t in keep_idx:
+        assignments[t].append((w, float(vec[t])))
 
-# (A) MiniBatchKMeans (fast, scalable)
-from sklearn.cluster import MiniBatchKMeans
-k_grid = auto_k_grid(m)
-for k in k_grid:
-    t0 = time.time()
-    km = MiniBatchKMeans(n_clusters=k, random_state=0, batch_size=2048, n_init=10)
-    labels = km.fit_predict(Y)
-    sscore = sample_for_score(Y, labels)
-    lab_fin, sims, thr = finalize_labels_from_centers(Y, labels, km.cluster_centers_)
-    t1 = time.time()
-    assigned = (lab_fin >= 0).mean()*100
-    results.append(["MiniBatchKMeans", k, round(sscore,4), round(assigned,1), round(t1-t0,2), thr])
-    labels_by_method[("MiniBatchKMeans", k)] = (lab_fin, sims)
+# sort assignments by strength per topic
+for t in assignments:
+    assignments[t].sort(key=lambda x: x[1], reverse=True)
 
-# (B) BIRCH (linear-time)
-from sklearn.cluster import Birch
-for k in k_grid:
-    t0 = time.time()
-    br = Birch(n_clusters=k, threshold=0.5, branching_factor=50)
-    labels = br.fit_predict(Y)
-    # compute simple centers from assignments
-    centers = np.vstack([normalize(Y[labels==i].mean(axis=0).reshape(1,-1))[0] for i in range(k)])
-    sscore = sample_for_score(Y, labels)
-    lab_fin, sims, thr = finalize_labels_from_centers(Y, labels, centers)
-    t1 = time.time()
-    assigned = (lab_fin >= 0).mean()*100
-    results.append(["BIRCH", k, round(sscore,4), round(assigned,1), round(t1-t0,2), thr])
-    labels_by_method[("BIRCH", k)] = (lab_fin, sims)
+print(f"\nWords with at least one cluster: {sum(len(v) for v in assignments.values()):,}")
+print(f"Unassigned words (low-signal):   {len(unassigned):,}")
 
-# (C) Agglomerative on a small sample, then assign rest to nearest center
-def safe_agglom(Ysub, k):
-    # try metric then affinity; if both fail, precomputed on the sample
-    try:
-        model = AgglomerativeClustering(n_clusters=k, linkage="average", metric="cosine")
-        return model.fit_predict(Ysub)
-    except TypeError:
-        try:
-            model = AgglomerativeClustering(n_clusters=k, linkage="average", affinity="cosine")
-            return model.fit_predict(Ysub)
-        except TypeError:
-            D = cosine_distances(Ysub)
-            try:
-                model = AgglomerativeClustering(n_clusters=k, linkage="average", metric="precomputed")
-            except TypeError:
-                model = AgglomerativeClustering(n_clusters=k, linkage="average", affinity="precomputed")
-            return model.fit_predict(D)
+# ------------------------------------------------------------------------------
+# 6) Human-readable summaries
+# ------------------------------------------------------------------------------
+# a) Top *terms* (context vocabulary) that define each topic (to label clusters)
+feature_names = np.array(tfidf.get_feature_names_out())
+topic_summaries = []
+for t in range(N_TOPICS):
+    top_term_idx = np.argsort(H[t])[::-1][:20]
+    top_terms = feature_names[top_term_idx].tolist()
+    topic_summaries.append((t, top_terms))
 
-sub_n = min(1500, m)  # keep sample small -> fast O(n^2)
-sub_idx = np.random.RandomState(0).choice(m, size=sub_n, replace=False)
-Ysub = Y[sub_idx]
-for k in k_grid:
-    t0 = time.time()
-    labels_sub = safe_agglom(Ysub, k)
-    # centers from sample
-    centers = np.vstack([normalize(Ysub[labels_sub==i].mean(axis=0).reshape(1,-1))[0] for i in range(k)])
-    # assign all points to nearest center (cosine)
-    sims_all = cosine_similarity(Y, centers)
-    labels_all = sims_all.argmax(axis=1)
-    sscore = sample_for_score(Y, labels_all)
-    lab_fin, sims, thr = finalize_labels_from_centers(Y, labels_all, centers)
-    t1 = time.time()
-    assigned = (lab_fin >= 0).mean()*100
-    results.append(["Agglo(sample→assign)", k, round(sscore,4), round(assigned,1), round(t1-t0,2), thr])
-    labels_by_method[("Agglo(sample→assign)", k)] = (lab_fin, sims)
+print("\n=== Topic label hints (top context terms) ===")
+for t, terms in topic_summaries:
+    print(f"[Topic {t:02d}] " + ", ".join(terms))
 
-# --------------------- 7) Summarize & export ---------------------
-summary = pd.DataFrame(results, columns=["method","k","silhouette_cosine(sample)","assigned_%","fit_seconds","sim_threshold"])
-summary = summary.sort_values(["silhouette_cosine(sample)","assigned_%"], ascending=[False, False])
-summary_path = OUT_DIR / "summary.csv"
-summary.to_csv(summary_path, index=False)
-print("Summary written:", summary_path)
-display(summary.head(10))
+# b) Top words (from your corpus) that belong to each topic
+print("\n=== Top words per topic (by membership) ===")
+for t in range(N_TOPICS):
+    if t not in assignments or len(assignments[t]) == 0:
+        continue
+    top_words = assignments[t][:TOP_K_WORDS_PER_TOPIC]
+    preview = ", ".join(f"{w}({s:.2f})" for w, s in top_words[:20])
+    print(f"[Topic {t:02d}] {preview}")
 
-# Save a labeled CSV per (method,k) tried
-def save_labels(method, k, labels, sims):
-    df = pd.DataFrame({
-        "word": terms_used,
-        "doc_freq": doc_freq_used,
-        "nn_similarity": nn_sim[cluster_idx],
-        "cluster": labels,
-        "sim_to_center": sims,
-    }).sort_values(["cluster","doc_freq","word"], ascending=[True, False, True])
-    out = OUT_DIR / f"word_clusters_{method.replace('/','_')}_k{k}.csv"
-    df.to_csv(out, index=False)
-    return out
+# ------------------------------------------------------------------------------
+# 7) Export artifacts for downstream use
+# ------------------------------------------------------------------------------
+# (a) Word-topic membership matrix
+word_topic_df = pd.DataFrame(word_topic, index=words, columns=[f"topic_{i:02d}" for i in range(N_TOPICS)])
+word_topic_df.index.name = "word"
 
-paths = []
-for (method, k), (lab_fin, sims) in labels_by_method.items():
-    paths.append(save_labels(method, k, lab_fin, sims))
+# (b) Assignments (long form)
+rows = []
+for t, items in assignments.items():
+    for w, s in items:
+        rows.append((w, t, s))
+assignments_df = pd.DataFrame(rows, columns=["word", "topic", "score"]).sort_values(["topic","score"], ascending=[True, False])
 
-print("Wrote label files:", len(paths))
-for p in paths[:5]:
-    print("  ", p)
+# (c) Unassigned words
+unassigned_df = pd.DataFrame({"word": sorted(unassigned)})
+
+# Uncomment to persist locally if desired:
+# word_topic_df.to_csv("word_topic_membership.csv")
+# assignments_df.to_csv("word_cluster_assignments.csv", index=False)
+# unassigned_df.to_csv("words_unassigned.csv", index=False)
+
+# Quick peeks
+print("\n=== Sample of word -> topic scores ===")
+display(word_topic_df.head(20))
+
+print("\n=== Sample assignments (first 10 per topic) ===")
+display(assignments_df.groupby("topic").head(10))
+
+print("\n=== Unassigned sample ===")
+display(unassigned_df.head(50))
+
+# ------------------------------------------------------------------------------
+# Notes:
+# - Increase N_TOPICS for finer clusters; decrease to coarsen.
+# - Raise MIN_MEMBERSHIP to be stricter (more words become unassigned).
+# - To capture *senses* more explicitly, you can first cluster contexts per word
+#   (e.g., KMeans on context TF-IDF for each word) to create word-sense rows,
+#   then run NMF on those; the above keeps things simple and fast to start.
+# - Swap NMF for TruncatedSVD + KMeans if you prefer hard clusters; keep soft
+#   membership by converting distances to similarities and thresholding.
+# ------------------------------------------------------------------------------
