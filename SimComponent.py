@@ -1,18 +1,20 @@
 import pandas as pd
 
-# Read CSV
-df = pd.read_csv("clustering_data_source.csv")
+# Load the CSV
+DATA = pd.read_csv("clustering_data_source.csv")
 
-# Group by `did` and sentence boundaries, then join tokens in order
-# We'll sort by `place` to keep token order correct
+# Ensure tokens are always strings
+DATA["token"] = DATA["token"].fillna("").astype(str)
+
+# Step 1: Rebuild sentences (group by did + sentence boundaries)
 sentences = (
-    df.sort_values(["did", "sentence_beg", "place"])
-      .groupby(["did", "sentence_beg", "sentence_end"])
-      .agg({"token": lambda x: " ".join(x)})
-      .reset_index()
+    DATA.sort_values(["did", "sentence_beg", "place"])
+        .groupby(["did", "sentence_beg", "sentence_end"])
+        .agg({"token": lambda x: " ".join(x)})
+        .reset_index()
 )
 
-# Combine into a single text string per `did`
+# Step 2: Rebuild full text per did (all sentences joined)
 full_sentences = (
     sentences.groupby("did")["token"]
              .apply(lambda x: " ".join(x))
