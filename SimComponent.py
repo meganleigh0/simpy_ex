@@ -1,25 +1,27 @@
 # ============================================================
-# Synonym-like term grouping with TF-IDF + (Agglomerative, KMeans, NMF)
-# One cell • scikit-learn only • dense conversion fixed
+# Fast synonym-ish term grouping (scikit-learn only, <5 min)
+# Methods: MiniBatchKMeans, Birch, NMF topics
+# Uses TF-IDF -> TruncatedSVD (LSA) for speedy, dense term vectors
 # ============================================================
 
 # -----------------------------
 # CONFIG — tweak as needed
 # -----------------------------
-DATA_PATH    = "assets/reliability_data_test.json"
-TEXT_COL     = "trimmed"
+DATA_PATH     = "assets/reliability_data_test.json"
+TEXT_COL      = "trimmed"
 
-MIN_DF       = 5            # drop very-rare terms (min doc freq)
-MAX_FEATURES = 15000        # cap vocab to keep memory OK when densifying
-NGRAM_RANGE  = (1, 2)       # unigrams + bigrams (captures short phrases)
-LOWERCASE    = True
-STOP_WORDS   = "english"
+MIN_DF        = 5             # drop very-rare terms
+MAX_FEATURES  = 10000         # limit vocab for speed/memory
+NGRAM_RANGE   = (1, 2)        # unigrams + bigrams
+LOWERCASE     = True
+STOP_WORDS    = "english"
 
-# Cluster/topic count heuristic (no tuning step):
-# k ≈ sqrt(#terms/2), clipped to [8, 80].
-K_LOWER, K_UPPER = 8, 80
+SVD_COMPONENTS = 200          # LSA dimensionality (100–300 works well)
+K_MIN, K_MAX   = 8, 60        # clamp cluster/topic count
+SAMPLE_FOR_SCORES = 2000      # max sampled terms for silhouette
 
-SHOW_PREVIEW = 30           # preview lines per method (0 to skip)
+SHOW_PREVIEW   = 25           # heads per method to preview (0 to skip)
+RANDOM_STATE   = 42
 
 # -----------------------------
 # Imports
@@ -27,13 +29,13 @@ SHOW_PREVIEW = 30           # preview lines per method (0 to skip)
 import math
 import numpy as np
 import pandas as pd
-from collections import defaultdict
+from collections import defaultdict, Counter
 
-from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
-from sklearn.cluster import AgglomerativeClustering, KMeans
-from sklearn.decomposition import NMF
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.decomposition import TruncatedSVD, NMF
 from sklearn.preprocessing import normalize
-from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.cluster import MiniBatchKMeans, Birch
+from sklearn.metrics import silhouette_score
 
 # -----------------------------
 # Load data
@@ -42,11 +44,11 @@ df = pd.read_json(DATA_PATH)
 if TEXT_COL not in df.columns:
     raise ValueError(f"Column '{TEXT_COL}' not in df. Available: {list(df.columns)}")
 docs = df[TEXT_COL].astype(str).fillna("")
-print(f"Loaded df: {df.shape}, using '{TEXT_COL}'. First 3 rows:")
+print(f"Loaded df: {df.shape}, using '{TEXT_COL}'.")
 print(df[[TEXT_COL]].head(3), "\n")
 
 # -----------------------------
-# TF-IDF (docs x terms) + raw counts for term frequency
+# TF-IDF (docs x terms) — sparse and fast
 # -----------------------------
 tfidf = TfidfVectorizer(
     lowercase=LOWERCASE,
@@ -54,107 +56,51 @@ tfidf = TfidfVectorizer(
     ngram_range=NGRAM_RANGE,
     min_df=MIN_DF,
     max_features=MAX_FEATURES,
-    norm="l2",           # cosine-friendly
+    norm="l2",
 )
-X = tfidf.fit_transform(docs)      # SPARSE (n_docs, n_terms)
+X = tfidf.fit_transform(docs)             # (n_docs, n_terms), sparse
 terms = np.array(tfidf.get_feature_names_out())
 n_terms = len(terms)
 if n_terms == 0:
-    raise ValueError("No terms survived vectorization. Lower MIN_DF or change preprocessing.")
-print(f"TF-IDF shape: {X.shape} | vocab size: {n_terms}")
-
-# Raw counts for frequency-based 'head' selection
-cv = CountVectorizer(
-    lowercase=LOWERCASE,
-    stop_words=STOP_WORDS,
-    ngram_range=NGRAM_RANGE,
-    min_df=MIN_DF,
-    max_features=MAX_FEATURES,
-)
-C = cv.fit_transform(docs)         # SPARSE (n_docs, n_terms2)
-cv_terms = np.array(cv.get_feature_names_out())
-
-# Align vocabularies between TF-IDF and Count
-common, tfidf_idx, cv_idx = np.intersect1d(terms, cv_terms, return_indices=True)
-if len(common) < n_terms:
-    X = X[:, tfidf_idx]            # keep only common columns in TF-IDF
-    terms = terms[tfidf_idx]
-    n_terms = len(terms)
-    print(f"Aligned to common vocab of size {n_terms} for frequency lookup.")
-term_freq = np.asarray(C[:, cv_idx].sum(axis=0)).ravel()  # frequency per term matching 'terms'
+    raise ValueError("No terms survived vectorization. Lower MIN_DF or adjust preprocessing.")
+print(f"TF-IDF: docs x terms = {X.shape} | vocab size = {n_terms}")
 
 # -----------------------------
-# Dense term vectors (terms x docs) for clustering
-# NOTE: Agglomerative/KMeans require DENSE inputs.
+# Fast term embeddings via LSA
+# SVD on X.T (terms x docs) -> dense (n_terms x SVD_COMPONENTS)
 # -----------------------------
-# T_sparse: (terms x docs) but still sparse. Convert to DENSE via .toarray() safely sized by MAX_FEATURES.
-T_dense = normalize(X.T.toarray(), norm="l2", axis=1)     # (n_terms, n_docs), L2-normalized
+svd = TruncatedSVD(n_components=SVD_COMPONENTS, random_state=RANDOM_STATE)
+term_vecs = svd.fit_transform(X.T)        # dense, compact
+term_vecs = normalize(term_vecs, norm="l2", axis=1)  # cosine-friendly
+print(f"LSA term vectors: {term_vecs.shape}\n")
 
 # -----------------------------
-# Heuristic for number of clusters/topics
+# Heuristic for K (no tuning loop)
 # -----------------------------
-def pick_k(n_terms):
-    k = int(round(math.sqrt(max(2, n_terms)/2.0)))
-    return max(K_LOWER, min(K_UPPER, k))
+def pick_k(n):
+    k = int(round(math.sqrt(max(2, n)/2)))
+    return max(K_MIN, min(K_MAX, k))
 K = pick_k(n_terms)
 print(f"Chosen K = {K} (heuristic)\n")
 
 # -----------------------------
-# Metrics
+# Helpers: mapping, preview, metrics (FAST)
 # -----------------------------
-def evaluate_labels(term_matrix_dense, labels):
-    """
-    term_matrix_dense: (n_terms, dim) dense L2-normalized vectors
-    labels: cluster/topic label for each term (len = n_terms)
-    Returns:
-      n_terms, n_clusters, pct_singletons, mean_intra_sim, mean_inter_sim
-    """
-    labels = np.asarray(labels)
-    n_terms = len(labels)
-    uniq = np.unique(labels)
-    n_clusters = len(uniq)
-    counts = [np.sum(labels == l) for l in uniq]
-    pct_singletons = (sum(1 for c in counts if c == 1) / max(1, n_terms))
-
-    # Cosine similarity across terms (dense)
-    # If vocab is large, this can be big; for typical sizes (<6k) it's OK.
-    sims = cosine_similarity(term_matrix_dense)  # (n_terms, n_terms)
-
-    intra_vals = []
-    idx_by_lab = {l: np.where(labels == l)[0] for l in uniq}
-    for l, idx in idx_by_lab.items():
-        if len(idx) > 1:
-            block = sims[np.ix_(idx, idx)]
-            m = (block.sum() - np.trace(block)) / (len(idx) * (len(idx) - 1))
-            intra_vals.append(m)
-
-    inter_vals = []
-    labs = list(idx_by_lab.keys())
-    for i in range(len(labs)):
-        for j in range(i+1, len(labs)):
-            a, b = idx_by_lab[labs[i]], idx_by_lab[labs[j]]
-            inter_vals.append(sims[np.ix_(a, b)].mean())
-
-    mean_intra = float(np.mean(intra_vals)) if intra_vals else float("nan")
-    mean_inter = float(np.mean(inter_vals)) if inter_vals else float("nan")
-    return n_terms, n_clusters, pct_singletons, mean_intra, mean_inter
-
-def build_mapping(terms_arr, labels, freqs):
-    """Group terms by label; 'head' = highest frequency (tie-break: shortest)."""
+def build_mapping(terms_arr, labels, doc_freq):
+    """Head = most frequent term in cluster (tie-break: shortest)."""
     groups = defaultdict(list)
     for t, l in zip(terms_arr, labels):
         groups[int(l)].append(t)
-
-    # quick index for frequencies
-    term_to_idx = {t: i for i, t in enumerate(terms_arr)}
     mapping = {}
+    # quick index for freq lookup
+    idx = {t: i for i, t in enumerate(terms_arr)}
     for l, ts in groups.items():
-        head = max(ts, key=lambda t: (freqs[term_to_idx[t]], -len(t)))
+        head = max(ts, key=lambda t: (doc_freq[idx[t]], -len(t)))
         syns = [t for t in ts if t != head]
-        mapping[head] = sorted(syns, key=lambda s: (-freqs[term_to_idx[s]], len(s)))
-    return mapping
+        mapping[head] = sorted(syns, key=lambda s: (-doc_freq[idx[s]], len(s)))
+    return mapping, groups
 
-def preview_mapping(name, mapping, n=30):
+def preview_mapping(name, mapping, n=25):
     if n <= 0 or not mapping:
         return
     print(f"[{name}] preview of {min(n, len(mapping))} heads (sorted by #synonyms):")
@@ -162,90 +108,119 @@ def preview_mapping(name, mapping, n=30):
         print(f"{head:22s} : {', '.join(syns) if syns else '(singleton)'}")
     print()
 
-# -----------------------------
-# METHOD A: Agglomerative (cosine, average)
-# (Handles version diff: metric vs affinity)
-# -----------------------------
-try:
-    agg = AgglomerativeClustering(n_clusters=K, linkage="average", metric="cosine")
-except TypeError:
-    # older scikit-learn
-    agg = AgglomerativeClustering(n_clusters=K, linkage="average", affinity="cosine")
-labels_A = agg.fit_predict(T_dense)
-nA, kA, sA, intraA, interA = evaluate_labels(T_dense, labels_A)
-map_A = build_mapping(terms, labels_A, term_freq)
+def fast_scores(embeddings, labels, sample_cap=2000):
+    """Silhouette (cosine) on a random sample + cluster size stats. No O(n²) heavy sims."""
+    n = embeddings.shape[0]
+    if n == 0:
+        return np.nan, np.nan, np.nan, np.nan
+    rng = np.random.default_rng(RANDOM_STATE)
+    if n > sample_cap:
+        sel = rng.choice(n, size=sample_cap, replace=False)
+        E = embeddings[sel]
+        y = np.asarray(labels)[sel]
+    else:
+        E = embeddings
+        y = np.asarray(labels)
+    # require at least 2 labels for silhouette
+    if len(np.unique(y)) < 2:
+        sil = np.nan
+    else:
+        sil = float(silhouette_score(E, y, metric="cosine"))
+    # size stats
+    counts = Counter(labels).values()
+    mean_sz = float(np.mean(list(counts)))
+    med_sz  = float(np.median(list(counts)))
+    pct_small = float(sum(c <= 2 for c in counts) / max(1, len(labels)))  # tiny clusters share
+    return sil, mean_sz, med_sz, pct_small
+
+# For frequency-based head selection, we use doc frequency from TF-IDF presence
+# (more robust than raw counts here; quick proxy)
+df_presence = (X > 0).astype(np.int32)
+term_doc_freq = np.asarray(df_presence.sum(axis=0)).ravel()  # per-term in original 'terms' order
 
 # -----------------------------
-# METHOD B: KMeans (euclidean) on dense term vectors
+# Method A: MiniBatchKMeans on LSA term vectors (FAST)
 # -----------------------------
-try:
-    kmeans = KMeans(n_clusters=K, n_init="auto", random_state=42)
-except TypeError:
-    # older scikit-learn
-    kmeans = KMeans(n_clusters=K, n_init=10, random_state=42)
-labels_B = kmeans.fit_predict(T_dense)
-nB, kB, sB, intraB, interB = evaluate_labels(T_dense, labels_B)
-map_B = build_mapping(terms, labels_B, term_freq)
+kmeans = MiniBatchKMeans(n_clusters=K, random_state=RANDOM_STATE, batch_size=4096, n_init=5)
+labels_A = kmeans.fit_predict(term_vecs)
+map_A, groups_A = build_mapping(terms, labels_A, term_doc_freq)
+sil_A, mean_A, med_A, small_A = fast_scores(term_vecs, labels_A, sample_cap=SAMPLE_FOR_SCORES)
 
 # -----------------------------
-# METHOD C: NMF topics on TF-IDF (no dense needed for fit)
-# Assign each term to topic with highest loading in H.
-# Evaluate using topic-space term vectors (H^T normalized).
+# Method B: Birch (FAST, incremental)
 # -----------------------------
-nmf = NMF(n_components=K, init="nndsvd", random_state=42, max_iter=400)
-W = nmf.fit_transform(X)       # X can stay SPARSE here
-H = nmf.components_            # (K, n_terms)
-labels_C = H.argmax(axis=0)
-T_topic = normalize(H.T, norm="l2", axis=1)  # dense (n_terms, K)
-nC, kC, sC, intraC, interC = evaluate_labels(T_topic, labels_C)
-map_C = build_mapping(terms, labels_C, term_freq)
+birch = Birch(n_clusters=K, threshold=0.5)  # threshold is mild; K controls final clusters
+labels_B = birch.fit_predict(term_vecs)
+map_B, groups_B = build_mapping(terms, labels_B, term_doc_freq)
+sil_B, mean_B, med_B, small_B = fast_scores(term_vecs, labels_B, sample_cap=SAMPLE_FOR_SCORES)
 
 # -----------------------------
-# SUMMARY TABLE
+# Method C: NMF topics (on sparse X), evaluate in topic space
+# -----------------------------
+nmf = NMF(n_components=K, init="nndsvd", random_state=RANDOM_STATE, max_iter=300)
+W = nmf.fit_transform(X)          # (docs x K)
+H = nmf.components_               # (K x terms)
+labels_C = H.argmax(axis=0)       # topic per term
+T_topic = normalize(H.T, norm="l2", axis=1)   # (terms x K)
+map_C, groups_C = build_mapping(terms, labels_C, term_doc_freq)
+sil_C, mean_C, med_C, small_C = fast_scores(T_topic, labels_C, sample_cap=SAMPLE_FOR_SCORES)
+
+# -----------------------------
+# Summary table
 # -----------------------------
 summary = pd.DataFrame([
     {
-        "method": "Agglomerative (cosine, average)",
-        "space":  "TF-IDF term vectors (dense)",
-        "params": f"K={K}",
-        "n_terms": nA, "n_clusters": kA,
-        "pct_singletons": round(sA, 4),
-        "mean_intra_sim": round(intraA, 4),
-        "mean_inter_sim": round(interA, 4),
+        "method": "MiniBatchKMeans",
+        "space":  f"LSA (SVD={SVD_COMPONENTS})",
+        "K": K,
+        "silhouette_cosine(sampled)": round(sil_A, 4),
+        "mean_cluster_size": round(mean_A, 1),
+        "median_cluster_size": round(med_A, 1),
+        "pct_terms_in_tiny_clusters(<=2)": round(small_A, 4),
+        "n_clusters": int(len(np.unique(labels_A))),
     },
     {
-        "method": "KMeans (euclidean)",
-        "space":  "TF-IDF term vectors (dense)",
-        "params": f"K={K}",
-        "n_terms": nB, "n_clusters": kB,
-        "pct_singletons": round(sB, 4),
-        "mean_intra_sim": round(intraB, 4),
-        "mean_inter_sim": round(interB, 4),
+        "method": "Birch",
+        "space":  f"LSA (SVD={SVD_COMPONENTS})",
+        "K": K,
+        "silhouette_cosine(sampled)": round(sil_B, 4),
+        "mean_cluster_size": round(mean_B, 1),
+        "median_cluster_size": round(med_B, 1),
+        "pct_terms_in_tiny_clusters(<=2)": round(small_B, 4),
+        "n_clusters": int(len(np.unique(labels_B))),
     },
     {
         "method": "NMF topics",
-        "space":  "Topic loadings Hᵀ (dense)",
-        "params": f"K={K}",
-        "n_terms": nC, "n_clusters": kC,
-        "pct_singletons": round(sC, 4),
-        "mean_intra_sim": round(intraC, 4),
-        "mean_inter_sim": round(interC, 4),
+        "space":  "Topic loadings (Hᵀ)",
+        "K": K,
+        "silhouette_cosine(sampled)": round(sil_C, 4),
+        "mean_cluster_size": round(mean_C, 1),
+        "median_cluster_size": round(med_C, 1),
+        "pct_terms_in_tiny_clusters(<=2)": round(small_C, 4),
+        "n_clusters": int(len(np.unique(labels_C))),
     },
-], columns=["method","space","params","n_terms","n_clusters","pct_singletons","mean_intra_sim","mean_inter_sim"])
+], columns=[
+    "method","space","K","silhouette_cosine(sampled)","mean_cluster_size",
+    "median_cluster_size","pct_terms_in_tiny_clusters(<=2)","n_clusters"
+])
 
-print("\n==== Term Grouping Summary (no tuning) ====\n")
+print("\n==== Fast Term Grouping Summary ====\n")
 display(summary)
 
 # -----------------------------
-# Quick previews for sanity-checking
+# Quick previews (heads -> synonyms) for sanity
 # -----------------------------
-preview_mapping("Agglomerative", map_A, n=SHOW_PREVIEW)
-preview_mapping("KMeans",        map_B, n=SHOW_PREVIEW)
-preview_mapping("NMF topics",    map_C, n=SHOW_PREVIEW)
+def preview(name, mapping, n=SHOW_PREVIEW):
+    if n <= 0: return
+    preview_mapping(name, mapping, n=n)
+
+preview("MiniBatchKMeans", map_A, SHOW_PREVIEW)
+preview("Birch",          map_B, SHOW_PREVIEW)
+preview("NMF topics",     map_C, SHOW_PREVIEW)
 
 # -----------------------------
-# Tips:
-# - If you hit memory limits on .toarray(), lower MAX_FEATURES (e.g., 8k–12k).
-# - Prefer the method with higher mean_intra_sim, lower mean_inter_sim, and fewer singletons.
-# - NMF often yields crisp, theme-based groups even when clustering looks noisy.
+# Notes:
+# - This is fast because we: (1) limit vocab, (2) use SVD to 200 dims, (3) sample for silhouette.
+# - Pick the winner by higher silhouette and clean previews.
+# - If you need even faster: lower MAX_FEATURES (e.g., 7000) or SVD_COMPONENTS (e.g., 150).
 # -----------------------------
