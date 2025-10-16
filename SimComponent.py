@@ -1,72 +1,75 @@
-import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import r2_score, mean_absolute_error
 
-# --- assumes you already have merged_hours from your merges ---
-mh = merged_hours.copy()
+# --- PIE CHARTS: BUY vs MAKE share by SEP parts for each org ---
+# Uses mh from the previous cell (normalized/filled)
+for org, g in mh.groupby('Usr_Org'):
+    parts = (
+        g.groupby('Make_Buy')['SEP_Part_Count']
+         .sum()
+         .reindex(['BUY','MAKE'])  # keep stable order
+         .fillna(0)
+    )
+    if parts.sum() <= 0:
+        continue  # skip orgs with no parts
 
-# Normalize column names so they're easy to reference
-mh.columns = (
-    mh.columns
-      .str.strip()
-      .str.replace('#', '', regex=False)
-      .str.replace(' ', '_', regex=False)
-      .str.replace('/', '_', regex=False)
-      .str.replace('-', '_', regex=False)
-)
+    plt.figure()
+    plt.pie(parts.values, labels=parts.index, autopct='%1.1f%%', startangle=90)
+    plt.title(f'{org}: BUY vs MAKE (by SEP parts)')
+    plt.axis('equal')  # perfect circle
+    plt.show()
 
-# Make sure these columns exist (create as 0 if not present)
-expected_cols = [
-    'Usr_Org', 'Make_Buy',
-    'SEP_CWS_Hours', 'SEP_Part_Count',
-    'XM30_CWS_Hours', 'XM30_Part_Count',
-    'M10_CWS_Hours',  'M10_Part_Count'
-]
-for c in expected_cols:
-    if c not in mh.columns:
-        mh[c] = 0.0 if 'Hours' in c or 'Count' in c else mh.get(c, np.nan)
-
-mh = mh.fillna(0)
-
-# Per-row averages (guard against divide-by-zero)
-mh['SEP_Avg_Hours_per_Part']   = np.where(mh['SEP_Part_Count']>0,   mh['SEP_CWS_Hours']/mh['SEP_Part_Count'],   0.0)
-mh['XM30_Avg_Hours_per_Part']  = np.where(mh['XM30_Part_Count']>0,  mh['XM30_CWS_Hours']/mh['XM30_Part_Count'], 0.0)
-mh['M10_Avg_Hours_per_Part']   = np.where(mh['M10_Part_Count']>0,   mh['M10_CWS_Hours']/mh['M10_Part_Count'],   0.0)
-
-# Org x Make/Buy summary (sums)
-org_mb = (
-    mh.groupby(['Usr_Org','Make_Buy'], as_index=False)
+# --- QUICK PREDICTIONS: XM30 & M10 hours from SEP hours (org-level) ---
+agg = (
+    mh.groupby('Usr_Org', as_index=True)
       .agg(
           SEP_Hours=('SEP_CWS_Hours','sum'),
-          SEP_Parts=('SEP_Part_Count','sum'),
           XM30_Hours=('XM30_CWS_Hours','sum'),
-          XM30_Parts=('XM30_Part_Count','sum'),
-          M10_Hours=('M10_CWS_Hours','sum'),
-          M10_Parts=('M10_Part_Count','sum')
+          M10_Hours=('M10_CWS_Hours','sum')
       )
 )
 
-# Total parts per org (for BUY % later)
-org_totals = org_mb.groupby('Usr_Org', as_index=False)['SEP_Parts'].sum().rename(columns={'SEP_Parts':'Org_SEP_Parts_Total'})
-org_mb = org_mb.merge(org_totals, on='Usr_Org', how='left')
+# Drop rows where we don't have targets
+xm30_df = agg[['SEP_Hours','XM30_Hours']].replace(0, np.nan).dropna()
+m10_df  = agg[['SEP_Hours','M10_Hours']].replace(0, np.nan).dropna()
 
-# BUY percentage on SEP parts within each org
-org_mb['SEP_Buyer_Pct'] = np.where(
-    (org_mb['Make_Buy'].str.upper()=='BUY') & (org_mb['Org_SEP_Parts_Total']>0),
-    org_mb['SEP_Parts'] / org_mb['Org_SEP_Parts_Total'],
-    0.0
-)
+def fit_and_report(X, y, label):
+    if len(X) < 2:
+        print(f'Not enough data to fit {label} model (need ≥2 orgs with data).')
+        return None, None
+    model = LinearRegression().fit(X, y)
+    yhat  = model.predict(X)
+    print(f'\n{label} ~ SEP_Hours')
+    print(f'  coef:      {model.coef_[0]:.4f}')
+    print(f'  intercept: {model.intercept_:.4f}')
+    print(f'  R^2:       {r2_score(y, yhat):.4f}')
+    print(f'  MAE:       {mean_absolute_error(y, yhat):.4f}')
+    return model, yhat
 
-# Wide view (handy for dashboards)
-wide = (
-    org_mb
-      .pivot(index='Usr_Org', columns='Make_Buy', values=['SEP_Hours','SEP_Parts','XM30_Hours','M10_Hours'])
-      .fillna(0)
-)
-wide.columns = ['{}_{}'.format(a,b) for a,b in wide.columns]
-wide = wide.reset_index()
+# Fit XM30 from SEP
+xm30_model, xm30_hat = (None, None)
+if not xm30_df.empty:
+    xm30_model, xm30_hat = fit_and_report(xm30_df[['SEP_Hours']].values, xm30_df['XM30_Hours'].values, 'XM30_Hours')
 
-# Helpful outputs:
-print("Long (org x Make/Buy):")
-display(org_mb.sort_values(['Usr_Org','Make_Buy']).reset_index(drop=True))
-print("\nWide (one row per org):")
-display(wide)
+# Fit M10 from SEP
+m10_model, m10_hat = (None, None)
+if not m10_df.empty:
+    m10_model, m10_hat = fit_and_report(m10_df[['SEP_Hours']].values, m10_df['M10_Hours'].values, 'M10_Hours')
+
+# Helper functions for ad-hoc predictions
+def predict_xm30(sep_hours: float) -> float:
+    """Predict XM30 hours from SEP hours."""
+    if xm30_model is None:
+        raise ValueError("XM30 model not available (insufficient data).")
+    return float(xm30_model.predict(np.array([[sep_hours]])).ravel()[0])
+
+def predict_m10(sep_hours: float) -> float:
+    """Predict M10 hours from SEP hours."""
+    if m10_model is None:
+        raise ValueError("M10 model not available (insufficient data).")
+    return float(m10_model.predict(np.array([[sep_hours]])).ravel()[0])
+
+# Example usage:
+# predict_xm30(250.0), predict_m10(250.0)
