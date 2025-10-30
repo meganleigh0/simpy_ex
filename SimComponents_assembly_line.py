@@ -1,121 +1,149 @@
+# --- XM30 Cobra → tidy dataset (and a couple quick visuals) ---
 import pandas as pd
-import difflib
-from collections import defaultdict
+import numpy as np
+import plotly.express as px
+from pathlib import Path
 
-# --- Helper Functions ---
+# ---------- Config ----------
+COBRA_PATH = Path("data/Cobra-XM30.xlsx")               # input 1
+DASHBOARD_PATH = Path("data/Dashboard-XM30_10_15_25.xlsx")  # (optional) input 2
+OUT_SUMMARY_CSV = Path("data/weekly_summary_latest.csv")    # output for Streamlit
+OUT_DETAIL_PARQUET = Path("data/weekly_detail.parquet")     # optional faster source
 
-def build_bom_tree(bom_df, parent_col='ParentID', part_col='PART_NUMBER', qty_col='Qty'):
-    """
-    Build a dictionary that maps a parent to a list of its (child, quantity) tuples.
-    Rows with missing (NaN) ParentID are assumed to be the top-level assembly.
-    """
-    tree = defaultdict(list)
-    for _, row in bom_df.iterrows():
-        parent = row[parent_col]
-        part = row[part_col]
-        # Default quantity is 1 if not provided or if NaN
-        qty = row[qty_col] if qty_col in row and pd.notna(row[qty_col]) else 1
-        tree[parent].append((part, qty))
-    return dict(tree)
+# ---------- Helpers ----------
+def _std_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """Lowercase + strip + unify a few expected names."""
+    df = df.copy()
+    df.columns = (
+        df.columns.astype(str)
+        .str.strip()
+        .str.replace("#", "_num", regex=False)
+        .str.replace(" ", "_")
+        .str.replace("-", "_")
+        .str.lower()
+    )
+    # common renames we’ve seen in your sheets/screenshots
+    rename_map = {
+        "chg_num": "chg",
+        "resp_dept": "resp_dept",
+        "be_dept": "be_dept",
+        "control_acct": "control_acct",
+        "date": "date",
+        "acwp": "acwp",
+        "bcwp": "bcwp",
+        "bcws": "bcws",
+        "etc": "etc",
+        "project": "project",
+        "ce_project": "project",  # sometimes appears as CE PROJECT
+        "family": "family",
+        "team": "team",
+        "sub_team": "sub_team"
+    }
+    for k, v in list(rename_map.items()):
+        if k in df.columns and v not in df.columns:
+            df.rename(columns={k: v}, inplace=True)
+    return df
 
-def explode_bom(tree, parent, multiplier=1, exploded=None):
-    """
-    Recursively traverse the BOM tree to calculate the total (exploded) quantity of each part.
-    
-    Args:
-        tree (dict): BOM tree as returned by build_bom_tree.
-        parent: The current parent to start from (e.g. top-level assembly, usually NaN).
-        multiplier (float): The accumulated multiplication factor for quantities.
-        exploded (defaultdict): Dictionary to accumulate quantities.
-    
-    Returns:
-        defaultdict: Mapping of part numbers to total required quantity.
-    """
-    if exploded is None:
-        exploded = defaultdict(float)
-    for child, qty in tree.get(parent, []):
-        total_qty = multiplier * qty
-        exploded[child] += total_qty
-        # Recursively process the child to handle multi-level BOMs.
-        explode_bom(tree, child, total_qty, exploded)
-    return exploded
+def _numeric(df: pd.DataFrame, cols) -> pd.DataFrame:
+    df = df.copy()
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
 
-def get_unique_parts(bom_df, part_col='PART_NUMBER'):
-    """Return the set of unique part numbers from a BOM DataFrame."""
-    return set(bom_df[part_col].unique())
+def _parse_xl(xl_path: Path, sheet_name: str) -> pd.DataFrame:
+    if not xl_path.exists():
+        return pd.DataFrame()
+    x = pd.ExcelFile(xl_path)
+    if sheet_name not in x.sheet_names:
+        return pd.DataFrame()
+    df = x.parse(sheet_name)
+    return _std_cols(df)
 
-def map_parts(ebom_parts, mbom_parts, cutoff=0.6):
-    """
-    Map EBOM part numbers to MBOM part numbers using fuzzy matching.
-    
-    Args:
-        ebom_parts (set): Set of EBOM part numbers.
-        mbom_parts (set): Set of MBOM part numbers.
-        cutoff (float): Matching threshold between 0 and 1.
-    
-    Returns:
-        dict: Mapping of EBOM part number to best–matching MBOM part number (or None if no match).
-    """
-    mapping = {}
-    for part in ebom_parts:
-        matches = difflib.get_close_matches(part, mbom_parts, n=1, cutoff=cutoff)
-        mapping[part] = matches[0] if matches else None
-    return mapping
+# ---------- Load ----------
+tbl_we_1 = _parse_xl(COBRA_PATH, "tbl_Weekly Extract")
+tbl_we_2 = _parse_xl(COBRA_PATH, "tbl_Weekly Extract (2)")
+sheet1   = _parse_xl(COBRA_PATH, "Sheet1")
+valid_w  = _parse_xl(COBRA_PATH, "Validation-W")
+dash_tab = _parse_xl(DASHBOARD_PATH, "DASHBOARD")
+dash_piv = _parse_xl(DASHBOARD_PATH, "PIVOT")
 
-# --- Main Analysis in a Single Cell ---
+# ---------- Combine weekly extracts ----------
+weekly_raw = pd.concat([tbl_we_1, tbl_we_2], ignore_index=True).pipe(_std_cols)
 
-def main():
-    # Read your EBOM and MBOM CSV files.
-    # Adjust file names and paths as needed. These CSVs should include at least:
-    #   - A Parent identifier column (e.g. ParentID)
-    #   - A Part number column (e.g. PART_NUMBER)
-    #   - A Quantity column (e.g. Qty)
-    ebom_df = pd.read_csv('ebom.csv')  # e.g. columns: ParentID, PART_NUMBER, Qty, etc.
-    mbom_df = pd.read_csv('mbom.csv')  # e.g. similar structure
+# best-effort type cleanup
+weekly_raw["date"] = pd.to_datetime(weekly_raw.get("date"), errors="coerce")
+weekly_raw = _numeric(weekly_raw, ["acwp", "bcwp", "bcws", "etc"])
 
-    # Build BOM trees from the dataframes.
-    ebom_tree = build_bom_tree(ebom_df)
-    mbom_tree = build_bom_tree(mbom_df)
-    
-    # Identify the top-level assembly.
-    # Here we assume rows with a missing ParentID (NaN) are top-level.
-    # (If your data designates top-level differently, adjust accordingly.)
-    top_level = None
-    # Note: If multiple top-level assemblies exist, you might need to loop through each.
-    for parent in ebom_tree.keys():
-        if pd.isna(parent):
-            top_level = parent
-            break
-    
-    # Compute exploded quantities (total required parts) for each BOM.
-    ebom_exploded = explode_bom(ebom_tree, top_level, multiplier=1)
-    mbom_exploded = explode_bom(mbom_tree, top_level, multiplier=1)
+# ---------- Attach metadata (project / family / team) ----------
+# In some files these live on Sheet1
+meta_cols = [c for c in ["control_acct", "project", "family", "team"] if c in sheet1.columns]
+if "control_acct" in weekly_raw.columns and meta_cols:
+    weekly = weekly_raw.merge(
+        sheet1[meta_cols].drop_duplicates(),
+        on="control_acct",
+        how="left"
+    )
+else:
+    weekly = weekly_raw.copy()
+    for c in ["project", "family", "team"]:
+        if c not in weekly.columns: weekly[c] = np.nan
 
-    # Get unique part numbers from each BOM.
-    ebom_parts = get_unique_parts(ebom_df)
-    mbom_parts = get_unique_parts(mbom_df)
+# ---------- Clean dims and fill ----------
+for c in ["project", "family", "team", "sub_team"]:
+    if c in weekly.columns:
+        weekly[c] = weekly[c].astype("string").fillna("Unassigned")
 
-    # Map EBOM parts to MBOM parts via fuzzy matching.
-    part_mapping = map_parts(ebom_parts, mbom_parts, cutoff=0.6)
+# ---------- Build summary (by date + project; extendable) ----------
+summary_dims = ["date", "project"]  # change or add "family", "team" if you want wider controls
+num_cols = [c for c in ["acwp", "bcwp", "bcws", "etc"] if c in weekly.columns]
 
-    # Compile a summary with mapping and quantity comparisons.
-    results = []
-    for ebom_part in ebom_parts:
-        mbom_part = part_mapping.get(ebom_part)
-        ebom_qty = ebom_exploded.get(ebom_part, 0)
-        mbom_qty = mbom_exploded.get(mbom_part, 0) if mbom_part is not None else None
-        ratio = (mbom_qty / ebom_qty) if ebom_qty and mbom_qty is not None else None
-        results.append({
-            'EBOM_Part': ebom_part,
-            'Mapped_MBOM_Part': mbom_part,
-            'EBOM_Exploded_Qty': ebom_qty,
-            'MBOM_Exploded_Qty': mbom_qty,
-            'Predicted_Ratio_MBOM_to_EBOM': ratio
-        })
+weekly_summary = (
+    weekly
+    .dropna(subset=["date"])
+    .groupby(summary_dims, dropna=False)[num_cols]
+    .sum()
+    .reset_index()
+    .sort_values("date")
+)
 
-    df_results = pd.DataFrame(results)
-    print("Mapping and Quantity Comparison:")
-    print(df_results)
+# ---------- Persist for the Streamlit app ----------
+OUT_SUMMARY_CSV.parent.mkdir(parents=True, exist_ok=True)
+weekly_summary.to_csv(OUT_SUMMARY_CSV, index=False)
+try:
+    weekly.to_parquet(OUT_DETAIL_PARQUET, index=False)
+except Exception:
+    # parquet may not be available in some envs; it's optional
+    pass
 
-if __name__ == '__main__':
-    main()
+# ---------- Quick validation prints/figures ----------
+print("Rows in weekly detail:", len(weekly))
+print("Rows in weekly summary:", len(weekly_summary))
+print("Date range:", weekly_summary["date"].min(), "→", weekly_summary["date"].max())
+print(weekly_summary.tail(3))
+
+# Trend line (earned value)
+if not weekly_summary.empty:
+    fig_trend = px.line(
+        weekly_summary,
+        x="date",
+        y=[c for c in ["acwp","bcwp","bcws"] if c in weekly_summary.columns],
+        color="project",
+        markers=True,
+        title="Earned Value Trends by Project"
+    )
+    fig_trend.show()
+
+# Current week ETC by project
+if not weekly_summary.empty and "etc" in weekly_summary.columns:
+    latest_date = weekly_summary["date"].max()
+    latest = weekly_summary[weekly_summary["date"] == latest_date]
+    fig_etc = px.bar(
+        latest,
+        x="project",
+        y="etc",
+        title=f"ETC by Project — {latest_date.date()}",
+        text_auto=".2s"
+    )
+    fig_etc.update_layout(xaxis_title="", yaxis_title="ETC")
+    fig_etc.show()
