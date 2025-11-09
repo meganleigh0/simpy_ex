@@ -1,215 +1,232 @@
-# ONE-CELL STREAMLIT DASHBOARD (robust loader)
-import os, sys, types
-import pandas as pd
-import numpy as np
-import streamlit as st
-import plotly.express as px
+# ====================== ONE-CELL EV DASHBOARD (no Streamlit) ======================
+# Works in a Jupyter cell or plain Python. Produces summary tables, pivots, and a chart.
+# Requires: pandas, numpy, plotly (for the chart; you can remove the chart if not installed)
 
-st.set_page_config(page_title="XM30 EV Dashboard", layout="wide")
+import pandas as pd, numpy as np, io, sys, os, datetime as dt
 
-# ---------------- Helpers ----------------
+# ------------------- User-configurable defaults -------------------
+AS_OF = None                 # e.g., dt.date(2025, 10, 25). If None, uses max DATE in data
+WEEK_START_DAY = "MON"       # One of: "MON","TUE","WED","THU","FRI","SAT","SUN"
+FOUR_WK_LEN = 4              # rolling window length in weeks for the "4 Week" block
+EXPORT_EXCEL = False         # True to export an Excel with all tables at the end
+EXPORT_PATH = "ev_dashboard_output.xlsx"
+
+# ------------------- Load data (robust) -------------------
+def _load_df():
+    # 1) If an in-memory DataFrame exists, use it
+    g = globals()
+    if "xm30_cobra_export_weekly_extract" in g and isinstance(g["xm30_cobra_export_weekly_extract"], pd.DataFrame):
+        return g["xm30_cobra_export_weekly_extract"].copy()
+
+    # 2) Otherwise, open a file picker
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk(); root.withdraw()
+        path = filedialog.askopenfilename(title="Select CSV or Excel", filetypes=[("Data files","*.csv *.xlsx *.xls")])
+        if not path:
+            raise RuntimeError("No file selected and no in-memory DataFrame found.")
+        if path.lower().endswith(".csv"):
+            return pd.read_csv(path)
+        else:
+            # If multiple sheets, use the first by default
+            xls = pd.ExcelFile(path)
+            return pd.read_excel(xls, sheet_name=xls.sheet_names[0])
+    except Exception as e:
+        raise RuntimeError(f"Could not load data. {e}")
+
+df = _load_df()
+
+# ------------------- Normalize columns -------------------
+# We expect DATE, CHG#, COST-SET, HOURS exactly (case-insensitive, allow spaces/underscores)
+norm = {c: c.strip().upper().replace(" ", "").replace("_","") for c in df.columns}
+df.rename(columns={old: new for old,new in zip(df.columns, [norm[c] for c in df.columns])}, inplace=True)
+
+rename_map = {
+    "DATE":"DATE",
+    "CHG#":"CHG#",
+    "CHG":"CHG#",
+    "PLUG":"CHG#",
+    "COST-SET":"COST-SET",
+    "COSTSET":"COST-SET",
+    "HOURS":"HOURS"
+}
+
+# Rebuild a second map from normalized keys back to required names
+rev = {k.strip().upper().replace(" ","").replace("_",""): v for k,v in rename_map.items()}
+fixed_cols = {}
+for c in df.columns:
+    key = c  # already normalized
+    if key in rev:
+        fixed_cols[c] = rev[key]
+    else:
+        fixed_cols[c] = c  # keep as-is
+
+df.rename(columns=fixed_cols, inplace=True)
+
+required = ["DATE","CHG#","COST-SET","HOURS"]
+missing = [c for c in required if c not in df.columns]
+if missing:
+    raise ValueError(f"Missing required columns: {missing}. Found: {list(df.columns)}")
+
+# Types & cleaning
+df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
+df = df.dropna(subset=["DATE"]).copy()
+df["COST-SET"] = df["COST-SET"].astype(str).str.upper().str.strip()
+df["HOURS"] = pd.to_numeric(df["HOURS"], errors="coerce").fillna(0.0)
+
+# ------------------- Period helpers -------------------
+DAY_TO_NUM = dict(MON=0,TUE=1,WED=2,THU=3,FRI=4,SAT=5,SUN=6)
+if WEEK_START_DAY.upper() not in DAY_TO_NUM:
+    raise ValueError("WEEK_START_DAY must be one of MON,TUE,WED,THU,FRI,SAT,SUN")
+anchor = DAY_TO_NUM[WEEK_START_DAY.upper()]
+
+def week_start(series_dt):
+    # shift so that anchor becomes day 0
+    # Example: if anchor=2 (WED), then Wednesday is week start
+    dow = series_dt.dt.dayofweek
+    offset = (dow - anchor) % 7
+    return series_dt - pd.to_timedelta(offset, unit="D")
+
+df["WEEK_START"] = week_start(df["DATE"])
+
+# Determine AS_OF
+if AS_OF is None:
+    AS_OF = df["DATE"].max().date()
+AS_OF = pd.Timestamp(AS_OF)
+
+status_week_start = week_start(pd.Series([AS_OF]))[0]
+status_week_end   = status_week_start + pd.Timedelta(days=6)
+
+# Slices
+df_cum   = df[df["DATE"] <= AS_OF]
+fourwk_start = AS_OF - pd.Timedelta(weeks=FOUR_WK_LEN) + pd.Timedelta(days=1)
+df_4wk   = df[(df["DATE"] >= fourwk_start) & (df["DATE"] <= AS_OF)]
+df_stat  = df[df["WEEK_START"] == status_week_start]
+
+# ------------------- EV math -------------------
 COST_ORDER = ["ACWP","BCWP","BCWS","ETC"]
 
-def week_start(d):  # Monday-week; change offset if your cadence is different
-    return (d - pd.to_timedelta(d.dt.dayofweek, unit="D"))
-
-def coalesce_cost_columns(df, value_col):
-    pt = (df.pivot_table(index="CHG#", columns="COST-SET", values=value_col,
-                         aggfunc="sum", fill_value=0)
+def coalesce_cost_columns(dfx, value_col="HOURS"):
+    pt = (dfx.pivot_table(index="CHG#", columns="COST-SET", values=value_col,
+                          aggfunc="sum", fill_value=0)
             .reindex(columns=COST_ORDER, fill_value=0))
     pt["TOTAL"] = pt.sum(axis=1, numeric_only=True)
     return pt
 
-def ev_rollup(df):
-    s = (df.pivot_table(index=None, columns="COST-SET", values="HOURS",
-                        aggfunc="sum", fill_value=0)
-           .reindex(COST_ORDER, fill_value=0))
-    # pull floats safely
-    getv = lambda k: (float(s[k].iloc[0]) if k in s else 0.0)
-    ACWP, BCWP, BCWS, ETC = (getv("ACWP"), getv("BCWP"), getv("BCWS"), getv("ETC"))
+def ev_rollup(dfx):
+    s = (dfx.pivot_table(index=None, columns="COST-SET", values="HOURS",
+                         aggfunc="sum", fill_value=0)
+            .reindex(COST_ORDER, fill_value=0))
+    val = {k: float((s[k].iloc[0] if k in s else 0.0)) for k in COST_ORDER}
 
+    ACWP, BCWP, BCWS, ETC = val.get("ACWP",0.0), val.get("BCWP",0.0), val.get("BCWS",0.0), val.get("ETC",0.0)
     SPI = np.nan if BCWS == 0 else BCWP/BCWS
     CPI = np.nan if ACWP == 0 else BCWP/ACWP
     SV  = BCWP - BCWS
     SVp = np.nan if BCWS == 0 else 100*SV/BCWS
     CV  = BCWP - ACWP
     CVp = np.nan if BCWP == 0 else 100*CV/BCWP
-
     BAC = BCWS
     EAC = ACWP + ETC
     VAC = BAC - EAC
-    VACp = np.nan if BAC == 0 else 100*VAC/BAC
-
-    BCWR = BAC - BCWP
+    VACp= np.nan if BAC == 0 else 100*VAC/BAC
+    BCWR= BAC - BCWP
     denom = (EAC - ACWP)
     TCPI = np.nan if denom == 0 else (BAC - BCWP)/denom
+    return dict(ACWP=ACWP,BCWP=BCWP,BCWS=BCWS,ETC=ETC,SPI=SPI,CPI=CPI,SV=SV,SVp=SVp,CV=CV,CVp=CVp,
+                BAC=BAC,EAC=EAC,VAC=VAC,VACp=VACp,BCWR=BCWR,TCPI=TCPI)
 
-    return dict(ACWP=ACWP, BCWP=BCWP, BCWS=BCWS, ETC=ETC,
-                SPI=SPI, CPI=CPI, SV=SV, SVp=SVp, CV=CV, CVp=CVp,
-                BAC=BAC, EAC=EAC, VAC=VAC, VACp=VACp, BCWR=BCWR, TCPI=TCPI)
+def fmt_money(x): return f"{x:,.2f}"
+def fmt_ratio(x): return "—" if pd.isna(x) else f"{x:0.2f}"
+def fmt_pct(x):   return "—" if pd.isna(x) else f"{x:0.2f}"
 
-fmt_money = lambda x: f"{x:,.2f}"
-fmt_ratio = lambda x: "—" if pd.isna(x) else f"{x:0.2f}"
-fmt_pct   = lambda x: "—" if pd.isna(x) else f"{x:0.2f}"
+def metrics_df(label, m):
+    return pd.DataFrame({
+        "Metric": ["SPI","CPI","SV","SV%","CV","CV%","BAC","EAC","VAC","VAC%","BCWR","ETC","TCPI"],
+        label: [
+            fmt_ratio(m["SPI"]), fmt_ratio(m["CPI"]),
+            fmt_money(m["SV"]),  fmt_pct(m["SVp"]),
+            fmt_money(m["CV"]),  fmt_pct(m["CVp"]),
+            fmt_money(m["BAC"]), fmt_money(m["EAC"]),
+            fmt_money(m["VAC"]), fmt_pct(m["VACp"]),
+            fmt_money(m["BCWR"]),fmt_money(m["ETC"]),
+            fmt_ratio(m["TCPI"])
+        ]
+    })
 
-def metrics_table(label, m):
-    rows = [
-        ("SPI",  fmt_ratio(m["SPI"])),
-        ("CPI",  fmt_ratio(m["CPI"])),
-        ("SV",   fmt_money(m["SV"])),
-        ("SV%",  fmt_pct(m["SVp"])),
-        ("CV",   fmt_money(m["CV"])),
-        ("CV%",  fmt_pct(m["CVp"])),
-        ("BAC",  fmt_money(m["BAC"])),
-        ("EAC",  fmt_money(m["EAC"])),
-        ("VAC",  fmt_money(m["VAC"])),
-        ("VAC%", fmt_pct(m["VACp"])),
-        ("BCWR", fmt_money(m["BCWR"])),
-        ("ETC",  fmt_money(m["ETC"])),
-        ("TCPI", fmt_ratio(m["TCPI"]))
-    ]
-    return pd.DataFrame(rows, columns=["Metric", label]).set_index("Metric")
+# ------------------- Compute blocks -------------------
+m_cum  = ev_rollup(df_cum)
+m_4wk  = ev_rollup(df_4wk)
+m_stat = ev_rollup(df_stat)
 
-# -------------- Data load (resilient) --------------
-st.sidebar.header("Data")
-df = None
+cum_by_plug  = coalesce_cost_columns(df_cum)
+wk_by_plug   = coalesce_cost_columns(df_4wk)
+stat_by_plug = coalesce_cost_columns(df_stat)
 
-# 1) If a DataFrame named exactly below exists (e.g., when launching from a notebook kernel), use it.
-if "xm30_cobra_export_weekly_extract" in globals():
-    df = globals()["xm30_cobra_export_weekly_extract"].copy()
+# ------------------- Display results -------------------
+from IPython.display import display, HTML
 
-# 2) Or let the user upload a file:
-uploaded = st.sidebar.file_uploader("Upload CSV/Excel", type=["csv","xlsx","xls"])
+print(f"XM30 Earned Value Dashboard — As-of: {AS_OF.date()}   (Status week: {status_week_start.date()}–{status_week_end.date()}, start={WEEK_START_DAY})\n")
 
-# 3) Or type a local path (optional, for your Windows path use \\ or raw string)
-path_hint = st.sidebar.text_input("…or enter a local file path (CSV/XLSX)")
+# Summary blocks
+def head_row(title, m):
+    row = pd.DataFrame([[
+        fmt_money(m["ACWP"]), fmt_money(m["BCWP"]), fmt_money(m["BCWS"]), fmt_money(m["ETC"])
+    ]], columns=["ACWP","BCWP","BCWS","ETC"])
+    row.index = [title]
+    return row
 
-if df is None:
-    if uploaded is not None:
-        # safe guard BEFORE using uploaded.name
-        name = uploaded.name.lower()
-        if name.endswith(".csv"):
-            df = pd.read_csv(uploaded)
-        else:
-            # allow sheet choice
-            xls = pd.ExcelFile(uploaded)
-            sheet = st.sidebar.selectbox("Excel sheet", xls.sheet_names, index=0)
-            df = pd.read_excel(xls, sheet_name=sheet, engine="openpyxl")
-    elif path_hint:
-        if not os.path.exists(path_hint):
-            st.error(f"Path not found: {path_hint}")
-            st.stop()
-        if path_hint.lower().endswith(".csv"):
-            df = pd.read_csv(path_hint)
-        else:
-            xls = pd.ExcelFile(path_hint)
-            sheet = st.sidebar.selectbox("Excel sheet", xls.sheet_names, index=0)
-            df = pd.read_excel(xls, sheet_name=sheet, engine="openpyxl")
-    else:
-        st.info("Load a DataFrame named `xm30_cobra_export_weekly_extract`, or upload a file, or enter a path.")
-        st.stop()
+display(pd.concat([
+    head_row("CUM", m_cum),
+    head_row(f"Last {FOUR_WK_LEN} Weeks", m_4wk),
+    head_row("Current Status", m_stat)
+]))
 
-# Normalize expected columns (accept a few common variants)
-colmap = {c.upper().replace(" ", "").replace("_",""): c for c in df.columns}
-def pick(*aliases):
-    for a in aliases:
-        k = a.upper().replace(" ","").replace("_","")
-        if k in colmap: return colmap[k]
-    return None
+# EV Metrics tables
+print("\nEV Metrics — CUM")
+display(metrics_df("CUM", m_cum).set_index("Metric"))
+print("\nEV Metrics — 4 Wk")
+display(metrics_df("4 Wk", m_4wk).set_index("Metric"))
+print("\nEV Metrics — Current Status")
+display(metrics_df("Status", m_stat).set_index("Metric"))
 
-col_date   = pick("DATE", "WEEKDATE", "ASOFDATE")
-col_chg    = pick("CHG#", "CHG", "PLUG", "CONTROL_ACCOUNT", "CONTROLACCT")
-col_cost   = pick("COST-SET", "COST_SET", "COSTSET")
-col_hours  = pick("HOURS", "QTY", "VALUE")
+# Detail pivots
+print("\nDetail by CHG# — CUM")
+display(cum_by_plug)
+print("\nDetail by CHG# — 4 Wk")
+display(wk_by_plug)
+print("\nDetail by CHG# — Current Status")
+display(stat_by_plug)
 
-need = [col_date, col_chg, col_cost, col_hours]
-if any(x is None for x in need):
-    st.error(f"Missing required columns. Found: {list(df.columns)}. "
-             f"Need date/CHG#/COST-SET/HOURS (common aliases supported).")
-    st.stop()
+# ------------------- Trend chart (weekly totals) -------------------
+try:
+    import plotly.express as px
+    weekly = (df[df["DATE"] <= AS_OF]
+              .groupby(["WEEK_START","COST-SET"], as_index=False)["HOURS"].sum())
+    weekly = weekly[weekly["COST-SET"].isin(COST_ORDER)]
+    fig = px.line(weekly, x="WEEK_START", y="HOURS", color="COST-SET",
+                  category_orders={"COST-SET": COST_ORDER},
+                  labels={"WEEK_START":"Week","HOURS":"Hours"})
+    fig.update_layout(title=f"Weekly Totals through {AS_OF.date()}")
+    fig.show()
+except Exception as e:
+    print(f"(Skipping chart; plotly not available) {e}")
 
-# Canonicalize names
-df = df.rename(columns={col_date:"DATE", col_chg:"CHG#", col_cost:"COST-SET", col_hours:"HOURS"})
-df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
-df = df.dropna(subset=["DATE"])
-df["COST-SET"] = df["COST-SET"].astype(str).str.upper().str.replace(" ", "")
-# tidy up one-off typos
-df["COST-SET"] = df["COST-SET"].replace({"BCW S":"BCWS", "BCW":"BCWP"})  # extend if needed
-df["WEEK_START"] = week_start(df["DATE"])
-
-# ---------------- UI controls ----------------
-st.sidebar.header("Filters")
-all_chg = sorted(df["CHG#"].astype(str).unique().tolist())
-sel_chg = st.sidebar.multiselect("PLUG / CHG#", options=all_chg, default=all_chg)
-
-min_d, max_d = df["DATE"].min().date(), df["DATE"].max().date()
-as_of = st.sidebar.date_input("As-of date", value=max_d, min_value=min_d, max_value=max_d)
-as_of = pd.Timestamp(as_of)
-
-weeks_back = st.sidebar.number_input("Rolling window (weeks)", min_value=1, max_value=12, value=4, step=1)
-
-status_week_start = week_start(pd.Series([as_of]))[0]
-status_week_end   = status_week_start + pd.Timedelta(days=6)
-
-df = df[df["CHG#"].astype(str).isin(sel_chg)]
-
-# ---------------- Period slices ----------------
-df_cum   = df[df["DATE"] <= as_of]
-fourwk_start = as_of - pd.Timedelta(weeks=weeks_back) + pd.Timedelta(days=1)
-df_4wk  = df[(df["DATE"] >= fourwk_start) & (df["DATE"] <= as_of)]
-df_stat = df[(df["WEEK_START"] == status_week_start)]
-
-# ---------------- Header ----------------
-st.title("XM30 Earned Value Dashboard")
-st.caption(f"As-of **{as_of.date()}**  |  Current Status Week: **{status_week_start.date()} – {status_week_end.date()}**")
-st.write("Using columns: `DATE`, `CHG#`, `COST-SET` (ACWP/BCWP/BCWS/ETC), `HOURS`.")
-
-# ---------------- Summary cards ----------------
-def summary_block(label, data):
-    m = ev_rollup(data)
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric(f"{label} • ACWP", fmt_money(m["ACWP"]))
-    c2.metric(f"{label} • BCWP", fmt_money(m["BCWP"]))
-    c3.metric(f"{label} • BCWS", fmt_money(m["BCWS"]))
-    c4.metric(f"{label} • ETC",  fmt_money(m["ETC"]))
-    return m
-
-st.subheader("CUM through As-of")
-m_cum = summary_block("CUM", df_cum)
-
-st.subheader(f"Last {weeks_back} Weeks")
-m_4wk = summary_block("4 Week", df_4wk)
-
-st.subheader("Current Status Period (Accounting Week of As-of)")
-m_stat = summary_block("Status", df_stat)
-
-# ---------------- Metrics tables ----------------
-left, mid, right = st.columns(3)
-with left:
-    st.markdown("#### EV Metrics — CUM")
-    st.table(metrics_table("CUM", m_cum))
-with mid:
-    st.markdown("#### EV Metrics — 4 Wk")
-    st.table(metrics_table("4 Wk", m_4wk))
-with right:
-    st.markdown("#### EV Metrics — Status")
-    st.table(metrics_table("Status", m_stat))
-
-# ---------------- Detail pivots ----------------
-st.markdown("---")
-st.subheader("Detail by CHG#")
-t1, t2, t3 = st.tabs(["CUM", "4 Wk", "Status"])
-with t1: st.dataframe(coalesce_cost_columns(df_cum, "HOURS"))
-with t2: st.dataframe(coalesce_cost_columns(df_4wk, "HOURS"))
-with t3: st.dataframe(coalesce_cost_columns(df_stat, "HOURS"))
-
-# ---------------- Trend chart ----------------
-st.markdown("---")
-st.subheader("Weekly Totals Trend")
-weekly = (df[df["DATE"] <= as_of]
-          .groupby(["WEEK_START","COST-SET"], as_index=False)["HOURS"].sum())
-weekly = weekly[weekly["COST-SET"].isin(COST_ORDER)]
-fig = px.line(weekly, x="WEEK_START", y="HOURS", color="COST-SET",
-              category_orders={"COST-SET": COST_ORDER},
-              labels={"WEEK_START":"Week", "HOURS":"Hours"})
-st.plotly_chart(fig, use_container_width=True)
+# ------------------- Optional export -------------------
+if EXPORT_EXCEL:
+    with pd.ExcelWriter(EXPORT_PATH, engine="xlsxwriter") as xw:
+        head = pd.concat([
+            head_row("CUM", m_cum),
+            head_row(f"Last {FOUR_WK_LEN} Weeks", m_4wk),
+            head_row("Current Status", m_stat)
+        ])
+        head.to_excel(xw, sheet_name="Summary")
+        metrics_df("CUM", m_cum).to_excel(xw, sheet_name="Metrics", index=False, startrow=0)
+        metrics_df("4 Wk", m_4wk).to_excel(xw, sheet_name="Metrics", index=False, startrow=16)
+        metrics_df("Status", m_stat).to_excel(xw, sheet_name="Metrics", index=False, startrow=32)
+        cum_by_plug.to_excel(xw, sheet_name="Detail_CUM")
+        wk_by_plug.to_excel(xw, sheet_name="Detail_4Wk")
+        stat_by_plug.to_excel(xw, sheet_name="Detail_Status")
+    print(f"\nExported: {os.path.abspath(EXPORT_PATH)}")
+# ==================== end one cell ====================
