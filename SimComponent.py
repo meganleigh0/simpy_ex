@@ -1,221 +1,203 @@
-import pandas as pd
-import numpy as np
+import pandas as pd, numpy as np
 from pathlib import Path
 
-# ==== CONFIG (change paths if yours differ) ====
-weekly_path    = Path("data/cobra-XM30.xlsx")
-weekly_sheet   = "tbl_Weekly Extract"
-dashboard_path = Path("data/Dashboard-XM30_10.15.25.xlsx")
-dash_pivot_sh  = "PIVOT"
-TOL = 1e-3  # tolerance to consider a value "matching" (0.001 ~ Excel display)
+# -------------------- CONFIG --------------------
+weekly_xlsx_candidates = ["data/cobra-XM30.xlsx", "data/Cobra-XM30.xlsx"]
+weekly_sheet = "tbl_Weekly Extract"
+excel_pivot_csv = "data/cum_table.csv"   # your cleaned export from Excel "PIVOT"
+TOL = 1e-3                                # match tolerance (≈ Excel display)
+ROUND = 4                                 # rounding to display like Excel
+# ------------------------------------------------
 
-# ---------- helpers ----------
-def _find_col(df, candidates):
-    """Return the first existing column name matching any of the case-insensitive candidates or substring hits."""
-    cols = {c.lower(): c for c in df.columns}
-    for c in candidates:
-        if c.lower() in cols:
-            return cols[c.lower()]
-    # substring fallback
-    for c in df.columns:
+def pick_existing(paths):
+    for p in paths:
+        if Path(p).exists():
+            return p
+    raise FileNotFoundError(f"None of these paths exist: {paths}")
+
+def find_col(df, candidates):
+    """Return the first matching column by exact case-insensitive name or substring."""
+    cols = list(df.columns)
+    lower = {c.lower(): c for c in cols}
+    for want in candidates:
+        if want.lower() in lower:
+            return lower[want.lower()]
+    for c in cols:
         cu = c.lower()
-        if any(x.lower() in cu for x in candidates):
+        if any(w.lower() in cu for w in candidates):
             return c
-    raise KeyError(f"Could not find any of {candidates} in {list(df.columns)}")
+    raise KeyError(f"Could not find any of {candidates} in: {list(df.columns)}")
 
-def _coerce_num(s):
-    return pd.to_numeric(s, errors="coerce").fillna(0.0)
+def to_num(s, zero_missing=True):
+    out = pd.to_numeric(s, errors="coerce")
+    if zero_missing:
+        out = out.fillna(0.0)
+    return out
 
-def read_dashboard_pivot_table(xlsx_path, sheet_name="PIVOT"):
-    """
-    The 'PIVOT' sheet is an Excel Pivot export with extra header rows/columns like:
-      [ 'PLUG', 'DATE', 'CUM', ... ]
-      then a row containing 'Row Labels', and one nearby row containing 'ACWP','BCWP','BCWS','ETC'.
-    This parses it into a tidy df with columns: CHG#, ACWP, BCWP, BCWS, ETC. Excludes 'Grand Total' row.
-    """
-    raw = pd.read_excel(xlsx_path, sheet_name=sheet_name, header=None, dtype=object)
-    # locate the column that contains 'Row Labels'
-    loc = np.argwhere(raw.values == "Row Labels")
-    if len(loc) == 0:
-        # Some Pivot exports say 'Row Labels' in another locale/case or put it one col right; try a contains search
-        got = False
-        for r in range(min(50, len(raw))):  # search near the top
-            for c in range(min(50, raw.shape[1])):
-                val = str(raw.iat[r, c]) if pd.notna(raw.iat[r, c]) else ""
-                if "row labels" in val.lower():
-                    rowlabels_row, chg_col = r, c
-                    got = True
-                    break
-            if got: break
-        if not got:
-            raise RuntimeError("Couldn't find 'Row Labels' in the PIVOT sheet.")
-    else:
-        rowlabels_row, chg_col = loc[0]  # first occurrence
-
-    # find the header row that contains the cost set names
-    targets = ["ACWP", "BCWP", "BCWS", "ETC"]
-    header_row = None
-    for r in range(rowlabels_row, min(rowlabels_row + 6, len(raw))):
-        row_vals = [str(x).strip().upper() if pd.notna(x) else "" for x in raw.iloc[r].tolist()]
-        if sum(t in row_vals for t in targets) >= 2:
-            header_row = r
-            break
-    if header_row is None:
-        # last resort: scan first 50 rows
-        for r in range(0, min(50, len(raw))):
-            row_vals = [str(x).strip().upper() if pd.notna(x) else "" for x in raw.iloc[r].tolist()]
-            if sum(t in row_vals for t in targets) >= 2:
-                header_row = r
-                break
-    if header_row is None:
-        raise RuntimeError("Couldn't find the ACWP/BCWP/BCWS/ETC header row in PIVOT.")
-
-    # figure out which columns those targets live in
-    header_vals = [str(x).strip().upper() if pd.notna(x) else "" for x in raw.iloc[header_row].tolist()]
-    target_cols = {}
-    for t in targets:
-        try:
-            target_cols[t] = header_vals.index(t)
-        except ValueError:
-            target_cols[t] = None  # missing in sheet (we'll treat as zeros)
-
-    # data start is next row after header; end is row where CHG# col == 'Grand Total'
-    start = header_row + 1
-    # find first 'Grand Total'
-    end = None
-    for r in range(start, len(raw)):
-        v = str(raw.iat[r, chg_col]) if pd.notna(raw.iat[r, chg_col]) else ""
-        if v.strip().lower().startswith("grand total"):
-            end = r
-            break
-    if end is None:
-        end = len(raw)
-
-    # build the clean dataframe
-    recs = []
-    for r in range(start, end):
-        chg = raw.iat[r, chg_col]
-        if pd.isna(chg) or str(chg).strip() == "":
-            continue
-        row = {"CHG#": str(chg).strip()}
-        for t in targets:
-            cidx = target_cols.get(t)
-            val = 0.0 if cidx is None else _coerce_num(raw.iat[r, cidx])
-            row[t] = float(val)
-        recs.append(row)
-    df = pd.DataFrame(recs).set_index("CHG#")
-
-    # totals row (optional diagnostics)
-    totals = {"ACWP":0.0,"BCWP":0.0,"BCWS":0.0,"ETC":0.0}
-    if end < len(raw):
-        for t in targets:
-            cidx = target_cols.get(t)
-            if cidx is not None:
-                totals[t] = float(_coerce_num(raw.iat[end, cidx]))
-    return df.sort_index(), totals
-
-def make_grouped_from_weekly(xlsx_path, sheet_name):
-    """Re-create the Excel-like pivot from the weekly extract with the same filtering Excel used."""
-    df = pd.read_excel(xlsx_path, sheet_name=sheet_name)
-    # canonicalize columns and pick the important ones
+def build_pivot(df, latest_date_per_key=False):
+    """Make a pivot like Excel: SUM(HOURS) by CHG# x COST-SET, with common page-filters."""
+    df = df.copy()
     df.columns = df.columns.str.strip()
-    chg_col   = _find_col(df, ["CHG#", "CHG", "WORK PACKAGE", "ROW LABELS"])
-    cost_col  = _find_col(df, ["COST-SET", "COST SET", "COSTSET"])
-    hours_col = _find_col(df, ["HOURS","QTY","AMOUNT"])
 
-    # Excel pivot you showed had the page filters: PLUG = Missing value, DATE = Missing value, CUM = (likely 'CUM')
-    # Apply those if columns exist.
-    if any(x in df.columns.str.upper() for x in ["CUM/PER","CUM PER","CUMPER","CUM"]):
-        cumcol = _find_col(df, ["CUM/PER","CUM PER","CUMPER","CUM"])
+    chg = find_col(df, ["CHG#", "CHG", "WORK PACKAGE"])
+    cost = find_col(df, ["COST-SET", "COST SET", "COSTSET"])
+    hours = find_col(df, ["HOURS", "QTY", "AMOUNT"])
+    df[hours] = to_num(df[hours])
+
+    # Excel-style 'page filters' commonly used in your screenshots:
+    # 1) Keep CUM (if a "CUM/PER"ish column exists)
+    cumcol = None
+    for cand in ["CUM/PER", "CUM PER", "CUMPER", "CUM"]:
+        try:
+            cumcol = find_col(df, [cand])
+            break
+        except Exception:
+            pass
+    if cumcol is not None:
         df = df[df[cumcol].astype(str).str.upper().str.contains("CUM", na=False)]
 
-    if "PLUG" in df.columns.str.upper().tolist():
-        plugcol = _find_col(df, ["PLUG"])
-        df = df[df[plugcol].isna() | (df[plugcol].astype(str).str.strip().eq("")) | (df[plugcol]==0)]
+    # 2) PLUG = Missing value (i.e., blank/NaN/0) IF a PLUG column exists
+    try:
+        plug = find_col(df, ["PLUG"])
+        df = df[df[plug].isna() | (df[plug].astype(str).str.strip().eq("")) | (df[plug]==0)]
+    except Exception:
+        pass
 
-    # The PIVOT screenshot shows DATE "Missing value". When there is a DATE column, exclude rows that have a date.
-    # (This avoids double-counting periodized rows when the Pivot is cumulative.)
+    # 3) DATE = Missing value (if a date-ish column exists)
+    datecol = None
     for cand in ["DATE", "STATUS DATE", "AS OF", "ASOF", "REPORT DATE"]:
-        if any(cand == c.upper() for c in df.columns):
-            dcol = _find_col(df, [cand])
-            df = df[df[dcol].isna() | (df[dcol].astype(str).str.strip().eq(""))]
+        try:
+            datecol = find_col(df, [cand])
             break
+        except Exception:
+            pass
+    if datecol is not None:
+        # If we're NOT doing latest-date logic, match the Excel screenshot filter:
+        # keep rows where date is missing.
+        if not latest_date_per_key:
+            df = df[df[datecol].isna() | (df[datecol].astype(str).str.strip().eq(""))]
+        else:
+            # Latest-date per (CHG#, COST-SET). If some are blank, treat blank as "oldest".
+            tmp = df.copy()
+            # Convert to datetime (coerce errors -> NaT)
+            tmp[datecol] = pd.to_datetime(tmp[datecol], errors="coerce")
+            # pick max date per key; if all NaT for a key, keep the NaT rows
+            max_dates = tmp.groupby([chg, cost], dropna=False)[datecol].transform("max")
+            df = tmp[(tmp[datecol].isna() & max_dates.isna()) | (tmp[datecol] == max_dates)]
 
-    df[hours_col] = _coerce_num(df[hours_col])
+    # Build pivot
+    pv = df.pivot_table(index=chg, columns=cost, values=hours, aggfunc="sum", fill_value=0.0)
 
-    # Create pivot (sum of HOURS)
-    pt = df.pivot_table(index=chg_col, columns=cost_col, values=hours_col, aggfunc="sum", fill_value=0.0)
+    # Normalize columns to the four of interest
+    rename = {}
+    for c in pv.columns:
+        u = str(c).strip().upper()
+        if u in ["ACWP", "ACMP"]:
+            rename[c] = "ACWP"
+        elif u == "BCWP":
+            rename[c] = "BCWP"
+        elif u == "BCWS":
+            rename[c] = "BCWS"
+        elif u == "ETC":
+            rename[c] = "ETC"
+    pv = pv.rename(columns=rename)
+    for need in ["ACWP", "BCWP", "BCWS", "ETC"]:
+        if need not in pv.columns:
+            pv[need] = 0.0
+    pv = pv[["ACWP", "BCWP", "BCWS", "ETC"]]
+    pv.index = pv.index.astype(str).str.strip()
+    return pv.sort_index()
 
-    # normalize column names (Excel shows ACWP/BCWP/BCWS/ETC)
-    rename_map = {}
-    for c in pt.columns:
-        cu = str(c).strip().upper()
-        if cu in ["ACWP","ACMP"]: rename_map[c] = "ACWP"
-        elif cu == "BCWP":        rename_map[c] = "BCWP"
-        elif cu == "BCWS":        rename_map[c] = "BCWS"
-        elif cu == "ETC":         rename_map[c] = "ETC"
-    pt = pt.rename(columns=rename_map)
-    # ensure all expected columns exist
-    for col in ["ACWP","BCWP","BCWS","ETC"]:
-        if col not in pt.columns:
-            pt[col] = 0.0
+# 1) Load weekly extract + build two versions of the pivot
+weekly_path = pick_existing(weekly_xlsx_candidates)
+weekly = pd.read_excel(weekly_path, sheet_name=weekly_sheet)
 
-    # keep only the four columns, sorted by CHG#
-    pt = pt[["ACWP","BCWP","BCWS","ETC"]].copy()
-    pt.index = pt.index.astype(str).str.strip()
-    pt = pt.sort_index()
+grouped_all = build_pivot(weekly, latest_date_per_key=False)          # Excel page-filter: DATE missing
+grouped_latest = build_pivot(weekly, latest_date_per_key=True)        # try latest DATE per (CHG#, COST-SET)
 
-    totals = pt.sum(numeric_only=True).to_dict()
-    return pt, totals
+# 2) Load your Excel pivot export (CSV) -> tidy shape
+cum = pd.read_csv(excel_pivot_csv, dtype=str).fillna("")
+# Expect columns: 'Row Labels', 'ACWP','BCWP','BCWS','ETC' (strings like 'Missing value' present)
+rename_map = {c: c.strip() for c in cum.columns}
+cum = cum.rename(columns=rename_map)
+chg_csv_col = "Row Labels" if "Row Labels" in cum.columns else "CHG#"
+cum.rename(columns={chg_csv_col: "CHG#"}, inplace=True)
+for col in ["ACWP", "BCWP", "BCWS", "ETC"]:
+    if col not in cum.columns:
+        cum[col] = 0
+    # Turn 'Missing value' or blanks into 0
+    vals = cum[col].replace({"Missing value": 0, "": 0, "-": 0})
+    cum[col] = to_num(vals, zero_missing=True)
+cum["CHG#"] = cum["CHG#"].astype(str).str.strip()
+cum = cum.set_index("CHG#").sort_index()
+cum = cum[["ACWP", "BCWP", "BCWS", "ETC"]]
 
-# ---------- run ----------
-# 1) Build grouped from weekly extract
-grouped, grouped_totals = make_grouped_from_weekly(weekly_path, weekly_sheet)
+# 3) Compare (totals + per-row deltas)
+def compare_and_report(py_pivot, name):
+    # align
+    keys = sorted(set(py_pivot.index).union(set(cum.index)))
+    g = py_pivot.reindex(keys).fillna(0.0)
+    e = cum.reindex(keys).fillna(0.0)
+    delta = (g - e)
+    absmax = delta.abs().max(axis=1)
 
-# 2) Parse the Excel pivot sheet to get the expected numbers
-piv_expected, excel_totals = read_dashboard_pivot_table(dashboard_path, dash_pivot_sh)
+    print(f"\n================= COMPARISON: {name} =================")
+    print("Totals (Python vs Excel pivot):")
+    totals = pd.DataFrame({
+        "Python_total": g.sum(),
+        "Excel_total": e.sum(),
+        "Delta": (g.sum() - e.sum())
+    })[["Python_total","Excel_total","Delta"]].round(ROUND)
+    print(totals, "\n")
 
-# 3) Align and compare
-#    (some CHG# might exist in one but not the other)
-all_keys = sorted(set(grouped.index).union(set(piv_expected.index)))
-g = grouped.reindex(all_keys).fillna(0.0)
-e = piv_expected.reindex(all_keys).fillna(0.0)
+    mism = delta[absmax > TOL].copy()
+    print(f"Rows compared: {len(keys)}   mismatches (>|{TOL}|): {len(mism)}")
+    # show top 20 by largest absolute sum of deltas
+    top = (delta.abs().sum(axis=1).sort_values(ascending=False).head(20).index)
+    view = pd.concat(
+        {
+            "python": g.loc[top, ["ACWP","BCWP","BCWS","ETC"]],
+            "excel":  e.loc[top, ["ACWP","BCWP","BCWS","ETC"]],
+            "delta":  delta.loc[top, ["ACWP","BCWP","BCWS","ETC"]],
+        }, axis=1
+    ).round(ROUND)
+    print("\nTop 20 row mismatches:")
+    print(view)
 
-delta = (g - e).assign(
-    abs_max_diff = (g[["ACWP","BCWP","BCWS","ETC"]] - e[["ACWP","BCWP","BCWS","ETC"]]).abs().max(axis=1)
-)
-mismatches = delta[delta["abs_max_diff"] > TOL].drop(columns=["abs_max_diff"])
+    # Save full mismatch file
+    report = pd.concat(
+        [g.add_prefix("py_"), e.add_prefix("xl_"), delta.add_prefix("delta_")],
+        axis=1
+    ).round(ROUND)
+    outpath = f"mismatch_{name.replace(' ','_').lower()}.csv"
+    report.to_csv(outpath)
+    print(f"\nSaved full comparison to: {outpath}")
 
-# totals side-by-side
-totals_df = pd.DataFrame({
-    "grouped_total": g.sum(),
-    "excel_pivot_total": e.sum(),
-    "delta": (g.sum() - e.sum())
-}).T[["ACWP","BCWP","BCWS","ETC"]]
+    # Diagnostics for BCWS/ETC mismatches: show potential duplicate “keys” in raw data
+    # (only for CHG# present in top mismatches)
+    top_keys = list(top)
+    chg_col = find_col(weekly, ["CHG#", "CHG", "WORK PACKAGE"])
+    cost_col = find_col(weekly, ["COST-SET", "COST SET", "COSTSET"])
+    diag_cols = [c for c in ["DATE","STATUS DATE","AS OF","ASOF","CUM/PER","CUM PER","CUMPER","PLUG","RESP_DEPT","BE_DEPT","Control_Acct"] if any(c.lower() in x.lower() for x in weekly.columns)]
+    diag_cols = [find_col(weekly, [c]) for c in diag_cols if c] if diag_cols else []
+    keep_cols = list(dict.fromkeys([chg_col, cost_col] + diag_cols))  # unique order
+    w = weekly.copy()
+    # normalize cost set labels to four buckets
+    w[cost_col] = w[cost_col].astype(str).str.upper().str.strip()
+    w = w[w[chg_col].astype(str).isin(top_keys) & w[cost_col].isin(["ACWP","BCWP","BCWS","ETC"])]
+    print("\nSample raw rows for top mismatches (to spot duplicates by DATE / CUM / PLUG etc.):")
+    try:
+        display_cols = [c for c in keep_cols if c in w.columns]
+        print(w[display_cols].head(50))
+    except Exception:
+        print("(Could not display diagnostics subset.)")
 
-# 4) Print concise diagnostics
-pd.set_option("display.float_format", lambda x: f"{x:,.4f}")
-print("=== Totals (Python grouped vs Excel pivot) ===")
-print(totals_df, "\n")
+# Run both comparisons
+compare_and_report(grouped_all, "page_filters_DATE_missing")
+if any(x.lower() in c.lower() for x in ["date","status date","as of","asof","report date"] for c in weekly.columns):
+    compare_and_report(grouped_latest, "latest_DATE_per_CHG_COST")
 
-print(f"Rows compared: {len(all_keys)}")
-print(f"Rows with any mismatch > {TOL}: {len(mismatches)}")
-print("\n--- Top 25 largest absolute deltas ---")
-top25 = (g - e).abs().sum(axis=1).sort_values(ascending=False).head(25).index
-out = pd.concat(
-    {
-        "python_grouped": g.loc[top25, ["ACWP","BCWP","BCWS","ETC"]],
-        "excel_pivot":    e.loc[top25, ["ACWP","BCWP","BCWS","ETC"]],
-        "delta":          (g.loc[top25, ["ACWP","BCWP","BCWS","ETC"]] - e.loc[top25, ["ACWP","BCWP","BCWS","ETC"]])
-    },
-    axis=1
-)
-print(out)
-
-# 5) Optional: save full mismatch report to inspect in Excel
-mismatch_report = pd.concat(
-    [g.add_prefix("py_"), e.add_prefix("xl_"), (g - e).add_prefix("delta_")],
-    axis=1
-)
-mismatch_report.to_csv("bcws_etc_mismatch_report.csv")
-print("\nSaved: bcws_etc_mismatch_report.csv (full side-by-side + deltas).")
+# Also expose the 'grouped' you asked for (matching the page-filter version)
+grouped = grouped_all.round(ROUND)
+print("\nPreview of grouped (first 15 rows):")
+print(grouped.head(15))
