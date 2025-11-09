@@ -1,27 +1,35 @@
 import pandas as pd
-from datetime import datetime
 
-# --- inputs you may change ---
-excel_path = "data/cobra-XM30.xlsx"
-sheet_name = "tbl_Weekly Extract"
-round_to = 4  # decimals to match Excel display
-# -----------------------------
+# === Load Data ===
+file_path = "data/Cobra-XM30.xlsx"
+sheet = "tbl_Weekly Extract"
 
-# 1) Load
-df = pd.read_excel(excel_path, sheet_name=sheet_name)
-
-# 2) Light cleanup / column detection
+df = pd.read_excel(file_path, sheet_name=sheet)
 df.columns = df.columns.str.strip()
-def pick(col_candidates):
-    up = {c.upper(): c for c in df.columns}
-    for want in col_candidates:
-        if want in up: return up[want]
-    # fuzzy contains
-    for c in df.columns:
-        cu = c.upper()
-        if any(w in cu for w in col_candidates): return c
-    raise KeyError(f"Could not find any of {col_candidates}")
 
-chg_col   = pick(["CHG#", "CHG", "CHANGE", "WORK PACKAGE"])
-cost_col  = pick(["COST-SET", "COST SET", "COSTSET"])
-hours
+# === Normalize column names for consistency ===
+df.rename(columns=lambda x: x.upper().replace(" ", "_"), inplace=True)
+
+# === Filter relevant columns only ===
+cols_needed = ["CHG#", "COST-SET", "HOURS"]
+df = df[[c for c in cols_needed if c in df.columns]]
+
+# === Coerce HOURS to numeric ===
+df["HOURS"] = pd.to_numeric(df["HOURS"], errors="coerce").fillna(0)
+
+# === Group and pivot exactly like Excel ===
+grouped = (
+    df.groupby(["CHG#", "COST-SET"])["HOURS"]
+      .sum()
+      .unstack(fill_value=0)
+      .reindex(columns=["ACWP", "BCWP", "BCWS", "ETC"], fill_value=0)
+)
+
+# === Add Grand Total Row (matching Excel) ===
+grouped.loc["Grand Total"] = grouped.sum(numeric_only=True)
+
+# === Optional: Round to match Excel’s precision ===
+grouped = grouped.round(4)
+
+# === Show result ===
+print(grouped.tail(10))
