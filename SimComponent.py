@@ -1,31 +1,42 @@
-limport pandas as pd
+# --- Totals summary from grouped_status, grouped_4wk, grouped_cum (one cell) ---
+import pandas as pd
 
-# ---- CONFIG: your fixed monthly accounting close dates (MM-DD)
-ACCOUNTING_CLOSE_MD = [(1,26),(2,23),(3,30),(4,27),(5,25),(6,29),
-                       (7,27),(8,24),(9,28),(10,26),(11,23),(12,31)]
+# Pick the metric columns in a fixed order if they exist
+_metric_order = ["ACWP", "BCWP", "BCWS", "ETC"]
+def _available_metrics(*dfs):
+    present = []
+    for c in _metric_order:
+        if any(c in df.columns for df in dfs):
+            present.append(c)
+    return present
 
-# ---- OPTIONAL: to reproduce a past run, set OVERRIDE_TODAY = 'YYYY-MM-DD' (else None for actual today)
-OVERRIDE_TODAY = None  # e.g., '2025-10-15'  -> most recent close = 2025-09-28
+def _total_series(df: pd.DataFrame, cols):
+    """Return TOTAL row for df over `cols`.
+       If the last row is the TOTAL row, use it; else compute the sum."""
+    if len(df) == 0:
+        return pd.Series({c: 0.0 for c in cols})
+    last_idx = str(df.index[-1]).upper()
+    if last_idx == "TOTAL" and set(cols).issubset(df.columns):
+        s = df.iloc[-1][cols]
+    else:
+        s = df[cols].sum(numeric_only=True)
+    # ensure numeric
+    s = pd.to_numeric(s, errors="coerce").fillna(0.0)
+    s.index = cols
+    return s
 
-# ---- Pick the source DF and date column
-df = xm30_cobra_export_weekly_extract.copy()
-date_col = 'DATE' if 'DATE' in df.columns else next((c for c in df.columns if c.lower() == 'date'), None)
-if date_col is None:
-    raise ValueError("No DATE column found.")
+cols = _available_metrics(grouped_status, grouped_4wk, grouped_cum)
 
-# ---- Ensure datetime (naive) for comparisons
-df[date_col] = pd.to_datetime(df[date_col], errors='coerce').dt.tz_localize(None)
+summary = pd.DataFrame(
+    [
+        _total_series(grouped_status, cols),
+        _total_series(grouped_4wk, cols),
+        _total_series(grouped_cum, cols),
+    ],
+    index=["Status Period", "Last 4 Weeks", "Cumulative"],
+)[cols]
 
-# ---- Determine "today" and build candidate close dates around it
-today = (pd.to_datetime(OVERRIDE_TODAY) if OVERRIDE_TODAY else pd.Timestamp.today()).normalize()
-years = [today.year - 1, today.year, today.year + 1]  # handles January edge cases cleanly
+# Optional: nicer display (round if you like)
+summary = summary.astype(float)
 
-candidates = pd.to_datetime([f"{y:04d}-{m:02d}-{d:02d}" for y in years for (m, d) in ACCOUNTING_CLOSE_MD])
-last_close = candidates[candidates <= today].max()  # most recent accounting period close (<= today)
-
-# ---- Filter: dates strictly greater than the most recent accounting close
-filtered_data = df[df[date_col] > last_close].copy()
-
-# (Optional) expose the anchor date you filtered from
-print("Most recent accounting close:", last_close.date())
-filtered_data
+summary
