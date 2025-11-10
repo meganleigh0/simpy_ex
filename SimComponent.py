@@ -1,65 +1,48 @@
-# === Cost Performance (CPI) by CHG#: CTD and YTD ==============================
+# === schedule_performance_tbl (SPI by CTD and YTD for each CHG#) ==============
 import pandas as pd
 import numpy as np
 from datetime import datetime
 
-# Reuse existing variables if present; set safe defaults
-if 'df' not in globals():
-    raise NameError("Expected in-memory `df` with DATE, COST-SET, HOURS, CHG#.")
+# Ensure DATE is datetime (in-place, continuing from your notebook)
+df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
 
-GROUP_COL = globals().get('GROUP_COL', 'CHG#')
-ANCHOR    = globals().get('ANCHOR', datetime.now())
+# Use latest date in df as the anchor; YTD starts Jan 1 of that year
+anchor = pd.to_datetime(df["DATE"].max())
+ytd_start = datetime(anchor.year, 1, 1)
 
-# Ensure DATE is datetime and trim any future-dated rows
-df_use = df.copy()
-df_use['DATE'] = pd.to_datetime(df_use['DATE'], errors='coerce')
-df_use = df_use[df_use['DATE'] <= ANCHOR]
+# ---- CTD rollup: sum HOURS by CHG# x COST-SET --------------------------------
+ctd = (df[df["DATE"].notna()]
+       .groupby(["CHG#", "COST-SET"], dropna=False)["HOURS"]
+       .sum()
+       .unstack(fill_value=0.0))
+for k in ["BCWP", "BCWS"]:
+    if k not in ctd.columns: ctd[k] = 0.0
+ctd = ctd[["BCWP", "BCWS"]].astype(float)
 
-# Windows
-ytd_start = datetime(ANCHOR.year, 1, 1)
+# ---- YTD rollup --------------------------------------------------------------
+ytd = (df[(df["DATE"] >= ytd_start) & df["DATE"].notna()]
+       .groupby(["CHG#", "COST-SET"], dropna=False)["HOURS"]
+       .sum()
+       .unstack(fill_value=0.0))
+for k in ["BCWP", "BCWS"]:
+    if k not in ytd.columns: ytd[k] = 0.0
+ytd = ytd[["BCWP", "BCWS"]].astype(float)
 
-def rollup_acwp_bcwp(dframe):
-    """Return ACWP & BCWP sums by GROUP_COL; ensure missing cost-sets are 0."""
-    g = (dframe
-         .groupby([GROUP_COL, 'COST-SET'], dropna=False)['HOURS']
-         .sum()
-         .unstack(fill_value=0.0))
-    for k in ['ACWP', 'BCWP']:
-        if k not in g.columns:
-            g[k] = 0.0
-    return g[['ACWP','BCWP']].astype(float)
+# ---- SPI = BCWP / BCWS -------------------------------------------------------
+spi_ctd = (ctd["BCWP"] / ctd["BCWS"].replace(0, np.nan)).round(2)
+spi_ytd = (ytd["BCWP"] / ytd["BCWS"].replace(0, np.nan)).round(2)
 
-# CTD and YTD totals
-ctd = rollup_acwp_bcwp(df_use)
-ytd = rollup_acwp_bcwp(df_use[(df_use['DATE'] >= ytd_start)])
-
-def safe_ratio(num, den):
-    return (num / den.replace({0: np.nan}))
-
-# CPI = BCWP / ACWP
-cpi_ctd = safe_ratio(ctd['BCWP'], ctd['ACWP']).round(2)
-cpi_ytd = safe_ratio(ytd['BCWP'], ytd['ACWP']).round(2)
-
-cost_performance_tbl = pd.DataFrame({
-    'CTD': cpi_ctd,
-    'YTD': cpi_ytd
+schedule_performance_tbl = pd.DataFrame({
+    "CTD": spi_ctd,
+    "YTD": spi_ytd
 })
-cost_performance_tbl.index.name = None
+schedule_performance_tbl.index.name = None
 
 # TOTAL row (ratio of sums, not average of ratios)
-tot_ctd_acwp = ctd['ACWP'].sum()
-tot_ctd_bcwp = ctd['BCWP'].sum()
-tot_ytd_acwp = ytd['ACWP'].sum()
-tot_ytd_bcwp = ytd['BCWP'].sum()
+tot_spi_ctd = np.nan if np.isclose(ctd["BCWS"].sum(), 0) else round(ctd["BCWP"].sum() / ctd["BCWS"].sum(), 2)
+tot_spi_ytd = np.nan if np.isclose(ytd["BCWS"].sum(), 0) else round(ytd["BCWP"].sum() / ytd["BCWS"].sum(), 2)
+schedule_performance_tbl.loc["TOTAL"] = [tot_spi_ctd, tot_spi_ytd]
 
-tot_row = pd.Series({
-    'CTD': np.nan if np.isclose(tot_ctd_acwp, 0) else round(tot_ctd_bcwp / tot_ctd_acwp, 2),
-    'YTD': np.nan if np.isclose(tot_ytd_acwp, 0) else round(tot_ytd_bcwp / tot_ytd_acwp, 2)
-}, name='TOTAL')
-
-cost_performance_tbl = pd.concat([cost_performance_tbl, tot_row.to_frame().T])
-
-print(f"Anchor: {ANCHOR:%Y-%m-%d} | YTD start: {ytd_start:%Y-%m-%d}")
-print("\n=== Cost Performance (CPI: CTD & YTD) by CHG# ===")
-display(cost_performance_tbl)
-# ============================================================================== 
+print(f"Anchor: {anchor:%Y-%m-%d} | YTD start: {ytd_start:%Y-%m-%d}")
+display(schedule_performance_tbl)
+# =============================================================================
