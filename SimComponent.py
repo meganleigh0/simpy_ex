@@ -1,17 +1,17 @@
-# === Style EVMS tables with exact colors; output ONLY styled Excel =============
+# === Style ONLY labor tables with exact colors; save styled Excel =============
 import os
 import numpy as np
 import pandas as pd
 
-# Exact palette from your Threshold Key (RGB -> HEX)
-HEX_BLUE   = "#8EB4E3"   # 142,180,227  (>= 1.05 or >= +0.05)
-HEX_GREEN  = "#339966"   # 051,153,102  ([1.02,1.05) or [+0.02,+0.05))
-HEX_YELLOW = "#FFFF99"   # 255,255,153  ([0.98,1.02) or [-0.02,+0.02])
-HEX_RED    = "#C0504D"   # 192,080,077  ([0.95,0.98) and <0.95 ; and VAC/BAC <-0.02)
+# ---- Exact palette (from your key) -------------------------------------------
+HEX_BLUE   = "#8EB4E3"   # 142,180,227
+HEX_GREEN  = "#339966"   # 51,153,102
+HEX_YELLOW = "#FFFF99"   # 255,255,153
+HEX_RED    = "#C0504D"   # 192,80,77  (used for the two lowest bands)
 
-# ----------------------- Threshold color functions -----------------------------
+# ---- Threshold mappers -------------------------------------------------------
 def color_spi_cpi_exact(x):
-    """Color for ratios around 1.0 (SPI/CPI/BAC/EAC)."""
+    """For ratios centered at 1.0 (SPI/CPI/BAC/EAC style)."""
     if x is None or (isinstance(x, float) and np.isnan(x)): return ""
     try: v = float(x)
     except Exception: return ""
@@ -19,10 +19,10 @@ def color_spi_cpi_exact(x):
     if v >= 1.02:   return f"background-color:{HEX_GREEN};color:#000000"
     if v >= 0.98:   return f"background-color:{HEX_YELLOW};color:#000000"
     if v >= 0.95:   return f"background-color:{HEX_RED};color:#FFFFFF"   # 0.95–0.98
-    return f"background-color:{HEX_RED};color:#FFFFFF"                    # <0.95
+    return f"background-color:{HEX_RED};color:#FFFFFF"                    # < 0.95
 
 def color_vacbac_exact(x):
-    """Color for VAC/BAC thresholds centered at 0."""
+    """For VAC/BAC thresholds centered at 0."""
     if x is None or (isinstance(x, float) and np.isnan(x)): return ""
     try: v = float(x)
     except Exception: return ""
@@ -32,8 +32,8 @@ def color_vacbac_exact(x):
     if v >= -0.05:  return f"background-color:{HEX_RED};color:#FFFFFF"   # -0.05 to -0.02
     return f"background-color:{HEX_RED};color:#FFFFFF"                    # < -0.05
 
-# ----------------------- Styling / save helpers --------------------------------
-def save_styled(df, name, styler, outdir="output"):
+# ---- Helpers -----------------------------------------------------------------
+def save_styled_only(name, styler, outdir="output"):
     os.makedirs(outdir, exist_ok=True)
     path = os.path.join(outdir, f"{name}_styled.xlsx")
     try:
@@ -42,68 +42,61 @@ def save_styled(df, name, styler, outdir="output"):
         print(f"[warn] Could not write styled Excel for {name}: {e}")
     display(styler)
 
-# ----------------------- Cost Performance (CPI) --------------------------------
-if 'cost_performance_tbl' in globals():
-    # format + color both columns
-    sty = (cost_performance_tbl
-           .style
-           .format({"CTD":"{:.2f}","YTD":"{:.2f}"})
-           .applymap(color_spi_cpi_exact, subset=["CTD","YTD"]))
-    save_styled(cost_performance_tbl, "cost_performance_tbl", sty)
+def find_col(df, startswith_text):
+    """Find first column whose name (upper/stripped) starts with text."""
+    key = startswith_text.upper()
+    for c in df.columns:
+        if str(c).strip().upper().startswith(key):
+            return c
+    return None
 
-# ----------------------- Schedule Performance (SPI) ----------------------------
-if 'schedule_performance_tbl' in globals():
-    sty = (schedule_performance_tbl
-           .style
-           .format({"CTD":"{:.2f}","YTD":"{:.2f}"})
-           .applymap(color_spi_cpi_exact, subset=["CTD","YTD"]))
-    save_styled(schedule_performance_tbl, "schedule_performance_tbl", sty)
-
-# ----------------------- EVMS Metrics (SPI/CPI rows) ---------------------------
-if 'evms_metrics_tbl' in globals():
-    cols = list(evms_metrics_tbl.columns)  # ["CTD","4WK","YTD"]
-    sty = (evms_metrics_tbl
-           .style
-           .format({c:"{:.2f}" for c in cols})
-           .applymap(color_spi_cpi_exact, subset=cols))
-    save_styled(evms_metrics_tbl, "evms_metrics_tbl", sty)
-
-# ----------------------- Labor table: color VAC using VAC/BAC ------------------
+# ---- Labor Hours table: color VAC by VAC/BAC ---------------------------------
 if 'labor_tbl' in globals():
-    # build a style DataFrame where only VAC (K) cells get colored by VAC/BAC
-    def vac_column_style(df_):
-        css = pd.DataFrame("", index=df_.index, columns=df_.columns)
-        if "VAC (K)" in df_.columns and "BAC (K)" in df_.columns:
-            vac = pd.to_numeric(df_["VAC (K)"], errors="coerce")
-            bac = pd.to_numeric(df_["BAC (K)"], errors="coerce")
-            vacbac = vac / bac.replace(0, np.nan)  # uses same units (K)
-            colors = vacbac.apply(color_vacbac_exact)
-            css.loc[:, "VAC (K)"] = colors.values
-        return css
+    # Accept either 'VAC' or 'VAC (K)', 'BAC' or 'BAC (K)'
+    vac_col = find_col(labor_tbl, "VAC")
+    bac_col = find_col(labor_tbl, "BAC")
 
-    sty = (labor_tbl
-           .style
-           .apply(vac_column_style, axis=None))
-    save_styled(labor_tbl, "labor_tbl", sty)
+    if vac_col and bac_col:
+        # Build a per-cell CSS frame; color only the VAC column
+        def vac_style(df_):
+            css = pd.DataFrame("", index=df_.index, columns=df_.columns)
+            vac = pd.to_numeric(df_[vac_col], errors="coerce")
+            bac = pd.to_numeric(df_[bac_col], errors="coerce")
+            ratio = vac / bac.replace(0, np.nan)  # K units cancel if used
+            css[vac_col] = ratio.apply(color_vacbac_exact).values
+            return css
 
-# ----------------------- Monthly labor: color BOTH columns ---------------------
+        sty = labor_tbl.style.apply(vac_style, axis=None)
+        save_styled_only("labor_tbl", sty)
+    else:
+        print("[warn] Could not find VAC/BAC columns in labor_tbl.")
+
+# ---- Monthly labor table: color BOTH columns ---------------------------------
 if 'labor_monthly_tbl' in globals():
-    # BAC/EAC uses SPI/CPI thresholds; VAC/BAC uses VAC/BAC thresholds
-    def apply_dual_thresholds(df_):
+    # Accept canonical names; tolerate case/spacing differences
+    def match_col(df_, target):
+        for c in df_.columns:
+            if str(c).strip().replace(" ", "").upper() == target:
+                return c
+        return None
+
+    bac_eac_col = match_col(labor_monthly_tbl, "BAC/EAC")
+    vac_bac_col = match_col(labor_monthly_tbl, "VAC/BAC")
+
+    def dual_thresholds(df_):
         css = pd.DataFrame("", index=df_.index, columns=df_.columns)
-        if "BAC/EAC" in df_.columns:
-            css["BAC/EAC"] = df_["BAC/EAC"].apply(color_spi_cpi_exact).values
-        if "VAC/BAC" in df_.columns:
-            css["VAC/BAC"] = df_["VAC/BAC"].apply(color_vacbac_exact).values
+        if bac_eac_col in df_.columns:
+            css[bac_eac_col] = df_[bac_eac_col].apply(color_spi_cpi_exact).values
+        if vac_bac_col in df_.columns:
+            css[vac_bac_col] = df_[vac_bac_col].apply(color_vacbac_exact).values
         return css
 
-    # Ensure ratios display to 2 decimals
-    fmt_cols = {c:"{:.2f}" for c in labor_monthly_tbl.columns if c in ["BAC/EAC","VAC/BAC"]}
-    sty = (labor_monthly_tbl
-           .style
-           .format(fmt_cols)
-           .apply(apply_dual_thresholds, axis=None))
-    save_styled(labor_monthly_tbl, "labor_monthly_tbl", sty)
+    fmt = {}
+    if bac_eac_col: fmt[bac_eac_col] = "{:.2f}"
+    if vac_bac_col: fmt[vac_bac_col] = "{:.2f}"
 
-print("Styled tables displayed and saved to ./output as *_styled.xlsx (no CSVs).")
+    sty = labor_monthly_tbl.style.format(fmt).apply(dual_thresholds, axis=None)
+    save_styled_only("labor_monthly_tbl", sty)
+
+print("Styled labor tables saved to ./output as *_styled.xlsx (no CSVs).")
 # =============================================================================
