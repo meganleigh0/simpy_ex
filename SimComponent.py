@@ -1,69 +1,82 @@
-# === Metrics table from grouped_cum / grouped_4wk / grouped_status (ONE CELL) ===
-import numpy as np
+# app.py
+# Streamlit dashboard for precomputed DataFrames:
+# grouped_cum, grouped_4wk, grouped_status, summary, rounded
+
+import streamlit as st
 import pandas as pd
 
-cols = ["ACWP","BCWP","BCWS","ETC"]
+st.set_page_config(page_title="EVMS Tables", layout="wide")
 
-def total_series(df: pd.DataFrame, cols=cols):
-    """Return TOTAL row for df over `cols`; if missing, compute the sum."""
-    if len(df) == 0:
-        return pd.Series({c: 0.0 for c in cols})
-    last_idx = str(df.index[-1]).upper()
-    if last_idx == "TOTAL" and set(cols).issubset(df.columns):
-        s = df.iloc[-1][cols]
-    else:
-        s = df[cols].sum(numeric_only=True)
-    return pd.to_numeric(s, errors="coerce").fillna(0.0)
+def split_rounded(df: pd.DataFrame):
+    """Split rounded into multi-period rows and cumulative-only rows."""
+    r = df.copy()
 
-# Pull totals for each period
-cum   = total_series(grouped_cum)
-wk4   = total_series(grouped_4wk)
-stat  = total_series(grouped_status)
+    # If "Missing value" strings exist, treat them as NaN
+    r = r.replace("Missing value", pd.NA)
 
-periods = pd.DataFrame([cum, wk4, stat], index=["CUM","4Wk","Current status"])
+    # Coerce to numeric for robust missingness checks
+    for c in r.columns:
+        r[c] = pd.to_numeric(r[c], errors="coerce")
 
-def div(a, b):
-    return np.where(np.isclose(b, 0.0), np.nan, a / b)
+    # Identify the cumulative column by name (fallback = first col)
+    cum_col = next((c for c in r.columns if "cum" in c.lower()), r.columns[0])
+    other_cols = [c for c in r.columns if c != cum_col]
 
-# Build metrics table skeleton
-metrics = pd.DataFrame(
-    index=["SPI","CPI","SV","SV%","CV","CV%","BAC","EAC","VAC","VAC%","BCWR","ETC","TCPI"],
-    columns=["CUM","4Wk","Current status"],
-    dtype=float
-)
+    cumulative_only = r[r[other_cols].isna().all(axis=1) & r[cum_col].notna()]
+    multi_period   = r.drop(index=cumulative_only.index)
 
-# Metrics calculated for each period (SPI/CPI/SV/SV%/CV/CV%)
-for col, row in periods.iterrows():
-    ACWP, BCWP, BCWS, ETCv = row["ACWP"], row["BCWP"], row["BCWS"], row["ETC"]
-    SVv = BCWP - BCWS
-    CVv = BCWP - ACWP
-    metrics.loc["SPI", col] = div(BCWP, BCWS)
-    metrics.loc["CPI", col] = div(BCWP, ACWP)
-    metrics.loc["SV",  col] = SVv
-    metrics.loc["SV%", col] = div(SVv, BCWS) * 100.0
-    metrics.loc["CV",  col] = CVv
-    metrics.loc["CV%", col] = div(CVv, BCWP) * 100.0
+    # Keep original order of rows
+    cumulative_only = df.loc[cumulative_only.index, [cum_col]]
+    multi_period    = df.loc[multi_period.index, df.columns.tolist()]
 
-# CUM-only metrics (BAC/EAC/VAC/VAC%/BCWR/ETC/TCPI)
-BAC  = cum["BCWS"]                     # BCWS (cumulative)
-EAC  = cum["ACWP"] + cum["ETC"]        # ACWP_cum + ETC_cum
-VAC  = BAC - EAC                       # BCWS - (ACWP + ETC)
-VACp = (VAC / BAC * 100.0) if not np.isclose(BAC, 0.0) else np.nan
-BCWR = BAC - cum["BCWP"]               # BCWS - BCWP
-ETC_ = cum["ETC"]                      # cumulative ETC
-TCPI = div((BAC - cum["BCWP"]), ETC_)  # (BCWS - BCWP) / ETC
+    return multi_period, cumulative_only, cum_col
 
-metrics.loc["BAC", "CUM"]  = BAC
-metrics.loc["EAC", "CUM"]  = EAC
-metrics.loc["VAC", "CUM"]  = VAC
-metrics.loc["VAC%", "CUM"] = VACp
-metrics.loc["BCWR", "CUM"] = BCWR
-metrics.loc["ETC", "CUM"]  = ETC_
-metrics.loc["TCPI", "CUM"] = TCPI
+def add_download(df: pd.DataFrame, label: str, filename: str):
+    csv = df.to_csv(index=True).encode("utf-8")
+    st.download_button(f"Download {label} CSV", csv, file_name=filename, mime="text/csv")
 
-# Optional: round like your sheet
-rounded = metrics.copy()
-rounded.loc[["SPI","CPI","SV%","CV%","VAC%","TCPI"]] = rounded.loc[["SPI","CPI","SV%","CV%","VAC%","TCPI"]].round(2)
-rounded.loc[["SV","CV","BAC","EAC","VAC","BCWR","ETC"]] = rounded.loc[["SV","CV","BAC","EAC","VAC","BCWR","ETC"]].round(2)
+st.title("EVMS Status Dashboard")
 
-rounded  # <-- final table
+# ---------- Top: Summary & Rounded ----------
+left, right = st.columns([1, 1.25])
+
+with left:
+    st.subheader("Summary")
+    st.dataframe(summary, use_container_width=True)
+    add_download(summary, "Summary", "summary.csv")
+
+with right:
+    st.subheader("Key Metrics (Rounded)")
+    multi_period, cumulative_only, cum_col = split_rounded(rounded)
+
+    if not multi_period.empty:
+        st.caption("Across Periods")
+        st.dataframe(multi_period, use_container_width=True)
+        add_download(multi_period, "Rounded (across periods)", "rounded_across_periods.csv")
+
+    if not cumulative_only.empty:
+        st.caption(f"Cumulative-Only Metrics (column: {cum_col})")
+        st.dataframe(cumulative_only, use_container_width=True)
+        add_download(cumulative_only, "Rounded (cumulative-only)", "rounded_cumulative_only.csv")
+
+st.markdown("---")
+
+# ---------- Detailed Tables ----------
+st.header("Detailed Tables")
+tab1, tab2, tab3, tab4 = st.tabs(["Cumulative", "Last 4 Weeks", "Status Period", "Rounded (raw)"])
+
+with tab1:
+    st.dataframe(grouped_cum, use_container_width=True)
+    add_download(grouped_cum, "Cumulative", "grouped_cumulative.csv")
+
+with tab2:
+    st.dataframe(grouped_4wk, use_container_width=True)
+    add_download(grouped_4wk, "Last 4 Weeks", "grouped_last_4_weeks.csv")
+
+with tab3:
+    st.dataframe(grouped_status, use_container_width=True)
+    add_download(grouped_status, "Status Period", "grouped_status_period.csv")
+
+with tab4:
+    st.dataframe(rounded, use_container_width=True)
+    add_download(rounded, "Rounded (raw)", "rounded_raw.csv")
