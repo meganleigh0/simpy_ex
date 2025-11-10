@@ -1,197 +1,202 @@
-# --- Imports
-import re
-from collections import Counter
-
-import numpy as np
+# ===== EVMS / EMS METRICS PIPELINE (single cell) =====
 import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
 
-from IPython.display import display
+# ---- USER SETTINGS -----------------------------------------------------------
+DATA_PATH   = "data/Cobra-XM30.xlsx"          # <-- your file
+SHEET_NAME  = "tbl_Weekly Extract"            # <-- your sheet
+PROGRAM     = "XM30"                          # label only (optional)
+ANCHOR_DATE = None                             # None = today, or set e.g. datetime(2025, 10, 15)
 
-from sklearn.decomposition import NMF
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics import silhouette_score
-from sklearn.preprocessing import normalize
+# Company accounting month-end close days (month, day)
+ACCOUNTING_CLOSE_MD = [
+    (1, 26), (2, 23), (3, 30), (4, 27), (5, 25), (6, 29),
+    (7, 27), (8, 24), (9, 28), (10, 26), (11, 23), (12, 31)
+]
 
+# ---- HELPERS -----------------------------------------------------------------
+def as_dt(x):
+    return pd.to_datetime(x, errors="coerce")
 
-# ==============================
-# Config
-# ==============================
-INPUT_PATH         = "assets/clustering_data_source.csv"
-TEXT_COL           = "sentence"
-LOWERCASE          = True
-STOP_WORDS         = "english"
-NGRAM_RANGE        = (1, 2)
-MIN_DF             = 5
-MAX_FEATURES       = 10_000
-RANDOM_STATE       = 42
+def prior_accounting_close(anchor: datetime) -> datetime:
+    """Return the most recent accounting close date <= anchor."""
+    candidates = []
+    for y in (anchor.year - 1, anchor.year):
+        for m, d in ACCOUNTING_CLOSE_MD:
+            try:
+                dt = datetime(y, m, d)
+                if dt <= anchor:
+                    candidates.append(dt)
+            except ValueError:
+                pass
+    if not candidates:
+        # Fallback far past date if nothing matched
+        return datetime(anchor.year - 1, 1, 1)
+    return max(candidates)
 
-# Add Important words to filter topics
-IMPORTANT_WORDS_PATH = "assets/important_words.txt"
+def safe_div(a, b):
+    """Elementwise a/b with 0 -> NaN."""
+    a = float(a)
+    b = float(b)
+    return np.nan if np.isclose(b, 0.0) else a / b
 
-# Load important words list (comma/whitespace/semicolon/pipe separated; 1 per line also OK)
-with open(IMPORTANT_WORDS_PATH, "r", encoding="utf-8") as f:
-    important_words = {
-        w.strip().lower()
-        for w in re.split(r"[,\s;|]+", f.read())
-        if w.strip()
+def period_totals(df: pd.DataFrame, start=None, end=None) -> pd.Series:
+    """
+    Sum HOURS by COST-SET for a filtered period.
+    Returns Series with index ['ACWP','BCWP','BCWS','ETC'] (0.0 if missing).
+    """
+    mask = pd.Series(True, index=df.index)
+    if start is not None:
+        mask &= df["DATE"] >= pd.Timestamp(start)
+    if end is not None:
+        mask &= df["DATE"] <= pd.Timestamp(end)
+
+    s = (df.loc[mask]
+          .groupby("COST-SET", dropna=False)["HOURS"]
+          .sum(min_count=1))
+    return s.reindex(["ACWP","BCWP","BCWS","ETC"]).fillna(0.0)
+
+def make_summary_tables(df: pd.DataFrame, anchor: datetime):
+    """Build Cumulative, Last 4 Weeks, and Status Period totals (ACWP/BCWP/BCWS/ETC)."""
+    four_weeks_ago = anchor - timedelta(weeks=4)
+    close_date = prior_accounting_close(anchor)
+
+    totals = {
+        "Cumulative":    period_totals(df),
+        "Last 4 Weeks":  period_totals(df, start=four_weeks_ago, end=anchor),
+        "Status Period": period_totals(df, start=close_date + timedelta(days=0), end=anchor)
+        # If you want strictly after close, use + timedelta(days=1)
     }
+    summary = pd.DataFrame(totals).T[["ACWP","BCWP","BCWS","ETC"]].astype(float)
+    return summary, close_date
 
-# Test multiple K values
-K_GRID          = [10, 20, 40, 60, 80, 100]
-MAX_ITER        = 400
-SAMPLE_FOR_SIL  = 5000   # sample if too large
+def make_metrics(summary: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build EVMS metrics for each period (rows = metrics, cols = periods).
+    - SPI = BCWP / BCWS
+    - CPI = BCWP / ACWP
+    - SV  = BCWP - BCWS
+    - SV% = SV / BCWS * 100
+    - CV  = BCWP - ACWP
+    - CV% = CV / BCWP * 100
+    - BAC = BCWS (cumulative)
+    - EAC = ACWP (cumulative) + ETC (cumulative)
+    - VAC = BAC - EAC
+    - VAC% = VAC / BAC * 100
+    - BCWR = BCWS - BCWP  (cumulative)
+    - ETC  = ETC (cumulative)
+    - TCPI = (BAC - BCWP) / ETC  (cumulative)
+    """
+    periods = list(summary.index)
+    out = pd.DataFrame(index=[
+        "SPI","CPI","SV","SV%","CV","CV%","BAC","EAC","VAC","VAC%","BCWR","ETC","TCPI"
+    ], columns=periods, dtype=float)
 
-TOP_TERMS_PER_TOPIC = 20
-SHOW_DOC_PREVIEW    = 10
+    # Per-period metrics
+    for p in periods:
+        acwp = summary.loc[p,"ACWP"]
+        bcwp = summary.loc[p,"BCWP"]
+        bcws = summary.loc[p,"BCWS"]
+        etc  = summary.loc[p,"ETC"]
 
+        spi = safe_div(bcwp, bcws)
+        cpi = safe_div(bcwp, acwp)
+        sv  = bcwp - bcws
+        svp = np.nan if np.isclose(bcws,0) else (sv / bcws) * 100.0
+        cv  = bcwp - acwp
+        cvp = np.nan if np.isclose(bcwp,0) else (cv / bcwp) * 100.0
 
-# ==============================
-# Build documents
-# ==============================
-RAW = pd.read_csv(INPUT_PATH)
-RAW["token"] = RAW["token"].fillna("").astype(str)
+        out.loc["SPI", p] = spi
+        out.loc["CPI", p] = cpi
+        out.loc["SV",  p] = sv
+        out.loc["SV%", p] = svp
+        out.loc["CV",  p] = cv
+        out.loc["CV%", p] = cvp
 
-sentences = (
-    RAW.sort_values(["did", "sentence_beg", "place"])
-       .groupby(["did", "sentence_beg", "sentence_end"])
-       .agg({"token": lambda s: " ".join(s)})
-       .reset_index()
-)
+    # Cumulative-only metrics (BAC, EAC, VAC, VAC%, BCWR, ETC, TCPI)
+    cum = summary.loc["Cumulative"]
+    BAC  = cum["BCWS"]
+    EAC  = cum["ACWP"] + cum["ETC"]
+    VAC  = BAC - EAC
+    VACp = np.nan if np.isclose(BAC,0) else (VAC / BAC) * 100.0
+    BCWR = cum["BCWS"] - cum["BCWP"]
+    TCPI = np.nan if np.isclose(cum["ETC"],0) else (BAC - cum["BCWP"]) / cum["ETC"]
 
-docs_df = (
-    sentences.groupby("did")["token"]
-             .apply(lambda s: " ".join(s))
-             .reset_index()
-             .rename(columns={"token": TEXT_COL})
-)
+    out.loc["BAC","Cumulative"]  = BAC
+    out.loc["EAC","Cumulative"]  = EAC
+    out.loc["VAC","Cumulative"]  = VAC
+    out.loc["VAC%","Cumulative"] = VACp
+    out.loc["BCWR","Cumulative"] = BCWR
+    out.loc["ETC","Cumulative"]  = cum["ETC"]
+    out.loc["TCPI","Cumulative"] = TCPI
 
-docs = docs_df[TEXT_COL].astype(str).fillna("")
+    # Nice rounding for a copy you can paste
+    rounded = out.copy()
+    ratio_cols = ["SPI","CPI","TCPI"]
+    pct_cols   = ["SV%","CV%","VAC%"]
+    rounded.loc[ratio_cols] = rounded.loc[ratio_cols].round(2)
+    rounded.loc[pct_cols]   = rounded.loc[pct_cols].round(1)
+    # Hours-based quantities: integers look nicer for slides
+    for r in ["SV","CV","BAC","EAC","VAC","BCWR","ETC"]:
+        rounded.loc[r] = rounded.loc[r].round(0)
 
+    return out, rounded
 
-# ==============================
-# TF-IDF
-# ==============================
-tfidf = TfidfVectorizer(
-    lowercase=LOWERCASE,
-    stop_words=STOP_WORDS,
-    ngram_range=NGRAM_RANGE,
-    min_df=MIN_DF,
-    max_features=MAX_FEATURES,
-    norm="l2",
-)
-X = tfidf.fit_transform(docs)
-terms = np.array(tfidf.get_feature_names_out())
+def make_slide_table(summary: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build the PPT 'Labor Hours Performance' block (single total row):
+      %COMP, BAC, EAC, VAC   (all in K hours except %COMP)
+    """
+    cum = summary.loc["Cumulative"]
+    BAC = cum["BCWS"]
+    EAC = cum["ACWP"] + cum["ETC"]
+    VAC = BAC - EAC
+    pct_comp = np.nan if np.isclose(BAC,0) else (cum["BCWP"] / BAC) * 100.0
 
+    def K(x):  # thousands with one decimal
+        return np.nan if pd.isna(x) else round(x / 1000.0, 1)
 
-# ==============================
-# Score NMF model using cosine silhouette on normalized doc-topic (W)
-# ==============================
-def nmf_fit_score(K: int):
-    nmf = NMF(
-        n_components=K,
-        init="nndsvd",
-        random_state=RANDOM_STATE,
-        max_iter=MAX_ITER,
-        alpha_W=0.0,
-        alpha_H=0.0,
-        l1_ratio=0.0,
+    slide = pd.DataFrame(
+        {
+            "%COMP": [round(pct_comp, 0)],
+            "BAC (K)": [K(BAC)],
+            "EAC (K)": [K(EAC)],
+            "VAC (K)": [K(VAC)],
+        },
+        index=[f"{PROGRAM} Total"]
     )
-    W = nmf.fit_transform(X)  # (n_docs, K)
-    H = nmf.components_       # (K, n_terms)
+    return slide
 
-    # normalize W for cosine distances; label each doc by strongest topic
-    Wn = normalize(W, norm="l2", axis=1)
-    labels = Wn.argmax(axis=1)
+# ---- LOAD & RUN --------------------------------------------------------------
+# Anchor date
+anchor = (ANCHOR_DATE if isinstance(ANCHOR_DATE, datetime) else datetime.now()).replace(hour=0, minute=0, second=0, microsecond=0)
 
-    # silhouette sample if needed
-    n = Wn.shape[0]
-    if n > SAMPLE_FOR_SIL:
-        rng = np.random.default_rng(RANDOM_STATE)
-        idx = rng.choice(n, size=SAMPLE_FOR_SIL, replace=False)
-        Ws, ys = Wn[idx], labels[idx]
-    else:
-        Ws, ys = Wn, labels
+# Load exactly as-is (no renames)
+xl = pd.ExcelFile(DATA_PATH)
+weekly = xl.parse(SHEET_NAME)
+weekly["DATE"] = as_dt(weekly["DATE"])
 
-    sil = float("nan")
-    if len(np.unique(ys)) >= 2:
-        sil = float(silhouette_score(Ws, ys, metric="cosine"))
+# Build period summaries and metrics
+summary, close_date = make_summary_tables(weekly, anchor)
+metrics_raw, metrics_rounded = make_metrics(summary)
+slide_table = make_slide_table(summary)
 
-    # cluster size stats
-    counts = list(Counter(labels).values())
-    mean_sz = float(np.mean(counts))
-    med_sz  = float(np.median(counts))
-    pct_tiny = float(sum(c <= (0.05 * len(labels)) for c in counts) / max(1, len(counts)))
+# Optional: quick exports for pasting into PPT/Excel
+# (Uncomment if you want files written.)
+# with pd.ExcelWriter(f"EMS_{PROGRAM}_{anchor:%Y-%m-%d}.xlsx", engine="xlsxwriter") as xw:
+#     summary.to_excel(xw, sheet_name="Summary_Totals")
+#     metrics_rounded.to_excel(xw, sheet_name="Metrics_Table")
+#     slide_table.to_excel(xw, sheet_name="Slide_Table")
 
-    return nmf, W, H, sil, mean_sz, med_sz, pct_tiny, labels
+# Display at the end of the cell so you can copy/paste directly from the notebook
+print(f"Anchor Date: {anchor:%Y-%m-%d}  |  Prior Close: {close_date:%Y-%m-%d}")
+print("\n=== SUMMARY TOTALS (HOURS) ===")
+display(summary)
 
+print("\n=== METRICS TABLE (rounded; paste to slide if desired) ===")
+display(metrics_rounded)
 
-# ==============================
-# Grid search over K
-# ==============================
-rows   = []
-models = {}
-
-for K in K_GRID:
-    nmf, W, H, sil, mean_sz, med_sz, pct_tiny, labels = nmf_fit_score(K)
-    rows.append({
-        "K": K,
-        "silhouette_cosine(sampled)": round(sil, 4),
-        "mean_cluster_size": round(mean_sz, 1),
-        "median_cluster_size": round(med_sz, 1),
-        "pct_tiny_topics(<=5%docs)": round(pct_tiny, 4),
-    })
-    models[K] = (nmf, W, H, labels)
-
-tuning_summary = pd.DataFrame(rows).sort_values("silhouette_cosine(sampled)", ascending=False).reset_index(drop=True)
-
-print("\nNMF tuning summary:")
-display(tuning_summary)
-
-best_K = int(tuning_summary.loc[0, "K"])
-nmf, W, H, labels = models[best_K]
-Wn = normalize(W, norm="l2", axis=1)
-
-
-# ==============================
-# Select top terms per topic
-# (NEW) Filter to important_words for display
-# ==============================
-# vectorized mask of allowed vocab
-allowed_mask = np.array([t.lower() in important_words for t in terms])
-
-top_terms = []
-for k in range(best_K):
-    order = np.argsort(H[k])[::-1]             # strongest -> weakest
-    # keep only important words
-    filtered = [i for i in order if allowed_mask[i]]
-    # if none match, keep empty list (only important words should be shown)
-    chosen_idx = filtered[:TOP_TERMS_PER_TOPIC]
-    chosen_terms = terms[chosen_idx] if len(chosen_idx) else []
-    top_terms.append(list(chosen_terms))
-
-topic_df = pd.DataFrame({
-    "topic":     [f"Topic {i:02d}" for i in range(best_K)],
-    "top_terms": [", ".join(tt) if len(tt) else "(no important terms)" for tt in top_terms],
-})
-
-
-# ==============================
-# Document assignments
-# ==============================
-docs_df["topic"] = labels
-docs_df["topic_prob"] = W.max(axis=1)
-docs_preview = docs_df[["did", TEXT_COL, "topic", "topic_prob"]].head(SHOW_DOC_PREVIEW)
-
-print("\nTop terms per topic:")
-display(topic_df.head(10))
-
-print("\nSample of document assignments:")
-display(docs_preview)
-
-RESULTS = {
-    "tuning_summary": tuning_summary,
-    "best_K": best_K,
-    "topic_df": topic_df,
-    "docs_df": docs_df,
-    "W": W, "Wn": Wn, "H": H, "terms": terms, "labels": labels,
-}
+print("\n=== SLIDE TABLE (Table 1: Labor Hours Performance) ===")
+display(slide_table)
+# ===== end cell =====
