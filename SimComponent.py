@@ -1,82 +1,75 @@
-# app.py
-# Streamlit dashboard for precomputed DataFrames:
-# grouped_cum, grouped_4wk, grouped_status, summary, rounded
+# evms_dashboard.py
+# Assumes these DataFrames already exist in memory:
+#   grouped_cum, grouped_4wk, grouped_status, summary, rounded
 
-import streamlit as st
 import pandas as pd
-
-st.set_page_config(page_title="EVMS Tables", layout="wide")
+import streamlit as st
 
 def split_rounded(df: pd.DataFrame):
-    """Split rounded into multi-period rows and cumulative-only rows."""
-    r = df.copy()
-
-    # If "Missing value" strings exist, treat them as NaN
-    r = r.replace("Missing value", pd.NA)
-
-    # Coerce to numeric for robust missingness checks
-    for c in r.columns:
-        r[c] = pd.to_numeric(r[c], errors="coerce")
-
-    # Identify the cumulative column by name (fallback = first col)
-    cum_col = next((c for c in r.columns if "cum" in c.lower()), r.columns[0])
+    r = df.copy().replace("Missing value", pd.NA)
+    # find the cumulative column by name; fall back to first column
+    cum_candidates = [c for c in r.columns if "cum" in c.lower()]
+    cum_col = cum_candidates[0] if cum_candidates else r.columns[0]
     other_cols = [c for c in r.columns if c != cum_col]
 
-    cumulative_only = r[r[other_cols].isna().all(axis=1) & r[cum_col].notna()]
-    multi_period   = r.drop(index=cumulative_only.index)
+    # coerce to numeric to detect real missingness
+    for c in other_cols:
+        r[c] = pd.to_numeric(r[c], errors="coerce")
 
-    # Keep original order of rows
-    cumulative_only = df.loc[cumulative_only.index, [cum_col]]
-    multi_period    = df.loc[multi_period.index, df.columns.tolist()]
-
+    mask_cum_only = r[other_cols].isna().all(axis=1) & r[cum_col].notna()
+    cumulative_only = df.loc[mask_cum_only, [cum_col]]
+    multi_period = df.loc[~mask_cum_only, df.columns]
     return multi_period, cumulative_only, cum_col
 
-def add_download(df: pd.DataFrame, label: str, filename: str):
-    csv = df.to_csv(index=True).encode("utf-8")
-    st.download_button(f"Download {label} CSV", csv, file_name=filename, mime="text/csv")
+def app():
+    st.set_page_config(page_title="EVMS Tables", layout="wide")
+    st.title("EVMS Status Dashboard")
 
-st.title("EVMS Status Dashboard")
+    col1, col2 = st.columns([1, 1.25])
+    with col1:
+        st.subheader("Summary")
+        st.dataframe(summary, width="stretch")
 
-# ---------- Top: Summary & Rounded ----------
-left, right = st.columns([1, 1.25])
+    with col2:
+        st.subheader("Key Metrics (Rounded)")
+        multi, cum_only, cum_col = split_rounded(rounded)
+        if not multi.empty:
+            st.caption("Across Periods")
+            st.dataframe(multi, width="stretch")
+        if not cum_only.empty:
+            st.caption(f"Cumulative-Only ({cum_col})")
+            st.dataframe(cum_only, width="stretch")
 
-with left:
-    st.subheader("Summary")
-    st.dataframe(summary, use_container_width=True)
-    add_download(summary, "Summary", "summary.csv")
+    st.markdown("---")
+    st.header("Detailed Tables")
+    tab1, tab2, tab3, tab4 = st.tabs(["Cumulative", "Last 4 Weeks", "Status Period", "Rounded (raw)"])
+    with tab1:
+        st.dataframe(grouped_cum, width="stretch")
+    with tab2:
+        st.dataframe(grouped_4wk, width="stretch")
+    with tab3:
+        st.dataframe(grouped_status, width="stretch")
+    with tab4:
+        st.dataframe(rounded, width="stretch")
 
-with right:
-    st.subheader("Key Metrics (Rounded)")
-    multi_period, cumulative_only, cum_col = split_rounded(rounded)
+if __name__ == "__main__":
+    # If not under Streamlit, render a notebook-friendly preview without warnings.
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        in_streamlit = get_script_run_ctx() is not None
+    except Exception:
+        in_streamlit = False
 
-    if not multi_period.empty:
-        st.caption("Across Periods")
-        st.dataframe(multi_period, use_container_width=True)
-        add_download(multi_period, "Rounded (across periods)", "rounded_across_periods.csv")
-
-    if not cumulative_only.empty:
-        st.caption(f"Cumulative-Only Metrics (column: {cum_col})")
-        st.dataframe(cumulative_only, use_container_width=True)
-        add_download(cumulative_only, "Rounded (cumulative-only)", "rounded_cumulative_only.csv")
-
-st.markdown("---")
-
-# ---------- Detailed Tables ----------
-st.header("Detailed Tables")
-tab1, tab2, tab3, tab4 = st.tabs(["Cumulative", "Last 4 Weeks", "Status Period", "Rounded (raw)"])
-
-with tab1:
-    st.dataframe(grouped_cum, use_container_width=True)
-    add_download(grouped_cum, "Cumulative", "grouped_cumulative.csv")
-
-with tab2:
-    st.dataframe(grouped_4wk, use_container_width=True)
-    add_download(grouped_4wk, "Last 4 Weeks", "grouped_last_4_weeks.csv")
-
-with tab3:
-    st.dataframe(grouped_status, use_container_width=True)
-    add_download(grouped_status, "Status Period", "grouped_status_period.csv")
-
-with tab4:
-    st.dataframe(rounded, use_container_width=True)
-    add_download(rounded, "Rounded (raw)", "rounded_raw.csv")
+    if in_streamlit:
+        app()
+    else:
+        from IPython.display import display, HTML
+        display(HTML("<h2>EVMS Status Dashboard (Notebook Preview)</h2>"))
+        display(HTML("<h3>Summary</h3>")); display(summary)
+        multi, cum_only, cum_col = split_rounded(rounded)
+        display(HTML("<h3>Rounded — Across Periods</h3>")); display(multi)
+        display(HTML(f"<h3>Rounded — Cumulative-Only ({cum_col})</h3>")); display(cum_only)
+        display(HTML("<hr/><h3>Cumulative</h3>")); display(grouped_cum)
+        display(HTML("<h3>Last 4 Weeks</h3>")); display(grouped_4wk)
+        display(HTML("<h3>Status Period</h3>")); display(grouped_status)
+        display(HTML("<h3>Rounded (raw)</h3>")); display(rounded)
