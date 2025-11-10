@@ -1,202 +1,145 @@
-# ===== EVMS / EMS METRICS PIPELINE (single cell) =====
+# ===== EVMS Tables for PPT (single cell) =====================================
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime
 
-# ---- USER SETTINGS -----------------------------------------------------------
-DATA_PATH   = "data/Cobra-XM30.xlsx"          # <-- your file
-SHEET_NAME  = "tbl_Weekly Extract"            # <-- your sheet
-PROGRAM     = "XM30"                          # label only (optional)
-ANCHOR_DATE = None                             # None = today, or set e.g. datetime(2025, 10, 15)
+# ------------------ SETTINGS --------------------------------------------------
+DATA_PATH  = "data/Cobra-XM30.xlsx"         # your file
+SHEET_NAME = "tbl_Weekly Extract"           # your sheet
+GROUP_COL  = "CHG#"                          # team column in your data (e.g., "CHG#" or "RESP_DEPT")
+PROGRAM    = "XM30"                          # label only
+ANCHOR     = datetime.now()                  # or set datetime(2025,10,15)
 
-# Company accounting month-end close days (month, day)
-ACCOUNTING_CLOSE_MD = [
-    (1, 26), (2, 23), (3, 30), (4, 27), (5, 25), (6, 29),
-    (7, 27), (8, 24), (9, 28), (10, 26), (11, 23), (12, 31)
-]
+# ------------------ HELPERS ---------------------------------------------------
+def to_dt(s): return pd.to_datetime(s, errors="coerce")
 
-# ---- HELPERS -----------------------------------------------------------------
-def as_dt(x):
-    return pd.to_datetime(x, errors="coerce")
+def safe_ratio(num, den):
+    num = num.astype(float)
+    den = den.astype(float)
+    out = num / den.replace({0: np.nan})
+    return out
 
-def prior_accounting_close(anchor: datetime) -> datetime:
-    """Return the most recent accounting close date <= anchor."""
-    candidates = []
-    for y in (anchor.year - 1, anchor.year):
-        for m, d in ACCOUNTING_CLOSE_MD:
-            try:
-                dt = datetime(y, m, d)
-                if dt <= anchor:
-                    candidates.append(dt)
-            except ValueError:
-                pass
-    if not candidates:
-        # Fallback far past date if nothing matched
-        return datetime(anchor.year - 1, 1, 1)
-    return max(candidates)
+def totals_by_group(df, start=None, end=None):
+    """Sum HOURS by GROUP_COL and COST-SET for a date window."""
+    m = pd.Series(True, index=df.index)
+    if start is not None: m &= df["DATE"] >= pd.Timestamp(start)
+    if end   is not None: m &= df["DATE"] <= pd.Timestamp(end)
 
-def safe_div(a, b):
-    """Elementwise a/b with 0 -> NaN."""
-    a = float(a)
-    b = float(b)
-    return np.nan if np.isclose(b, 0.0) else a / b
+    g = (df.loc[m]
+           .groupby([GROUP_COL, "COST-SET"], dropna=False)["HOURS"]
+           .sum()
+           .unstack(fill_value=0.0))
 
-def period_totals(df: pd.DataFrame, start=None, end=None) -> pd.Series:
-    """
-    Sum HOURS by COST-SET for a filtered period.
-    Returns Series with index ['ACWP','BCWP','BCWS','ETC'] (0.0 if missing).
-    """
-    mask = pd.Series(True, index=df.index)
-    if start is not None:
-        mask &= df["DATE"] >= pd.Timestamp(start)
-    if end is not None:
-        mask &= df["DATE"] <= pd.Timestamp(end)
+    # guarantee missing COST-SET columns exist as 0.0
+    for k in ["ACWP", "BCWP", "BCWS", "ETC"]:
+        if k not in g.columns: g[k] = 0.0
+    return g[["ACWP","BCWP","BCWS","ETC"]].astype(float)
 
-    s = (df.loc[mask]
-          .groupby("COST-SET", dropna=False)["HOURS"]
-          .sum(min_count=1))
-    return s.reindex(["ACWP","BCWP","BCWS","ETC"]).fillna(0.0)
+def totals_all(df, start=None, end=None):
+    """Totals across ALL teams for a window (returns a 1-row DataFrame)."""
+    t = totals_by_group(df, start, end).sum(axis=0).to_frame().T
+    t.index = ["TOTAL"]
+    return t
 
-def make_summary_tables(df: pd.DataFrame, anchor: datetime):
-    """Build Cumulative, Last 4 Weeks, and Status Period totals (ACWP/BCWP/BCWS/ETC)."""
-    four_weeks_ago = anchor - timedelta(weeks=4)
-    close_date = prior_accounting_close(anchor)
+def add_total_row(table, compute_pct=None):
+    """Append a TOTAL row. If compute_pct is provided, recompute that column as ratio of sums."""
+    tbl = table.copy()
+    sums = tbl.drop(index=["TOTAL"], errors="ignore").sum(numeric_only=True)
+    total = sums.to_frame().T
+    total.index = ["TOTAL"]
+    tbl = pd.concat([tbl.drop(index=["TOTAL"], errors="ignore"), total], axis=0)
+    if compute_pct:
+        num, den, col = compute_pct
+        n = tbl.at["TOTAL", num]
+        d = tbl.at["TOTAL", den]
+        tbl.at["TOTAL", col] = np.nan if pd.isna(d) or d == 0 else round((n / d) * 100, 0)
+    return tbl
 
-    totals = {
-        "Cumulative":    period_totals(df),
-        "Last 4 Weeks":  period_totals(df, start=four_weeks_ago, end=anchor),
-        "Status Period": period_totals(df, start=close_date + timedelta(days=0), end=anchor)
-        # If you want strictly after close, use + timedelta(days=1)
-    }
-    summary = pd.DataFrame(totals).T[["ACWP","BCWP","BCWS","ETC"]].astype(float)
-    return summary, close_date
-
-def make_metrics(summary: pd.DataFrame) -> pd.DataFrame:
-    """
-    Build EVMS metrics for each period (rows = metrics, cols = periods).
-    - SPI = BCWP / BCWS
-    - CPI = BCWP / ACWP
-    - SV  = BCWP - BCWS
-    - SV% = SV / BCWS * 100
-    - CV  = BCWP - ACWP
-    - CV% = CV / BCWP * 100
-    - BAC = BCWS (cumulative)
-    - EAC = ACWP (cumulative) + ETC (cumulative)
-    - VAC = BAC - EAC
-    - VAC% = VAC / BAC * 100
-    - BCWR = BCWS - BCWP  (cumulative)
-    - ETC  = ETC (cumulative)
-    - TCPI = (BAC - BCWP) / ETC  (cumulative)
-    """
-    periods = list(summary.index)
-    out = pd.DataFrame(index=[
-        "SPI","CPI","SV","SV%","CV","CV%","BAC","EAC","VAC","VAC%","BCWR","ETC","TCPI"
-    ], columns=periods, dtype=float)
-
-    # Per-period metrics
-    for p in periods:
-        acwp = summary.loc[p,"ACWP"]
-        bcwp = summary.loc[p,"BCWP"]
-        bcws = summary.loc[p,"BCWS"]
-        etc  = summary.loc[p,"ETC"]
-
-        spi = safe_div(bcwp, bcws)
-        cpi = safe_div(bcwp, acwp)
-        sv  = bcwp - bcws
-        svp = np.nan if np.isclose(bcws,0) else (sv / bcws) * 100.0
-        cv  = bcwp - acwp
-        cvp = np.nan if np.isclose(bcwp,0) else (cv / bcwp) * 100.0
-
-        out.loc["SPI", p] = spi
-        out.loc["CPI", p] = cpi
-        out.loc["SV",  p] = sv
-        out.loc["SV%", p] = svp
-        out.loc["CV",  p] = cv
-        out.loc["CV%", p] = cvp
-
-    # Cumulative-only metrics (BAC, EAC, VAC, VAC%, BCWR, ETC, TCPI)
-    cum = summary.loc["Cumulative"]
-    BAC  = cum["BCWS"]
-    EAC  = cum["ACWP"] + cum["ETC"]
-    VAC  = BAC - EAC
-    VACp = np.nan if np.isclose(BAC,0) else (VAC / BAC) * 100.0
-    BCWR = cum["BCWS"] - cum["BCWP"]
-    TCPI = np.nan if np.isclose(cum["ETC"],0) else (BAC - cum["BCWP"]) / cum["ETC"]
-
-    out.loc["BAC","Cumulative"]  = BAC
-    out.loc["EAC","Cumulative"]  = EAC
-    out.loc["VAC","Cumulative"]  = VAC
-    out.loc["VAC%","Cumulative"] = VACp
-    out.loc["BCWR","Cumulative"] = BCWR
-    out.loc["ETC","Cumulative"]  = cum["ETC"]
-    out.loc["TCPI","Cumulative"] = TCPI
-
-    # Nice rounding for a copy you can paste
-    rounded = out.copy()
-    ratio_cols = ["SPI","CPI","TCPI"]
-    pct_cols   = ["SV%","CV%","VAC%"]
-    rounded.loc[ratio_cols] = rounded.loc[ratio_cols].round(2)
-    rounded.loc[pct_cols]   = rounded.loc[pct_cols].round(1)
-    # Hours-based quantities: integers look nicer for slides
-    for r in ["SV","CV","BAC","EAC","VAC","BCWR","ETC"]:
-        rounded.loc[r] = rounded.loc[r].round(0)
-
-    return out, rounded
-
-def make_slide_table(summary: pd.DataFrame) -> pd.DataFrame:
-    """
-    Build the PPT 'Labor Hours Performance' block (single total row):
-      %COMP, BAC, EAC, VAC   (all in K hours except %COMP)
-    """
-    cum = summary.loc["Cumulative"]
-    BAC = cum["BCWS"]
-    EAC = cum["ACWP"] + cum["ETC"]
-    VAC = BAC - EAC
-    pct_comp = np.nan if np.isclose(BAC,0) else (cum["BCWP"] / BAC) * 100.0
-
-    def K(x):  # thousands with one decimal
-        return np.nan if pd.isna(x) else round(x / 1000.0, 1)
-
-    slide = pd.DataFrame(
-        {
-            "%COMP": [round(pct_comp, 0)],
-            "BAC (K)": [K(BAC)],
-            "EAC (K)": [K(EAC)],
-            "VAC (K)": [K(VAC)],
-        },
-        index=[f"{PROGRAM} Total"]
-    )
-    return slide
-
-# ---- LOAD & RUN --------------------------------------------------------------
-# Anchor date
-anchor = (ANCHOR_DATE if isinstance(ANCHOR_DATE, datetime) else datetime.now()).replace(hour=0, minute=0, second=0, microsecond=0)
-
-# Load exactly as-is (no renames)
+# ------------------ LOAD ------------------------------------------------------
 xl = pd.ExcelFile(DATA_PATH)
-weekly = xl.parse(SHEET_NAME)
-weekly["DATE"] = as_dt(weekly["DATE"])
+df = xl.parse(SHEET_NAME)
+df["DATE"] = to_dt(df["DATE"])
 
-# Build period summaries and metrics
-summary, close_date = make_summary_tables(weekly, anchor)
-metrics_raw, metrics_rounded = make_metrics(summary)
-slide_table = make_slide_table(summary)
+# Windows
+year_start = datetime(ANCHOR.year, 1, 1)
+# CTD = all data up to ANCHOR; YTD = from Jan 1 of ANCHOR.year to ANCHOR
+ctd = totals_by_group(df, end=ANCHOR)
+ytd = totals_by_group(df, start=year_start, end=ANCHOR)
+ctd_all = totals_all(df, end=ANCHOR).iloc[0]
+ytd_all = totals_all(df, start=year_start, end=ANCHOR).iloc[0]
 
-# Optional: quick exports for pasting into PPT/Excel
-# (Uncomment if you want files written.)
-# with pd.ExcelWriter(f"EMS_{PROGRAM}_{anchor:%Y-%m-%d}.xlsx", engine="xlsxwriter") as xw:
-#     summary.to_excel(xw, sheet_name="Summary_Totals")
-#     metrics_rounded.to_excel(xw, sheet_name="Metrics_Table")
-#     slide_table.to_excel(xw, sheet_name="Slide_Table")
+# ------------------ TABLE 1: LABOR HOURS PERFORMANCE -------------------------
+# %COMP = BCWP / BAC ;  BAC = BCWS ;  EAC = ACWP + ETC ;  VAC = BAC - EAC  (display in K hours)
+BAC  = ctd["BCWS"]
+EAC  = ctd["ACWP"] + ctd["ETC"]
+VAC  = BAC - EAC
+PCMP = safe_ratio(ctd["BCWP"], BAC) * 100
 
-# Display at the end of the cell so you can copy/paste directly from the notebook
-print(f"Anchor Date: {anchor:%Y-%m-%d}  |  Prior Close: {close_date:%Y-%m-%d}")
-print("\n=== SUMMARY TOTALS (HOURS) ===")
-display(summary)
+labor_tbl = pd.DataFrame({
+    "%COMP":  PCMP.round(0),
+    "BAC (K)": (BAC/1000.0).round(1),
+    "EAC (K)": (EAC/1000.0).round(1),
+    "VAC (K)": (VAC/1000.0).round(1),
+})
+labor_tbl.index.name = None
 
-print("\n=== METRICS TABLE (rounded; paste to slide if desired) ===")
-display(metrics_rounded)
+# Proper TOTAL row (recompute %COMP from totals, not average of rows)
+labor_tot_bac  = ctd_all["BCWS"]
+labor_tot_eac  = ctd_all["ACWP"] + ctd_all["ETC"]
+labor_tot_vac  = labor_tot_bac - labor_tot_eac
+labor_tot_pcmp = np.nan if labor_tot_bac == 0 else round((ctd_all["BCWP"] / labor_tot_bac) * 100, 0)
 
-print("\n=== SLIDE TABLE (Table 1: Labor Hours Performance) ===")
-display(slide_table)
-# ===== end cell =====
+labor_total_row = pd.DataFrame(
+    {"%COMP":[labor_tot_pcmp],
+     "BAC (K)":[round(labor_tot_bac/1000.0,1)],
+     "EAC (K)":[round(labor_tot_eac/1000.0,1)],
+     "VAC (K)":[round(labor_tot_vac/1000.0,1)]},
+    index=["TOTAL"]
+)
+labor_tbl = pd.concat([labor_tbl, labor_total_row])
+
+# ------------------ TABLE 2: COST PERFORMANCE (CPI: CTD & YTD) ---------------
+cpi_ctd = safe_ratio(ctd["BCWP"], ctd["ACWP"])
+cpi_ytd = safe_ratio(ytd["BCWP"], ytd["ACWP"])
+
+cost_tbl = pd.DataFrame({
+    "CTD": cpi_ctd.round(2),
+    "YTD": cpi_ytd.round(2),
+})
+# TOTAL row = ratio of sums, not average of team ratios
+tot_cpi_ctd = np.nan if ctd_all["ACWP"] == 0 else round(ctd_all["BCWP"]/ctd_all["ACWP"], 2)
+tot_cpi_ytd = np.nan if ytd_all["ACWP"] == 0 else round(ytd_all["BCWP"]/ytd_all["ACWP"], 2)
+cost_tbl.loc["TOTAL"] = [tot_cpi_ctd, tot_cpi_ytd]
+cost_tbl.index.name = None
+
+# ------------------ TABLE 3: SCHEDULE PERFORMANCE (SPI: CTD & YTD) -----------
+spi_ctd = safe_ratio(ctd["BCWP"], ctd["BCWS"])
+spi_ytd = safe_ratio(ytd["BCWP"], ytd["BCWS"])
+
+sched_tbl = pd.DataFrame({
+    "CTD": spi_ctd.round(2),
+    "YTD": spi_ytd.round(2),
+})
+tot_spi_ctd = np.nan if ctd_all["BCWS"] == 0 else round(ctd_all["BCWP"]/ctd_all["BCWS"], 2)
+tot_spi_ytd = np.nan if ytd_all["BCWS"] == 0 else round(ytd_all["BCWP"]/ytd_all["BCWS"], 2)
+sched_tbl.loc["TOTAL"] = [tot_spi_ctd, tot_spi_ytd]
+sched_tbl.index.name = None
+
+# ------------------ SHOW / EXPORT -------------------------------------------
+print(f"{PROGRAM}  |  Anchor: {ANCHOR:%Y-%m-%d}  |  YTD from: {year_start:%Y-%m-%d}")
+
+print("\n=== Labor Hours Performance (paste into PPT) ===")
+display(labor_tbl)
+
+print("\n=== Cost Performance (CPI: CTD, YTD) ===")
+display(cost_tbl)
+
+print("\n=== Schedule Performance (SPI: CTD, YTD) ===")
+display(sched_tbl)
+
+# Optional Excel for easy copy/paste:
+# with pd.ExcelWriter(f"EVMS_{PROGRAM}_{ANCHOR:%Y-%m-%d}.xlsx") as xw:
+#     labor_tbl.to_excel(xw, sheet_name="Labor_Hours_Perf")
+#     cost_tbl.to_excel(xw, sheet_name="Cost_Perf_CPI")
+#     sched_tbl.to_excel(xw, sheet_name="Schedule_Perf_SPI")
+# =============================================================================
