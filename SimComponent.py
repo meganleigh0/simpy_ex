@@ -2,61 +2,84 @@ import os
 import pandas as pd
 
 # ------------------------------
-# CONFIG: set these for each run
+# CONFIG
 # ------------------------------
 PROGRAM_ID    = "XM30"
 SNAPSHOT_DATE = "2025-11-13"   # or use date.today().strftime("%Y-%m-%d")
 
+outdir = "pbi_exports"
+os.makedirs(outdir, exist_ok=True)
+filename = f"{PROGRAM_ID}_{SNAPSHOT_DATE}.xlsx"
+filepath = os.path.join(outdir, filename)
+
 # ------------------------------
-# Helper to ensure SUB_TEAM is a column
+# HELPERS
 # ------------------------------
-def ensure_subteam_column(df, index_name="SUB_TEAM"):
+
+def ensure_subteam_column(df):
     """
-    Returns a copy of df where SUB_TEAM is a normal column.
-    Handles the case where SUB_TEAM is currently the index.
+    Ensure SUB_TEAM is a real column and is the FIRST column.
+    Handles cases where SUB_TEAM is the index or missing.
     """
     if df is None:
         return None
 
     df = df.copy()
 
-    # If SUB_TEAM is the index name, reset it to a column
-    if df.index.name == index_name:
-        df.reset_index(inplace=True)
-    # If SUB_TEAM is part of a MultiIndex, also reset
-    elif index_name in (df.index.names or []):
-        df.reset_index(inplace=True)
+    # If no SUB_TEAM column, but index seems to be subteam codes, use index
+    if "SUB_TEAM" not in df.columns:
+        # take index values as SUB_TEAM
+        subteam = df.index.astype(str)
+        df.insert(0, "SUB_TEAM", subteam)
+    else:
+        # make sure it's first column
+        cols = ["SUB_TEAM"] + [c for c in df.columns if c != "SUB_TEAM"]
+        df = df[cols]
 
-    # If after this there is still no SUB_TEAM column, but there is an 'index' column,
-    # rename it as a last resort
-    if index_name not in df.columns and "index" in df.columns:
-        df.rename(columns={"index": index_name}, inplace=True)
+    # reset index so it doesn't appear in Excel
+    df.reset_index(drop=True, inplace=True)
+    return df
 
+
+def ensure_metric_column(df, metric_col_name="METRIC"):
+    """
+    Ensure a METRIC column exists (for SPI/CPI) and is the FIRST column.
+    Assumes index currently holds the metric names (SPI, CPI).
+    """
+    if df is None:
+        return None
+
+    df = df.copy()
+
+    if metric_col_name not in df.columns:
+        metric_vals = df.index.astype(str)
+        df.insert(0, metric_col_name, metric_vals)
+    else:
+        cols = [metric_col_name] + [c for c in df.columns if c != metric_col_name]
+        df = df[cols]
+
+    df.reset_index(drop=True, inplace=True)
     return df
 
 # ------------------------------
-# Export all tables to ONE Excel file
+# EXPORT
 # ------------------------------
-outdir = "pbi_exports"
-os.makedirs(outdir, exist_ok=True)
-
-filename = f"{PROGRAM_ID}_{SNAPSHOT_DATE}.xlsx"
-filepath = os.path.join(outdir, filename)
 
 with pd.ExcelWriter(filepath, engine="openpyxl") as writer:
-    # Cost Performance
+
+    # Cost Performance (CPI)
     if "cost_performance_tbl" in globals():
         df_cost = ensure_subteam_column(cost_performance_tbl)
         df_cost.to_excel(writer, sheet_name="cost_performance", index=False)
 
-    # Schedule Performance
+    # Schedule Performance (SPI)
     if "schedule_performance_tbl" in globals():
         df_sched = ensure_subteam_column(schedule_performance_tbl)
         df_sched.to_excel(writer, sheet_name="schedule_performance", index=False)
 
-    # EVMS Metrics
+    # EVMS Metrics (SPI/CPI rows)
     if "evms_metrics_tbl" in globals():
-        df_evms = ensure_subteam_column(evms_metrics_tbl)
+        df_evms = ensure_metric_column(evms_metrics_tbl, metric_col_name="METRIC")
         df_evms.to_excel(writer, sheet_name="evms_metrics", index=False)
 
     # Labor Hours
@@ -69,7 +92,7 @@ with pd.ExcelWriter(filepath, engine="openpyxl") as writer:
         df_labor_m = ensure_subteam_column(labor_monthly_tbl)
         df_labor_m.to_excel(writer, sheet_name="labor_monthly", index=False)
 
-    # Optional metadata sheet
+    # Optional meta sheet
     meta = pd.DataFrame({
         "Program": [PROGRAM_ID],
         "SnapshotDate": [SNAPSHOT_DATE]
