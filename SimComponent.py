@@ -5,113 +5,98 @@ import pandas as pd
 from pptx import Presentation
 from pptx.util import Inches
 from pptx.dml.color import RGBColor
+from IPython.display import display
 
-# -----------------------------------------------------------
-# Exact Palette
-# -----------------------------------------------------------
-HEX_COLORS = {
-    "BLUE":   "#B4E3F6",
-    "GREEN":  "#339966",
-    "YELLOW": "#FFFF99",
-    "RED":    "#CC5040",
-}
+# -------------------------------------------------------------------
+# ***** KEEP YOUR EXISTING COLOR FUNCTIONS AS-IS *****
+# This assumes you already have:
+#   HEX_COLORS
+#   get_color_style(...)
+#   color_spi_cpi_exact(...)
+#   color_vacbac_exact(...)
+# defined above in the notebook (the same ones you used for Excel).
+# -------------------------------------------------------------------
 
-# -----------------------------------------------------------
-# Threshold Color Functions
-# -----------------------------------------------------------
-def get_color_style(value, thresholds, colors, text_colors):
-    if value is None or (isinstance(value, float) and np.isnan(value)):
-        return ""
-    try:
-        v = float(value)
-    except:
-        return ""
-    for t, c, txt in zip(thresholds, colors, text_colors):
-        if v >= t:
-            return f"background-color:{c};color:{txt}"
-    return f"background-color:{colors[-1]};color:{text_colors[-1]}"
+# ---------- helpers for PowerPoint colors ----------
 
-def color_spi_cpi_exact(v):
-    thresholds = [1.05, 1.02, 0.98, 0.95]
-    colors     = [HEX_COLORS["BLUE"], HEX_COLORS["GREEN"], HEX_COLORS["YELLOW"], HEX_COLORS["RED"], HEX_COLORS["RED"]]
-    text       = ["#000000", "#000000", "#000000", "#FFFFFF", "#FFFFFF"]
-    return get_color_style(v, thresholds, colors, text)
-
-def color_vacbac_exact(v):
-    thresholds = [0.05, 0.02, -0.02, -0.05]
-    colors     = [HEX_COLORS["BLUE"], HEX_COLORS["GREEN"], HEX_COLORS["YELLOW"], HEX_COLORS["RED"], HEX_COLORS["RED"]]
-    text       = ["#000000", "#000000", "#000000", "#FFFFFF", "#FFFFFF"]
-    return get_color_style(v, thresholds, colors, text)
-
-# -----------------------------------------------------------
-# Utilities
-# -----------------------------------------------------------
 def hex_to_rgb(hex_color):
+    """'#RRGGBB' -> (R, G, B) tuple."""
     if not hex_color:
         return None
     h = hex_color.lstrip("#")
-    return tuple(int(h[i:i+2], 16) for i in (0,2,4))
+    if len(h) != 6:
+        return None
+    return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
 
-def parse_css(s):
-    """Extract background/text from CSS string."""
+
+def parse_css(style_str):
+    """
+    Parse 'background-color:#xxxxxx;color:#yyyyyy'
+    -> (bg_hex, text_hex)
+    """
     bg = txt = None
-    if not s:
+    if not style_str:
         return bg, txt
-    parts = s.split(";")
-    for p in parts:
-        if ":" not in p:
+
+    for part in style_str.split(";"):
+        if ":" not in part:
             continue
-        k,v = p.split(":",1)
-        k=k.strip(); v=v.strip()
-        if k=="background-color":
-            bg=v
-        elif k=="color":
-            txt=v
+        key, val = part.split(":", 1)
+        key = key.strip()
+        val = val.strip()
+        if key == "background-color":
+            bg = val
+        elif key == "color":
+            txt = val
     return bg, txt
 
-# -----------------------------------------------------------
-# PowerPoint Writer
-# -----------------------------------------------------------
-def add_table_slide(prs, df, title, fmt=None, style_fn=None):
+
+def add_df_slide(prs, title, df, fmt=None, cell_style=None):
+    """
+    Add a slide with a (slightly smaller) table.
+
+    cell_style(row, col_name, value) -> (bg_hex, text_hex)
+    """
     slide = prs.slides.add_slide(prs.slide_layouts[5])  # title only
     slide.shapes.title.text = title
 
-    rows = df.shape[0] + 1
-    cols = df.shape[1] + 1
+    rows = df.shape[0] + 1        # +1 for header
+    cols = df.shape[1] + 1        # +1 for index col
 
-    left = Inches(0.3)
-    top  = Inches(1.0)
-    width = prs.slide_width - Inches(0.6)
-    height = prs.slide_height - Inches(1.4)
+    # slightly smaller than full slide so it’s easy to see
+    left = Inches(1.0)
+    top = Inches(1.6)
+    width = prs.slide_width - Inches(2.0)
+    height = prs.slide_height - Inches(3.0)
 
     table = slide.shapes.add_table(rows, cols, left, top, width, height).table
 
-    # header
-    table.cell(0,0).text = df.index.name or ""
-    for j,c in enumerate(df.columns, start=1):
-        table.cell(0,j).text = str(c)
+    # header row
+    table.cell(0, 0).text = df.index.name or "SUB_TEAM"
+    for j, col in enumerate(df.columns, start=1):
+        table.cell(0, j).text = str(col)
 
-    # body
-    for i,(idx,row) in enumerate(df.iterrows(), start=1):
-        table.cell(i,0).text = str(idx)
+    # data rows
+    for i, (idx, row) in enumerate(df.iterrows(), start=1):
+        table.cell(i, 0).text = str(idx)
+        for j, col_name in enumerate(df.columns, start=1):
+            val = row[col_name]
 
-        for j,c in enumerate(df.columns, start=1):
-            val = row[c]
-
-            # format text
-            if fmt and c in fmt:
+            # text formatting
+            if fmt and col_name in fmt:
                 try:
-                    text = fmt[c].format(val)
-                except:
-                    text = "" if pd.isna(val) else str(val)
+                    text = fmt[col_name].format(val)
+                except Exception:
+                    text = "" if (val is None or (isinstance(val, float) and np.isnan(val))) else str(val)
             else:
-                text = "" if pd.isna(val) else str(val)
+                text = "" if (val is None or (isinstance(val, float) and np.isnan(val))) else str(val)
 
-            cell = table.cell(i,j)
+            cell = table.cell(i, j)
             cell.text = text
 
-            if style_fn:
-                bg_hex, txt_hex = style_fn(row,c,val)
+            # coloring
+            if cell_style is not None:
+                bg_hex, txt_hex = cell_style(row, col_name, val)
 
                 if bg_hex:
                     rgb = hex_to_rgb(bg_hex)
@@ -119,143 +104,182 @@ def add_table_slide(prs, df, title, fmt=None, style_fn=None):
                         cell.fill.solid()
                         cell.fill.fore_color.rgb = RGBColor(*rgb)
 
-                if txt_hex:
-                    rgb = hex_to_rgb(txt_hex)
-                    if rgb:
-                        p = cell.text_frame.paragraphs[0]
-                        r = p.runs[0]
-                        r.font.color.rgb = RGBColor(*rgb)
+                if txt_hex and cell.text_frame.paragraphs:
+                    for p in cell.text_frame.paragraphs:
+                        for run in p.runs:
+                            rgb_txt = hex_to_rgb(txt_hex)
+                            if rgb_txt:
+                                run.font.color.rgb = RGBColor(*rgb_txt)
 
-# -----------------------------------------------------------
-# Index Helper
-# -----------------------------------------------------------
-def set_index(df, col="SUB_TEAM"):
-    if col in df.columns:
+
+# ---------- dataframe helpers ----------
+
+def set_index(df, index_col="SUB_TEAM"):
+    """Ensure SUB_TEAM is the index if present."""
+    if index_col in df.columns:
         df = df.copy()
-        df.set_index(col, inplace=True)
+        df.set_index(index_col, inplace=True)
     return df
 
-# -----------------------------------------------------------
-# Begin Output
-# -----------------------------------------------------------
-os.makedirs("output", exist_ok=True)
-prs = Presentation()
 
-# -----------------------------------------------------------
-# Cost Performance
-# -----------------------------------------------------------
-if "cost_performance_tbl" in globals():
-    df = set_index(cost_performance_tbl)
-
-    def style_fn(row,c,val):
-        if c in ("CTD","YTD"):
-            return parse_css(color_spi_cpi_exact(val))
-        return (None,None)
-
-    add_table_slide(
-        prs, df, "Cost Performance (CPI)",
-        fmt={"CTD":"{:.2f}","YTD":"{:.2f}"},
-        style_fn=style_fn
-    )
-
-# -----------------------------------------------------------
-# Schedule Performance
-# -----------------------------------------------------------
-if "schedule_performance_tbl" in globals():
-    df = set_index(schedule_performance_tbl)
-
-    def style_fn(row,c,val):
-        if c in ("CTD","YTD"):
-            return parse_css(color_spi_cpi_exact(val))
-        return (None,None)
-
-    add_table_slide(
-        prs, df, "Schedule Performance (SPI)",
-        fmt={"CTD":"{:.2f}","YTD":"{:.2f}"},
-        style_fn=style_fn
-    )
-
-# -----------------------------------------------------------
-# EVMS Metrics (all cols SPI/CPI)
-# -----------------------------------------------------------
-if "evms_metrics_tbl" in globals():
-    df = set_index(evms_metrics_tbl)
-    cols = df.columns
-
-    def style_fn(row,c,val):
-        return parse_css(color_spi_cpi_exact(val))
-
-    add_table_slide(
-        prs, df, "EVMS Metrics",
-        fmt={c:"{:.2f}" for c in cols},
-        style_fn=style_fn
-    )
-
-# -----------------------------------------------------------
-# Labor Table - VAC/BAC logic
-# -----------------------------------------------------------
-def find_col(df, key):
-    key = key.upper()
+def find_col(df, startswith_text):
+    key = startswith_text.upper()
     for c in df.columns:
-        if str(c).upper().startswith(key):
+        if str(c).strip().upper().startswith(key):
             return c
     return None
 
-if "labor_tbl" in globals():
-    df = set_index(labor_tbl)
-    vac_col = find_col(df,"VAC")
-    bac_col = find_col(df,"BAC")
 
-    if vac_col and bac_col:
+def match_col(df, target):
+    """Match full text, ignoring spaces & case (for 'BAC/EAC', 'VAC/BAC')."""
+    t = target.replace(" ", "").upper()
+    for c in df.columns:
+        if str(c).replace(" ", "").upper() == t:
+            return c
+    return None
 
-        def style_fn(row,c,val):
-            if c == vac_col:
-                vac = pd.to_numeric(row[vac_col], errors="coerce")
-                bac = pd.to_numeric(row[bac_col], errors="coerce")
-                if pd.isna(vac) or pd.isna(bac) or bac==0:
-                    return (None,None)
-                ratio = vac / bac
-                return parse_css(color_vacbac_exact(ratio))
-            return (None,None)
 
-        add_table_slide(
-            prs, df, "Labor Hours (VAC/BAC)",
-            fmt={vac_col:"{:.2f}", bac_col:"{:.2f}"},
-            style_fn=style_fn
-        )
+# ---------- build the PowerPoint ----------
 
-# -----------------------------------------------------------
-# Monthly Labor Table (colors BOTH columns)
-# -----------------------------------------------------------
-if "labor_monthly_tbl" in globals():
-    df = set_index(labor_monthly_tbl)
+outdir = "output"
+os.makedirs(outdir, exist_ok=True)
+ppt_path = os.path.join(outdir, "evms_tables.pptx")
+prs = Presentation()
 
-    def match(df, text):
-        return next((c for c in df.columns if text.upper() in str(c).upper()), None)
+# ----- Cost Performance (CPI) -----
+if "cost_performance_tbl" in globals():
+    df = set_index(cost_performance_tbl)
 
-    bac_eac_col = match(df,"BAC/EAC")
-    vac_bac_col = match(df,"VAC/BAC")
+    # notebook display (optional)
+    sty = (
+        df.style
+        .format({"CTD": "{:.2f}", "YTD": "{:.2f}"})
+        .map(color_spi_cpi_exact, subset=["CTD", "YTD"])
+    )
+    display(sty)
 
-    def style_fn(row,c,val):
-        if c == bac_eac_col:
-            return parse_css(color_spi_cpi_exact(val))
-        if c == vac_bac_col:
-            return parse_css(color_vacbac_exact(val))
-        return (None,None)
+    def cpi_style(row, col_name, value):
+        if col_name in ("CTD", "YTD"):
+            return parse_css(color_spi_cpi_exact(value))
+        return (None, None)
 
-    fmt = {}
-    if bac_eac_col: fmt[bac_eac_col] = "{:.2f}"
-    if vac_bac_col: fmt[vac_bac_col] = "{:.2f}"
-
-    add_table_slide(
-        prs, df, "Monthly Labor Table",
-        fmt=fmt,
-        style_fn=style_fn
+    add_df_slide(
+        prs,
+        title="Cost Performance (CPI)",
+        df=df,
+        fmt={"CTD": "{:.2f}", "YTD": "{:.2f}"},
+        cell_style=cpi_style,
     )
 
-# -----------------------------------------------------------
-# Save PPTX
-# -----------------------------------------------------------
-pptx_path = "output/evms_styled_tables.pptx"
-prs.save(pptx_path)
-print("POWERPOINT CREATED →", pptx_path)
+# ----- Schedule Performance (SPI) -----
+if "schedule_performance_tbl" in globals():
+    df = set_index(schedule_performance_tbl)
+
+    sty = (
+        df.style
+        .format({"CTD": "{:.2f}", "YTD": "{:.2f}"})
+        .map(color_spi_cpi_exact, subset=["CTD", "YTD"])
+    )
+    display(sty)
+
+    def spi_style(row, col_name, value):
+        if col_name in ("CTD", "YTD"):
+            return parse_css(color_spi_cpi_exact(value))
+        return (None, None)
+
+    add_df_slide(
+        prs,
+        title="Schedule Performance (SPI)",
+        df=df,
+        fmt={"CTD": "{:.2f}", "YTD": "{:.2f}"},
+        cell_style=spi_style,
+    )
+
+# ----- EVMS Metrics (SPI/CPI rows) -----
+if "evms_metrics_tbl" in globals():
+    df = set_index(evms_metrics_tbl)
+    cols = list(df.columns)
+
+    sty = df.style.format({c: "{:.2f}" for c in cols}).map(color_spi_cpi_exact, subset=cols)
+    display(sty)
+
+    def evms_style(row, col_name, value):
+        if col_name in cols:
+            return parse_css(color_spi_cpi_exact(value))
+        return (None, None)
+
+    add_df_slide(
+        prs,
+        title="EVMS Metrics (SPI/CPI)",
+        df=df,
+        fmt={c: "{:.2f}" for c in cols},
+        cell_style=evms_style,
+    )
+
+# ----- Labor Hours table: color VAC by VAC/BAC -----
+if "labor_tbl" in globals():
+    df = set_index(labor_tbl)
+    vac_col = find_col(df, "VAC")
+    bac_col = find_col(df, "BAC")
+
+    if vac_col and bac_col:
+        def labor_style(row, col_name, value):
+            if col_name == vac_col:
+                vac = pd.to_numeric(row[vac_col], errors="coerce")
+                bac = pd.to_numeric(row[bac_col], errors="coerce")
+                if pd.isna(vac) or pd.isna(bac) or bac == 0:
+                    return (None, None)
+                ratio = vac / bac
+                return parse_css(color_vacbac_exact(ratio))
+            return (None, None)
+
+        # optional notebook view
+        def vac_style_df(df_):
+            css = pd.DataFrame("", index=df_.index, columns=df_.columns)
+            vac = pd.to_numeric(df_[vac_col], errors="coerce")
+            bac = pd.to_numeric(df_[bac_col], errors="coerce")
+            ratio = vac / bac.replace(0, np.nan)
+            css[vac_col] = ratio.apply(color_vacbac_exact).values
+            return css
+
+        display(df.style.apply(vac_style_df, axis=None))
+
+        add_df_slide(
+            prs,
+            title="Labor Hours (VAC/BAC)",
+            df=df,
+            cell_style=labor_style,
+        )
+    else:
+        print("[warn] Could not find VAC/BAC columns in labor_tbl")
+
+# ----- Monthly Labor table: color BAC/EAC with SPI/CPI thresholds, VAC/BAC with VAC thresholds -----
+if "labor_monthly_tbl" in globals():
+    df = set_index(labor_monthly_tbl)
+    bac_eac_col = match_col(df, "BAC/EAC")
+    vac_bac_col = match_col(df, "VAC/BAC")
+
+    def dual_style(row, col_name, value):
+        if bac_eac_col and col_name == bac_eac_col:
+            return parse_css(color_spi_cpi_exact(value))
+        if vac_bac_col and col_name == vac_bac_col:
+            return parse_css(color_vacbac_exact(value))
+        return (None, None)
+
+    fmt = {}
+    if bac_eac_col:
+        fmt[bac_eac_col] = "{:.2f}"
+    if vac_bac_col:
+        fmt[vac_bac_col] = "{:.2f}"
+
+    add_df_slide(
+        prs,
+        title="Monthly Labor Table",
+        df=df,
+        fmt=fmt,
+        cell_style=dual_style,
+    )
+
+# ----- save the PowerPoint -----
+prs.save(ppt_path)
+print(f"Saved PowerPoint to: {ppt_path}")
