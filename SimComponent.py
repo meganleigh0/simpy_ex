@@ -8,13 +8,11 @@ from pptx.dml.color import RGBColor
 from IPython.display import display
 
 # -------------------------------------------------------------------
-# ***** KEEP YOUR EXISTING COLOR FUNCTIONS AS-IS *****
-# This assumes you already have:
+# Assumes your existing color helpers are already defined ABOVE:
 #   HEX_COLORS
 #   get_color_style(...)
 #   color_spi_cpi_exact(...)
 #   color_vacbac_exact(...)
-# defined above in the notebook (the same ones you used for Excel).
 # -------------------------------------------------------------------
 
 # ---------- helpers for PowerPoint colors ----------
@@ -121,6 +119,12 @@ def set_index(df, index_col="SUB_TEAM"):
         df.set_index(index_col, inplace=True)
     return df
 
+def add_comment_col(df, col_name="COMMENT"):
+    """Add an empty COMMENT column if it isn't there already."""
+    if col_name not in df.columns:
+        df = df.copy()
+        df[col_name] = ""
+    return df
 
 def find_col(df, startswith_text):
     key = startswith_text.upper()
@@ -128,7 +132,6 @@ def find_col(df, startswith_text):
         if str(c).strip().upper().startswith(key):
             return c
     return None
-
 
 def match_col(df, target):
     """Match full text, ignoring spaces & case (for 'BAC/EAC', 'VAC/BAC')."""
@@ -149,8 +152,8 @@ prs = Presentation()
 # ----- Cost Performance (CPI) -----
 if "cost_performance_tbl" in globals():
     df = set_index(cost_performance_tbl)
+    df = add_comment_col(df)   # <<< add empty COMMENT column
 
-    # notebook display (optional)
     sty = (
         df.style
         .format({"CTD": "{:.2f}", "YTD": "{:.2f}"})
@@ -174,6 +177,7 @@ if "cost_performance_tbl" in globals():
 # ----- Schedule Performance (SPI) -----
 if "schedule_performance_tbl" in globals():
     df = set_index(schedule_performance_tbl)
+    df = add_comment_col(df)
 
     sty = (
         df.style
@@ -198,7 +202,8 @@ if "schedule_performance_tbl" in globals():
 # ----- EVMS Metrics (SPI/CPI rows) -----
 if "evms_metrics_tbl" in globals():
     df = set_index(evms_metrics_tbl)
-    cols = list(df.columns)
+    df = add_comment_col(df)
+    cols = [c for c in df.columns if c != "COMMENT"]
 
     sty = df.style.format({c: "{:.2f}" for c in cols}).map(color_spi_cpi_exact, subset=cols)
     display(sty)
@@ -219,6 +224,7 @@ if "evms_metrics_tbl" in globals():
 # ----- Labor Hours table: color VAC by VAC/BAC -----
 if "labor_tbl" in globals():
     df = set_index(labor_tbl)
+    df = add_comment_col(df)
     vac_col = find_col(df, "VAC")
     bac_col = find_col(df, "BAC")
 
@@ -253,9 +259,10 @@ if "labor_tbl" in globals():
     else:
         print("[warn] Could not find VAC/BAC columns in labor_tbl")
 
-# ----- Monthly Labor table: color BAC/EAC with SPI/CPI thresholds, VAC/BAC with VAC thresholds -----
+# ----- Monthly Labor table: BAC/EAC & VAC/BAC thresholds -----
 if "labor_monthly_tbl" in globals():
     df = set_index(labor_monthly_tbl)
+    df = add_comment_col(df)
     bac_eac_col = match_col(df, "BAC/EAC")
     vac_bac_col = match_col(df, "VAC/BAC")
 
