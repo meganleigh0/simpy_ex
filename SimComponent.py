@@ -21,10 +21,7 @@ def hex_to_rgb(hex_color):
 
 
 def parse_css(style_str):
-    """
-    Parse 'background-color:#xxxxxx;color:#yyyyyy'
-    -> (bg_hex, text_hex)
-    """
+    """Parse 'background-color:#xxxxxx;color:#yyyyyy' -> (bg_hex, text_hex)"""
     bg = txt = None
     if not style_str:
         return bg, txt
@@ -33,7 +30,7 @@ def parse_css(style_str):
         if ":" not in part:
             continue
         key, val = part.split(":", 1)
-        key = key.strip()
+        key = key.strip().lower()
         val = val.strip()
         if key == "background-color":
             bg = val
@@ -43,7 +40,6 @@ def parse_css(style_str):
 
 
 def set_index(df, index_col="SUB_TEAM"):
-    """Ensure SUB_TEAM is the index if present."""
     if index_col in df.columns:
         df = df.copy()
         df.set_index(index_col, inplace=True)
@@ -51,30 +47,26 @@ def set_index(df, index_col="SUB_TEAM"):
 
 
 def add_comment_col(df, col_name="COMMENT"):
-    """Ensure exactly one COMMENT column exists at the far right."""
     df = df.copy()
-
-    # remove any duplicate 'comment' columns with different casing
+    # Remove duplicates of "comment"
     for c in list(df.columns):
         if c.strip().upper() == "COMMENT" and c != col_name:
             df.drop(columns=[c], inplace=True)
 
     if col_name not in df.columns:
         df[col_name] = ""
-
     return df
 
 
 def find_col(df, startswith_text):
-    key = startswith_text.upper()
+    target = startswith_text.upper()
     for c in df.columns:
-        if str(c).strip().upper().startswith(key):
+        if str(c).strip().upper().startswith(target):
             return c
     return None
 
 
 def match_col(df, target):
-    """Match full text, ignoring spaces & case (for 'BAC/EAC', 'VAC/BAC')."""
     t = target.replace(" ", "").upper()
     for c in df.columns:
         if str(c).replace(" ", "").upper() == t:
@@ -82,30 +74,28 @@ def match_col(df, target):
     return None
 
 
+# ------------------------------------------------------------------
+# Add a metrics table slide (safe with theme layouts)
+# ------------------------------------------------------------------
 def add_df_slide(prs, title, df, fmt=None, cell_style=None, layout_index=5):
-    """
-    Add a slide with a (slightly smaller) table.
-    Handles custom themes that may lack a title placeholder.
-    """
 
-    # pick a valid layout index
     layout_index = min(layout_index, len(prs.slide_layouts) - 1)
     slide = prs.slides.add_slide(prs.slide_layouts[layout_index])
 
-    # ---- SAFE TITLE HANDLING ----
-    title_placeholder = None
+    # --- TITLE HANDLING ---
+    title_ph = None
     try:
-        title_placeholder = slide.shapes.title
-    except Exception:
-        title_placeholder = None
+        title_ph = slide.shapes.title
+    except:
+        title_ph = None
 
-    if title_placeholder is not None:
-        title_placeholder.text = title
+    if title_ph:
+        title_ph.text = title
     else:
-        # create a manual title text box if theme layout has no title
+        # Add title text box manually
         tx = slide.shapes.add_textbox(
             Inches(0.5), Inches(0.3),
-            prs.slide_width - Inches(1.0), Inches(0.6)
+            prs.slide_width - Inches(1), Inches(0.6)
         )
         tf = tx.text_frame
         tf.text = title
@@ -113,9 +103,9 @@ def add_df_slide(prs, title, df, fmt=None, cell_style=None, layout_index=5):
         p.font.size = Pt(32)
         p.font.bold = True
 
-    # ---- TABLE AREA ----
-    rows = df.shape[0] + 1     # header
-    cols = df.shape[1] + 1     # index column
+    # --- TABLE ---
+    rows = df.shape[0] + 1
+    cols = df.shape[1] + 1
 
     left = Inches(1.0)
     top = Inches(1.2)
@@ -124,31 +114,31 @@ def add_df_slide(prs, title, df, fmt=None, cell_style=None, layout_index=5):
 
     table = slide.shapes.add_table(rows, cols, left, top, width, height).table
 
-    # ---- HEADER ----
+    # headers
     table.cell(0, 0).text = df.index.name or "SUB_TEAM"
     for j, col in enumerate(df.columns, start=1):
         table.cell(0, j).text = str(col)
 
-    # ---- BODY ----
+    # body
     for i, (idx, row) in enumerate(df.iterrows(), start=1):
         table.cell(i, 0).text = str(idx)
         for j, col_name in enumerate(df.columns, start=1):
             val = row[col_name]
 
-            # formatting (skip COMMENT / non-numeric safely)
+            # safe formatting
             if fmt and col_name in fmt:
                 try:
-                    cell_text = fmt[col_name].format(val)
-                except Exception:
-                    cell_text = "" if pd.isna(val) else str(val)
+                    txt = fmt[col_name].format(val)
+                except:
+                    txt = "" if pd.isna(val) else str(val)
             else:
-                cell_text = "" if pd.isna(val) else str(val)
+                txt = "" if pd.isna(val) else str(val)
 
             cell = table.cell(i, j)
-            cell.text = cell_text
+            cell.text = txt
 
-            # conditional coloring
-            if cell_style is not None:
+            # colors
+            if cell_style:
                 bg_hex, txt_hex = cell_style(row, col_name, val)
 
                 if bg_hex:
@@ -161,41 +151,59 @@ def add_df_slide(prs, title, df, fmt=None, cell_style=None, layout_index=5):
                     rgb = hex_to_rgb(txt_hex)
                     if rgb and cell.text_frame.paragraphs:
                         for p in cell.text_frame.paragraphs:
-                            for run in p.runs:
-                                run.font.color.rgb = RGBColor(*rgb)
+                            for r in p.runs:
+                                r.font.color.rgb = RGBColor(*rgb)
 
 
-def set_title_slide(prs, title_text):
-    """
-    Ensure there is a title slide with the given text.
-    If a slide already exists, use the first slide; otherwise, add one.
-    """
-    if len(prs.slides) > 0:
-        slide = prs.slides[0]
+# ------------------------------------------------------------------
+# Create/Update title slide with TITLE + SUBTITLE
+# ------------------------------------------------------------------
+def set_title_slide(prs, title_text, subtitle_text):
+    """Ensure a title slide with both title and subtitle filled."""
+
+    if len(prs.slides) == 0:
+        slide = prs.slides.add_slide(prs.slide_layouts[0])
     else:
-        layout_index = 0
-        layout_index = min(layout_index, len(prs.slide_layouts) - 1)
-        slide = prs.slides.add_slide(prs.slide_layouts[layout_index])
+        slide = prs.slides[0]
 
-    # Try to set the title placeholder; fallback to textbox.
+    # ---- TITLE ----
     title_ph = None
     try:
         title_ph = slide.shapes.title
-    except Exception:
+    except:
         title_ph = None
 
-    if title_ph is not None:
+    if title_ph:
         title_ph.text = title_text
     else:
         tx = slide.shapes.add_textbox(
             Inches(0.5), Inches(0.3),
-            prs.slide_width - Inches(1.0), Inches(0.8)
+            prs.slide_width - Inches(1), Inches(0.8)
         )
         tf = tx.text_frame
         tf.text = title_text
         p = tf.paragraphs[0]
-        p.font.size = Pt(36)
+        p.font.size = Pt(40)
         p.font.bold = True
+
+    # ---- SUBTITLE ----
+    subtitle_ph = None
+    try:
+        subtitle_ph = slide.placeholders[1]
+    except:
+        subtitle_ph = None
+
+    if subtitle_ph:
+        subtitle_ph.text = subtitle_text
+    else:
+        tx = slide.shapes.add_textbox(
+            Inches(0.5), Inches(1.0),
+            prs.slide_width - Inches(1), Inches(0.7)
+        )
+        tf = tx.text_frame
+        tf.text = subtitle_text
+        p = tf.paragraphs[0]
+        p.font.size = Pt(24)
 
 
 # ========= Build the PowerPoint ==============================================
@@ -204,146 +212,119 @@ outdir = "output"
 os.makedirs(outdir, exist_ok=True)
 ppt_path = os.path.join(outdir, "evms_tables.pptx")
 
-# --- load theme presentation if available ---
-theme_path = os.path.join("data", "theme.pptx")  # adjust if theme is elsewhere
+# --- load theme ---
+theme_path = os.path.join("data", "theme.pptx")
 if os.path.exists(theme_path):
     print(f"Using theme from: {theme_path}")
     prs = Presentation(theme_path)
 else:
-    print("Theme file not found, using default PowerPoint template.")
+    print("Theme file not found. Using default PowerPoint template.")
     prs = Presentation()
 
-# --- create/update title slide with current date ---
-today_str = datetime.today().strftime("%m/%d/%Y")
-title_text = f"XM30 Weekly Metrics - {today_str}"
-set_title_slide(prs, title_text)
+# --- Title & Subtitle ---
+title_text = "XM30 Weekly Metrics"
+subtitle_text = datetime.today().strftime("%m/%d/%Y")
+set_title_slide(prs, title_text, subtitle_text)
 
-# ----- Cost Performance (CPI) -----
+# ------------------------------------------------------------------
+# COST PERFORMANCE (CPI)
+# ------------------------------------------------------------------
 if "cost_performance_tbl" in globals():
-    df = set_index(cost_performance_tbl)
-    df = add_comment_col(df)
+    df = add_comment_col(set_index(cost_performance_tbl))
 
-    # Notebook display
-    sty = (
-        df.style
-        .format({"CTD": "{:.2f}", "YTD": "{:.2f}"})
-        .map(color_spi_cpi_exact, subset=["CTD", "YTD"])
-    )
+    sty = df.style.format({"CTD": "{:.2f}", "YTD": "{:.2f}"}).map(color_spi_cpi_exact, subset=["CTD","YTD"])
     display(sty)
 
-    def cpi_style(row, col_name, value):
-        if col_name in ("CTD", "YTD"):
-            return parse_css(color_spi_cpi_exact(value))
+    def cpi_style(r, c, v):
+        if c in ("CTD", "YTD"):
+            return parse_css(color_spi_cpi_exact(v))
         return (None, None)
 
     fmt = {"CTD": "{:.2f}", "YTD": "{:.2f}"}
-    add_df_slide(prs, "Cost Performance (CPI)", df, fmt=fmt, cell_style=cpi_style)
+    add_df_slide(prs, "Cost Performance (CPI)", df, fmt, cpi_style)
 
-
-# ----- Schedule Performance (SPI) -----
+# ------------------------------------------------------------------
+# SCHEDULE PERFORMANCE (SPI)
+# ------------------------------------------------------------------
 if "schedule_performance_tbl" in globals():
-    df = set_index(schedule_performance_tbl)
-    df = add_comment_col(df)
+    df = add_comment_col(set_index(schedule_performance_tbl))
 
-    sty = (
-        df.style
-        .format({"CTD": "{:.2f}", "YTD": "{:.2f}"})
-        .map(color_spi_cpi_exact, subset=["CTD", "YTD"])
-    )
+    sty = df.style.format({"CTD": "{:.2f}", "YTD": "{:.2f}"}).map(color_spi_cpi_exact, subset=["CTD","YTD"])
     display(sty)
 
-    def spi_style(row, col_name, value):
-        if col_name in ("CTD", "YTD"):
-            return parse_css(color_spi_cpi_exact(value))
+    def spi_style(r, c, v):
+        if c in ("CTD", "YTD"):
+            return parse_css(color_spi_cpi_exact(v))
         return (None, None)
 
     fmt = {"CTD": "{:.2f}", "YTD": "{:.2f}"}
-    add_df_slide(prs, "Schedule Performance (SPI)", df, fmt=fmt, cell_style=spi_style)
+    add_df_slide(prs, "Schedule Performance (SPI)", df, fmt, spi_style)
 
-
-# ----- EVMS Metrics (SPI/CPI rows) -----
+# ------------------------------------------------------------------
+# EVMS METRICS
+# ------------------------------------------------------------------
 if "evms_metrics_tbl" in globals():
-    df = set_index(evms_metrics_tbl)
-    df = add_comment_col(df)
+    df = add_comment_col(set_index(evms_metrics_tbl))
+    num_cols = df.select_dtypes(include=["number"]).columns
 
-    numeric_cols = df.select_dtypes(include=["number"]).columns
-
-    sty = (
-        df.style
-        .format({c: "{:.2f}" for c in numeric_cols})
-        .map(color_spi_cpi_exact, subset=numeric_cols)
-    )
+    sty = df.style.format({c:"{:.2f}" for c in num_cols}).map(color_spi_cpi_exact, subset=num_cols)
     display(sty)
 
-    def evms_style(row, col_name, value):
-        if col_name in numeric_cols:
-            return parse_css(color_spi_cpi_exact(value))
+    def evms_style(r, c, v):
+        if c in num_cols:
+            return parse_css(color_spi_cpi_exact(v))
         return (None, None)
 
-    fmt = {c: "{:.2f}" for c in numeric_cols}
-    add_df_slide(prs, "EVMS Metrics (SPI/CPI)", df, fmt=fmt, cell_style=evms_style)
+    fmt = {c:"{:.2f}" for c in num_cols}
+    add_df_slide(prs, "EVMS Metrics (SPI/CPI)", df, fmt, evms_style)
 
-
-# ----- Labor Hours table: color VAC by VAC/BAC -----
+# ------------------------------------------------------------------
+# LABOR HOURS (VAC/BAC)
+# ------------------------------------------------------------------
 if "labor_tbl" in globals():
-    df = set_index(labor_tbl)
-    df = add_comment_col(df)
-
+    df = add_comment_col(set_index(labor_tbl))
     vac_col = find_col(df, "VAC")
     bac_col = find_col(df, "BAC")
 
     if vac_col and bac_col:
 
-        def labor_style(row, col_name, value):
-            if col_name == vac_col:
-                vac = pd.to_numeric(row[vac_col], errors="coerce")
-                bac = pd.to_numeric(row[bac_col], errors="coerce")
+        def labor_style(r, c, v):
+            if c == vac_col:
+                vac = pd.to_numeric(r[vac_col], errors="coerce")
+                bac = pd.to_numeric(r[bac_col], errors="coerce")
                 if pd.isna(vac) or pd.isna(bac) or bac == 0:
                     return (None, None)
-                ratio = vac / bac
-                return parse_css(color_vacbac_exact(ratio))
+                return parse_css(color_vacbac_exact(vac/bac))
             return (None, None)
-
-        # Notebook display only – no numeric .format so COMMENT is safe
-        def vac_style_df(df_):
-            css = pd.DataFrame("", index=df_.index, columns=df_.columns)
-            vac = pd.to_numeric(df_[vac_col], errors="coerce")
-            bac = pd.to_numeric(df_[bac_col], errors="coerce")
-            ratio = vac / bac.replace(0, np.nan)
-            css[vac_col] = ratio.apply(color_vacbac_exact).values
-            return css
-
-        display(df.style.apply(vac_style_df, axis=None))
 
         add_df_slide(prs, "Labor Hours (VAC/BAC)", df, fmt=None, cell_style=labor_style)
     else:
         print("[warn] Could not find VAC/BAC columns in labor_tbl")
 
-
-# ----- Monthly Labor table: BAC/EAC & VAC/BAC thresholds -----
+# ------------------------------------------------------------------
+# MONTHLY LABOR
+# ------------------------------------------------------------------
 if "labor_monthly_tbl" in globals():
-    df = set_index(labor_monthly_tbl)
-    df = add_comment_col(df)
+    df = add_comment_col(set_index(labor_monthly_tbl))
 
     bac_eac_col = match_col(df, "BAC/EAC")
     vac_bac_col = match_col(df, "VAC/BAC")
 
-    def dual_style(row, col_name, value):
-        if bac_eac_col and col_name == bac_eac_col:
-            return parse_css(color_spi_cpi_exact(value))
-        if vac_bac_col and col_name == vac_bac_col:
-            return parse_css(color_vacbac_exact(value))
+    def dual_style(r, c, v):
+        if c == bac_eac_col:
+            return parse_css(color_spi_cpi_exact(v))
+        if c == vac_bac_col:
+            return parse_css(color_vacbac_exact(v))
         return (None, None)
 
     fmt = {}
-    if bac_eac_col:
-        fmt[bac_eac_col] = "{:.2f}"
-    if vac_bac_col:
-        fmt[vac_bac_col] = "{:.2f}"
+    if bac_eac_col: fmt[bac_eac_col] = "{:.2f}"
+    if vac_bac_col: fmt[vac_bac_col] = "{:.2f}"
 
-    add_df_slide(prs, "Monthly Labor Table", df, fmt=fmt, cell_style=dual_style)
+    add_df_slide(prs, "Monthly Labor Table", df, fmt, dual_style)
 
-
-# ----- Save PowerPoint --------------------------------------------------------
+# ------------------------------------------------------------------
+# SAVE
+# ------------------------------------------------------------------
 prs.save(ppt_path)
 print(f"Saved PowerPoint to: {ppt_path}")
