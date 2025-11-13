@@ -1,6 +1,6 @@
-# ---------------------------
-# IMPORTS (Complete + Correct)
-# ---------------------------
+# -------------------------------------------------------------
+# IMPORTS
+# -------------------------------------------------------------
 import pandas as pd
 import numpy as np
 
@@ -10,93 +10,130 @@ from pptx.enum.text import PP_ALIGN
 from pptx.dml.color import RGBColor
 
 
-# ---------------------------------------------
-# FUNCTION: Insert Pandas DataFrame Into a Slide
-# ---------------------------------------------
-def df_to_ppt_table(slide, df, title_text):
+# -------------------------------------------------------------
+# HELPER: Convert HEX ("#FF0000") → RGB tuple
+# -------------------------------------------------------------
+def hex_to_rgb(hex_value):
+    hex_value = hex_value.lstrip('#')
+    return tuple(int(hex_value[i:i+2], 16) for i in (0, 2, 4))
+
+
+# -------------------------------------------------------------
+# APPLY YOUR COLOR FUNCTIONS DIRECTLY TO PPT CELLS
+# -------------------------------------------------------------
+def apply_threshold_to_cell(cell, value, mode):
     """
-    Add a pandas DataFrame as a real PowerPoint table on a slide.
+    mode = 'CPI_SPI', 'VACBAC', or 'DUAL'
+    Applies your exact thresholds to a PowerPoint cell.
     """
 
-    # --- Set slide title ---
+    # Background + text colors returned by your functions
+    try:
+        if mode == "CPI_SPI":
+            css = get_color_style(value, 
+                                  [1.05, 1.02, 0.98, 0.95],
+                                  [HEX_COLORS["BLUE"], HEX_COLORS["GREEN"], HEX_COLORS["YELLOW"], HEX_COLORS["RED"], HEX_COLORS["RED"]],
+                                  ["#000000", "#000000", "#000000", "#FFFFFF", "#FFFFFF"])
+
+        elif mode == "VACBAC":
+            css = get_color_style(value,
+                                  [0.05, 0.02, -0.02, -0.05],
+                                  [HEX_COLORS["BLUE"], HEX_COLORS["GREEN"], HEX_COLORS["YELLOW"], HEX_COLORS["RED"], HEX_COLORS["RED"]],
+                                  ["#000000", "#000000", "#000000", "#FFFFFF", "#FFFFFF"])
+
+        else:
+            return  # no styling
+
+    except:
+        return
+
+    if css is None:
+        return
+
+    # parse the returned CSS string
+    # format: "background-color:#XXXXXX; color:#YYYYYY"
+    if "background-color" in css:
+        bg_hex = css.split("background-color:")[1].split(";")[0].strip()
+        text_hex = css.split("color:")[1].strip()
+
+        r, g, b = hex_to_rgb(bg_hex)
+        tr, tg, tb = hex_to_rgb(text_hex)
+
+        cell.fill.solid()
+        cell.fill.fore_color.rgb = RGBColor(r, g, b)
+
+        p = cell.text_frame.paragraphs[0]
+        p.font.color.rgb = RGBColor(tr, tg, tb)
+
+
+# -------------------------------------------------------------
+# FUNCTION: Insert DataFrame into PPT with styling
+# -------------------------------------------------------------
+def df_to_ppt_table(slide, df, title_text, mode=None):
+
+    df_clean = df.reset_index()
+
     title = slide.shapes.title
     title.text = title_text
 
-    # --- Prepare DataFrame ---
-    df_clean = df.copy()
-    df_clean = df_clean.reset_index()
-
     rows, cols = df_clean.shape
 
-    # --- Table position & size ---
-    left = Inches(0.4)
-    top = Inches(1.2)
-    width = Inches(9.1)
-    height = Inches(0.8 + rows * 0.3)
+    left, top = Inches(0.4), Inches(1.2)
+    width, height = Inches(9.1), Inches(0.8 + rows * 0.3)
 
     table = slide.shapes.add_table(rows + 1, cols, left, top, width, height).table
 
-    # --- Set header formatting ---
-    for j, col_name in enumerate(df_clean.columns):
+    # header
+    for j in range(cols):
         cell = table.cell(0, j)
-        cell.text = str(col_name)
-
-        # Header style
+        cell.text = str(df_clean.columns[j])
         cell.fill.solid()
         cell.fill.fore_color.rgb = RGBColor(230, 230, 230)
-        p = cell.text_frame.paragraphs[0]
-        p.font.bold = True
-        p.font.size = Pt(10)
-        p.alignment = PP_ALIGN.CENTER
+        cell.text_frame.paragraphs[0].font.bold = True
+        cell.text_frame.paragraphs[0].alignment = PP_ALIGN.CENTER
 
-    # --- Fill table with data ---
+    # data
     for i in range(rows):
         for j in range(cols):
             val = df_clean.iloc[i, j]
-            cell = table.cell(i + 1, j)
+            cell = table.cell(i+1, j)
 
             cell.text = "" if pd.isna(val) else str(val)
-
             p = cell.text_frame.paragraphs[0]
-            p.font.size = Pt(10)
             p.alignment = PP_ALIGN.CENTER
+            p.font.size = Pt(10)
+
+            # apply threshold if applicable
+            if mode == "CPI_SPI" and df_clean.columns[j] in ["CTD", "YTD", "4WK"]:
+                apply_threshold_to_cell(cell, val, "CPI_SPI")
+
+            elif mode == "VACBAC" and df_clean.columns[j] in ["VAC/BAC", "VAC", "BAC"]:
+                apply_threshold_to_cell(cell, val, "VACBAC")
 
     return table
 
 
-# ----------------------------------------------------------
-# FUNCTION: Create PowerPoint and Add All Existing DataFrames
-# ----------------------------------------------------------
-def save_all_tables_to_ppt(output="EVMS_Tables.pptx"):
+# -------------------------------------------------------------
+# MAIN FUNCTION: Add all your tables to PPT with styling
+# -------------------------------------------------------------
+def save_all_tables_to_ppt(output="Weekly_EVMS_Tables.pptx"):
     prs = Presentation()
 
-    # Table names expected to be in globals() after your pipeline
     table_map = {
-        "Cost Performance (CPI)": "cost_performance_tbl",
-        "Schedule Performance (SPI)": "schedule_performance_tbl",
-        "EVMS Metrics": "evms_metrics_tbl",
-        "Labor Table": "labor_tbl",
-        "Monthly Labor Table": "labor_monthly_tbl"
+        "Cost Performance (CPI)": ("cost_performance_tbl", "CPI_SPI"),
+        "Schedule Performance (SPI)": ("schedule_performance_tbl", "CPI_SPI"),
+        "EVMS Metrics": ("evms_metrics_tbl", "CPI_SPI"),
+        "Labor Table (VAC/BAC)": ("labor_tbl", "VACBAC"),
+        "Monthly Labor Table": ("labor_monthly_tbl", "CPI_SPI")
     }
 
-    for title_text, var_name in table_map.items():
+    for title_text, (var_name, mode) in table_map.items():
         if var_name in globals():
 
             df = globals()[var_name]
 
-            # Create slide
-            slide_layout = prs.slide_layouts[5]  # Title Only
-            slide = prs.slides.add_slide(slide_layout)
+            slide = prs.slides.add_slide(prs.slide_layouts[5])
+            df_to_ppt_table(slide, df, title_text, mode)
 
-            # Add table
-            df_to_ppt_table(slide, df, title_text)
-
-    # Save PowerPoint
     prs.save(output)
-    print(f"[OK] PowerPoint saved → {output}")
-
-
-# -----------------------------------------
-# RUN THIS TO GENERATE THE POWERPOINT FILE
-# -----------------------------------------
-save_all_tables_to_ppt("Weekly_EVMS_Tables.pptx")
+    print(f"[OK] Styled PowerPoint saved → {output}")
