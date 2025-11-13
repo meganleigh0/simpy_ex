@@ -1,6 +1,7 @@
 import os
 import numpy as np
 import pandas as pd
+from datetime import datetime
 
 from pptx import Presentation
 from pptx.util import Inches, Pt
@@ -164,6 +165,39 @@ def add_df_slide(prs, title, df, fmt=None, cell_style=None, layout_index=5):
                                 run.font.color.rgb = RGBColor(*rgb)
 
 
+def set_title_slide(prs, title_text):
+    """
+    Ensure there is a title slide with the given text.
+    If a slide already exists, use the first slide; otherwise, add one.
+    """
+    if len(prs.slides) > 0:
+        slide = prs.slides[0]
+    else:
+        layout_index = 0
+        layout_index = min(layout_index, len(prs.slide_layouts) - 1)
+        slide = prs.slides.add_slide(prs.slide_layouts[layout_index])
+
+    # Try to set the title placeholder; fallback to textbox.
+    title_ph = None
+    try:
+        title_ph = slide.shapes.title
+    except Exception:
+        title_ph = None
+
+    if title_ph is not None:
+        title_ph.text = title_text
+    else:
+        tx = slide.shapes.add_textbox(
+            Inches(0.5), Inches(0.3),
+            prs.slide_width - Inches(1.0), Inches(0.8)
+        )
+        tf = tx.text_frame
+        tf.text = title_text
+        p = tf.paragraphs[0]
+        p.font.size = Pt(36)
+        p.font.bold = True
+
+
 # ========= Build the PowerPoint ==============================================
 
 outdir = "output"
@@ -171,13 +205,18 @@ os.makedirs(outdir, exist_ok=True)
 ppt_path = os.path.join(outdir, "evms_tables.pptx")
 
 # --- load theme presentation if available ---
-theme_path = os.path.join("data", "theme.pptx")  # adjust if your theme lives elsewhere
+theme_path = os.path.join("data", "theme.pptx")  # adjust if theme is elsewhere
 if os.path.exists(theme_path):
     print(f"Using theme from: {theme_path}")
     prs = Presentation(theme_path)
 else:
     print("Theme file not found, using default PowerPoint template.")
     prs = Presentation()
+
+# --- create/update title slide with current date ---
+today_str = datetime.today().strftime("%m/%d/%Y")
+title_text = f"XM30 Weekly Metrics - {today_str}"
+set_title_slide(prs, title_text)
 
 # ----- Cost Performance (CPI) -----
 if "cost_performance_tbl" in globals():
