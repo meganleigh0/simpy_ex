@@ -7,15 +7,7 @@ from pptx.util import Inches
 from pptx.dml.color import RGBColor
 from IPython.display import display
 
-# -------------------------------------------------------------------
-# Assumes your existing color helpers are already defined ABOVE:
-#   HEX_COLORS
-#   get_color_style(...)
-#   color_spi_cpi_exact(...)
-#   color_vacbac_exact(...)
-# -------------------------------------------------------------------
-
-# ---------- helpers for PowerPoint colors ----------
+# ========= Helper functions ===================================================
 
 def hex_to_rgb(hex_color):
     """'#RRGGBB' -> (R, G, B) tuple."""
@@ -110,8 +102,6 @@ def add_df_slide(prs, title, df, fmt=None, cell_style=None):
                                 run.font.color.rgb = RGBColor(*rgb_txt)
 
 
-# ---------- dataframe helpers ----------
-
 def set_index(df, index_col="SUB_TEAM"):
     """Ensure SUB_TEAM is the index if present."""
     if index_col in df.columns:
@@ -119,12 +109,21 @@ def set_index(df, index_col="SUB_TEAM"):
         df.set_index(index_col, inplace=True)
     return df
 
+
 def add_comment_col(df, col_name="COMMENT"):
-    """Add an empty COMMENT column if it isn't there already."""
+    """Ensure exactly one COMMENT column exists at the far right."""
+    df = df.copy()
+
+    # remove any duplicate 'comment' columns with different casing
+    for c in list(df.columns):
+        if c.strip().upper() == "COMMENT" and c != col_name:
+            df.drop(columns=[c], inplace=True)
+
     if col_name not in df.columns:
-        df = df.copy()
         df[col_name] = ""
+
     return df
+
 
 def find_col(df, startswith_text):
     key = startswith_text.upper()
@@ -132,6 +131,7 @@ def find_col(df, startswith_text):
         if str(c).strip().upper().startswith(key):
             return c
     return None
+
 
 def match_col(df, target):
     """Match full text, ignoring spaces & case (for 'BAC/EAC', 'VAC/BAC')."""
@@ -142,7 +142,7 @@ def match_col(df, target):
     return None
 
 
-# ---------- build the PowerPoint ----------
+# ========= Build the PowerPoint ==============================================
 
 outdir = "output"
 os.makedirs(outdir, exist_ok=True)
@@ -152,8 +152,9 @@ prs = Presentation()
 # ----- Cost Performance (CPI) -----
 if "cost_performance_tbl" in globals():
     df = set_index(cost_performance_tbl)
-    df = add_comment_col(df)   # <<< add empty COMMENT column
+    df = add_comment_col(df)
 
+    # Notebook display
     sty = (
         df.style
         .format({"CTD": "{:.2f}", "YTD": "{:.2f}"})
@@ -166,13 +167,9 @@ if "cost_performance_tbl" in globals():
             return parse_css(color_spi_cpi_exact(value))
         return (None, None)
 
-    add_df_slide(
-        prs,
-        title="Cost Performance (CPI)",
-        df=df,
-        fmt={"CTD": "{:.2f}", "YTD": "{:.2f}"},
-        cell_style=cpi_style,
-    )
+    fmt = {"CTD": "{:.2f}", "YTD": "{:.2f}"}
+    add_df_slide(prs, "Cost Performance (CPI)", df, fmt=fmt, cell_style=cpi_style)
+
 
 # ----- Schedule Performance (SPI) -----
 if "schedule_performance_tbl" in globals():
@@ -191,44 +188,43 @@ if "schedule_performance_tbl" in globals():
             return parse_css(color_spi_cpi_exact(value))
         return (None, None)
 
-    add_df_slide(
-        prs,
-        title="Schedule Performance (SPI)",
-        df=df,
-        fmt={"CTD": "{:.2f}", "YTD": "{:.2f}"},
-        cell_style=spi_style,
-    )
+    fmt = {"CTD": "{:.2f}", "YTD": "{:.2f}"}
+    add_df_slide(prs, "Schedule Performance (SPI)", df, fmt=fmt, cell_style=spi_style)
+
 
 # ----- EVMS Metrics (SPI/CPI rows) -----
 if "evms_metrics_tbl" in globals():
     df = set_index(evms_metrics_tbl)
     df = add_comment_col(df)
-    cols = [c for c in df.columns if c != "COMMENT"]
 
-    sty = df.style.format({c: "{:.2f}" for c in cols}).map(color_spi_cpi_exact, subset=cols)
+    numeric_cols = df.select_dtypes(include=["number"]).columns
+
+    sty = (
+        df.style
+        .format({c: "{:.2f}" for c in numeric_cols})
+        .map(color_spi_cpi_exact, subset=numeric_cols)
+    )
     display(sty)
 
     def evms_style(row, col_name, value):
-        if col_name in cols:
+        if col_name in numeric_cols:
             return parse_css(color_spi_cpi_exact(value))
         return (None, None)
 
-    add_df_slide(
-        prs,
-        title="EVMS Metrics (SPI/CPI)",
-        df=df,
-        fmt={c: "{:.2f}" for c in cols},
-        cell_style=evms_style,
-    )
+    fmt = {c: "{:.2f}" for c in numeric_cols}
+    add_df_slide(prs, "EVMS Metrics (SPI/CPI)", df, fmt=fmt, cell_style=evms_style)
+
 
 # ----- Labor Hours table: color VAC by VAC/BAC -----
 if "labor_tbl" in globals():
     df = set_index(labor_tbl)
     df = add_comment_col(df)
+
     vac_col = find_col(df, "VAC")
     bac_col = find_col(df, "BAC")
 
     if vac_col and bac_col:
+
         def labor_style(row, col_name, value):
             if col_name == vac_col:
                 vac = pd.to_numeric(row[vac_col], errors="coerce")
@@ -239,7 +235,7 @@ if "labor_tbl" in globals():
                 return parse_css(color_vacbac_exact(ratio))
             return (None, None)
 
-        # optional notebook view
+        # Notebook display only – no numeric .format so COMMENT is safe
         def vac_style_df(df_):
             css = pd.DataFrame("", index=df_.index, columns=df_.columns)
             vac = pd.to_numeric(df_[vac_col], errors="coerce")
@@ -250,19 +246,16 @@ if "labor_tbl" in globals():
 
         display(df.style.apply(vac_style_df, axis=None))
 
-        add_df_slide(
-            prs,
-            title="Labor Hours (VAC/BAC)",
-            df=df,
-            cell_style=labor_style,
-        )
+        add_df_slide(prs, "Labor Hours (VAC/BAC)", df, fmt=None, cell_style=labor_style)
     else:
         print("[warn] Could not find VAC/BAC columns in labor_tbl")
+
 
 # ----- Monthly Labor table: BAC/EAC & VAC/BAC thresholds -----
 if "labor_monthly_tbl" in globals():
     df = set_index(labor_monthly_tbl)
     df = add_comment_col(df)
+
     bac_eac_col = match_col(df, "BAC/EAC")
     vac_bac_col = match_col(df, "VAC/BAC")
 
@@ -279,14 +272,9 @@ if "labor_monthly_tbl" in globals():
     if vac_bac_col:
         fmt[vac_bac_col] = "{:.2f}"
 
-    add_df_slide(
-        prs,
-        title="Monthly Labor Table",
-        df=df,
-        fmt=fmt,
-        cell_style=dual_style,
-    )
+    add_df_slide(prs, "Monthly Labor Table", df, fmt=fmt, cell_style=dual_style)
 
-# ----- save the PowerPoint -----
+
+# ----- Save PowerPoint --------------------------------------------------------
 prs.save(ppt_path)
 print(f"Saved PowerPoint to: {ppt_path}")
