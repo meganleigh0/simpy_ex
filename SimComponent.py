@@ -41,13 +41,15 @@ def parse_css(style_str):
     return bg, txt
 
 
-def add_df_slide(prs, title, df, fmt=None, cell_style=None):
+def add_df_slide(prs, title, df, fmt=None, cell_style=None, layout_index=5):
     """
     Add a slide with a (slightly smaller) table.
 
     cell_style(row, col_name, value) -> (bg_hex, text_hex)
     """
-    slide = prs.slides.add_slide(prs.slide_layouts[5])  # title only
+    # layout_index=5 is usually "Title Only" in most themes – adjust if needed
+    layout_index = min(layout_index, len(prs.slide_layouts) - 1)
+    slide = prs.slides.add_slide(prs.slide_layouts[layout_index])
     slide.shapes.title.text = title
 
     rows = df.shape[0] + 1        # +1 for header
@@ -147,7 +149,15 @@ def match_col(df, target):
 outdir = "output"
 os.makedirs(outdir, exist_ok=True)
 ppt_path = os.path.join(outdir, "evms_tables.pptx")
-prs = Presentation()
+
+# --- load theme presentation if available ---
+theme_path = os.path.join("data", "theme.pptx")  # adjust folder if needed
+if os.path.exists(theme_path):
+    print(f"Using theme from: {theme_path}")
+    prs = Presentation(theme_path)
+else:
+    print("Theme file not found, using default PowerPoint template.")
+    prs = Presentation()
 
 # ----- Cost Performance (CPI) -----
 if "cost_performance_tbl" in globals():
