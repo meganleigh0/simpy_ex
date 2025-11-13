@@ -1,139 +1,202 @@
-# -------------------------------------------------------------
-# IMPORTS
-# -------------------------------------------------------------
-import pandas as pd
+import os
 import numpy as np
-
+import pandas as pd
 from pptx import Presentation
-from pptx.util import Inches, Pt
-from pptx.enum.text import PP_ALIGN
+from pptx.util import Inches
 from pptx.dml.color import RGBColor
 
+# ---------- helpers for PPTX ----------
 
-# -------------------------------------------------------------
-# HELPER: Convert HEX ("#FF0000") → RGB tuple
-# -------------------------------------------------------------
-def hex_to_rgb(hex_value):
-    hex_value = hex_value.lstrip('#')
-    return tuple(int(hex_value[i:i+2], 16) for i in (0, 2, 4))
+def hex_to_rgb_tuple(hex_color: str):
+    """'#RRGGBB' -> (R,G,B)"""
+    if not isinstance(hex_color, str):
+        return None
+    hc = hex_color.strip().lstrip("#")
+    if len(hc) != 6:
+        return None
+    return tuple(int(hc[i:i+2], 16) for i in (0, 2, 4))
 
-
-# -------------------------------------------------------------
-# APPLY YOUR COLOR FUNCTIONS DIRECTLY TO PPT CELLS
-# -------------------------------------------------------------
-def apply_threshold_to_cell(cell, value, mode):
+def parse_css(css: str):
     """
-    mode = 'CPI_SPI', 'VACBAC', or 'DUAL'
-    Applies your exact thresholds to a PowerPoint cell.
+    css like 'background-color:#4E9BE3;color:#000000'
+    -> (bg_hex, text_hex)
     """
+    if not isinstance(css, str) or "background-color" not in css:
+        return None, None
 
-    # Background + text colors returned by your functions
-    try:
-        if mode == "CPI_SPI":
-            css = get_color_style(value, 
-                                  [1.05, 1.02, 0.98, 0.95],
-                                  [HEX_COLORS["BLUE"], HEX_COLORS["GREEN"], HEX_COLORS["YELLOW"], HEX_COLORS["RED"], HEX_COLORS["RED"]],
-                                  ["#000000", "#000000", "#000000", "#FFFFFF", "#FFFFFF"])
+    bg_hex, fg_hex = None, None
+    for part in css.split(";"):
+        if ":" not in part:
+            continue
+        k, v = part.split(":", 1)
+        k = k.strip()
+        v = v.strip()
+        if k == "background-color":
+            bg_hex = v
+        elif k == "color":
+            fg_hex = v
+    return bg_hex, fg_hex
 
-        elif mode == "VACBAC":
-            css = get_color_style(value,
-                                  [0.05, 0.02, -0.02, -0.05],
-                                  [HEX_COLORS["BLUE"], HEX_COLORS["GREEN"], HEX_COLORS["YELLOW"], HEX_COLORS["RED"], HEX_COLORS["RED"]],
-                                  ["#000000", "#000000", "#000000", "#FFFFFF", "#FFFFFF"])
+def add_df_slide(prs, title, df_display, css_df=None):
+    """
+    Add a slide with a table:
+      df_display: DataFrame of strings/numbers to show
+      css_df: DataFrame of css strings (same shape/index/cols as df_display)
+    """
+    rows, cols = df_display.shape
+    slide = prs.slides.add_slide(prs.slide_layouts[5])  # title only
+    slide.shapes.title.text = title
 
-        else:
-            return  # no styling
-
-    except:
-        return
-
-    if css is None:
-        return
-
-    # parse the returned CSS string
-    # format: "background-color:#XXXXXX; color:#YYYYYY"
-    if "background-color" in css:
-        bg_hex = css.split("background-color:")[1].split(";")[0].strip()
-        text_hex = css.split("color:")[1].strip()
-
-        r, g, b = hex_to_rgb(bg_hex)
-        tr, tg, tb = hex_to_rgb(text_hex)
-
-        cell.fill.solid()
-        cell.fill.fore_color.rgb = RGBColor(r, g, b)
-
-        p = cell.text_frame.paragraphs[0]
-        p.font.color.rgb = RGBColor(tr, tg, tb)
-
-
-# -------------------------------------------------------------
-# FUNCTION: Insert DataFrame into PPT with styling
-# -------------------------------------------------------------
-def df_to_ppt_table(slide, df, title_text, mode=None):
-
-    df_clean = df.reset_index()
-
-    title = slide.shapes.title
-    title.text = title_text
-
-    rows, cols = df_clean.shape
-
-    left, top = Inches(0.4), Inches(1.2)
-    width, height = Inches(9.1), Inches(0.8 + rows * 0.3)
+    left = Inches(0.3)
+    top = Inches(1.2)
+    width = Inches(9.0)
+    height = Inches(0.8)
 
     table = slide.shapes.add_table(rows + 1, cols, left, top, width, height).table
 
-    # header
-    for j in range(cols):
+    # headers
+    for j, col in enumerate(df_display.columns):
         cell = table.cell(0, j)
-        cell.text = str(df_clean.columns[j])
-        cell.fill.solid()
-        cell.fill.fore_color.rgb = RGBColor(230, 230, 230)
-        cell.text_frame.paragraphs[0].font.bold = True
-        cell.text_frame.paragraphs[0].alignment = PP_ALIGN.CENTER
+        cell.text = str(col)
+        for p in cell.text_frame.paragraphs:
+            for run in p.runs:
+                run.font.bold = True
 
-    # data
-    for i in range(rows):
-        for j in range(cols):
-            val = df_clean.iloc[i, j]
-            cell = table.cell(i+1, j)
+    # body
+    for i, idx in enumerate(df_display.index):
+        for j, col in enumerate(df_display.columns):
+            value = df_display.loc[idx, col]
+            if pd.isna(value):
+                text = ""
+            else:
+                text = str(value)
 
-            cell.text = "" if pd.isna(val) else str(val)
-            p = cell.text_frame.paragraphs[0]
-            p.alignment = PP_ALIGN.CENTER
-            p.font.size = Pt(10)
+            cell = table.cell(i + 1, j)
+            cell.text = text
 
-            # apply threshold if applicable
-            if mode == "CPI_SPI" and df_clean.columns[j] in ["CTD", "YTD", "4WK"]:
-                apply_threshold_to_cell(cell, val, "CPI_SPI")
+            bg_hex, fg_hex = None, None
+            if css_df is not None and idx in css_df.index and col in css_df.columns:
+                bg_hex, fg_hex = parse_css(css_df.loc[idx, col])
 
-            elif mode == "VACBAC" and df_clean.columns[j] in ["VAC/BAC", "VAC", "BAC"]:
-                apply_threshold_to_cell(cell, val, "VACBAC")
+            if bg_hex:
+                rgb = hex_to_rgb_tuple(bg_hex)
+                if rgb:
+                    cell.fill.solid()
+                    cell.fill.fore_color.rgb = RGBColor(*rgb)
 
-    return table
+            if fg_hex:
+                rgb = hex_to_rgb_tuple(fg_hex)
+                if rgb:
+                    for p in cell.text_frame.paragraphs:
+                        for run in p.runs:
+                            run.font.color.rgb = RGBColor(*rgb)
 
+    return prs
 
-# -------------------------------------------------------------
-# MAIN FUNCTION: Add all your tables to PPT with styling
-# -------------------------------------------------------------
-def save_all_tables_to_ppt(output="Weekly_EVMS_Tables.pptx"):
-    prs = Presentation()
+# ---------- build the PowerPoint ----------
 
-    table_map = {
-        "Cost Performance (CPI)": ("cost_performance_tbl", "CPI_SPI"),
-        "Schedule Performance (SPI)": ("schedule_performance_tbl", "CPI_SPI"),
-        "EVMS Metrics": ("evms_metrics_tbl", "CPI_SPI"),
-        "Labor Table (VAC/BAC)": ("labor_tbl", "VACBAC"),
-        "Monthly Labor Table": ("labor_monthly_tbl", "CPI_SPI")
-    }
+prs = Presentation()
 
-    for title_text, (var_name, mode) in table_map.items():
-        if var_name in globals():
+# 1) Cost Performance (CPI) table -------------------------------------------
+if "cost_performance_tbl" in globals():
+    df = set_index(cost_performance_tbl.copy())
 
-            df = globals()[var_name]
+    # create CSS using same thresholds/colors as Styler
+    css = pd.DataFrame("", index=df.index, columns=df.columns)
+    for col in ["CTD", "YTD"]:
+        if col in df.columns:
+            css[col] = df[col].apply(color_spi_cpi_exact).values
 
-            slide = prs.slides.add_slide(prs.slide_layouts[5])
-            df_to_ppt_table(slide, df, title_text, mode)
+    # format numbers as in Styler (.2f for CTD/YTD)
+    df_display = df.copy()
+    for col in ["CTD", "YTD"]:
+        if col in df_display.columns:
+            df_display[col] = pd.to_numeric(df_display[col], errors="coerce") \
+                                  .map(lambda x: "" if pd.isna(x) else f"{x:.2f}")
 
-    prs.save(output)
-    print(f"[OK] Styled PowerPoint saved → {output}")
+    prs = add_df_slide(prs, "Cost Performance (CPI)", df_display, css)
+
+# 2) Schedule Performance (SPI) table ---------------------------------------
+if "schedule_performance_tbl" in globals():
+    df = set_index(schedule_performance_tbl.copy())
+
+    css = pd.DataFrame("", index=df.index, columns=df.columns)
+    for col in ["CTD", "YTD"]:
+        if col in df.columns:
+            css[col] = df[col].apply(color_spi_cpi_exact).values
+
+    df_display = df.copy()
+    for col in ["CTD", "YTD"]:
+        if col in df_display.columns:
+            df_display[col] = pd.to_numeric(df_display[col], errors="coerce") \
+                                   .map(lambda x: "" if pd.isna(x) else f"{x:.2f}")
+
+    prs = add_df_slide(prs, "Schedule Performance (SPI)", df_display, css)
+
+# 3) EVMS metrics (SPI/CPI rows) -------------------------------------------
+if "evms_metrics_tbl" in globals():
+    df = set_index(evms_metrics_tbl.copy())
+
+    css = pd.DataFrame("", index=df.index, columns=df.columns)
+    for col in df.columns:
+        css[col] = df[col].apply(color_spi_cpi_exact).values
+
+    df_display = df.copy()
+    for col in df_display.columns:
+        df_display[col] = pd.to_numeric(df_display[col], errors="coerce") \
+                               .map(lambda x: "" if pd.isna(x) else f"{x:.2f}")
+
+    prs = add_df_slide(prs, "EVMS Metrics (SPI/CPI)", df_display, css)
+
+# 4) Labor hours table – color VAC by VAC/BAC -------------------------------
+if "labor_tbl" in globals():
+    df = set_index(labor_tbl.copy())
+    vac_col = find_col(df, "VAC")
+    bac_col = find_col(df, "BAC")
+
+    css = pd.DataFrame("", index=df.index, columns=df.columns)
+    if vac_col and bac_col:
+        vac = pd.to_numeric(df[vac_col], errors="coerce")
+        bac = pd.to_numeric(df[bac_col], errors="coerce")
+        bac = bac.replace(0, np.nan)
+        ratio = vac / bac
+        css[vac_col] = ratio.apply(color_vacbac_exact).values
+
+    df_display = df.copy()  # keep original numeric formatting
+    prs = add_df_slide(prs, "Labor Hours (VAC/BAC)", df_display, css)
+
+# 5) Monthly labor table – color BAC/EAC and VAC/BAC -----------------------
+def match_col(df, target):
+    """Find the first column whose name starts with target (case-insensitive)."""
+    key = target.upper()
+    for c in df.columns:
+        if str(c).strip().replace(" ", "").upper().startswith(key.replace(" ", "")):
+            return c
+    return None
+
+if "labor_monthly_tbl" in globals():
+    df = set_index(labor_monthly_tbl.copy())
+
+    bac_eac_col = match_col(df, "BAC/EAC")
+    vac_bac_col = match_col(df, "VAC/BAC")
+
+    css = pd.DataFrame("", index=df.index, columns=df.columns)
+    if bac_eac_col and bac_eac_col in df.columns:
+        css[bac_eac_col] = df[bac_eac_col].apply(color_spi_cpi_exact).values
+    if vac_bac_col and vac_bac_col in df.columns:
+        css[vac_bac_col] = df[vac_bac_col].apply(color_vacbac_exact).values
+
+    df_display = df.copy()
+    for col in [bac_eac_col, vac_bac_col]:
+        if col and col in df_display.columns:
+            df_display[col] = pd.to_numeric(df_display[col], errors="coerce") \
+                                   .map(lambda x: "" if pd.isna(x) else f"{x:.2f}")
+
+    prs = add_df_slide(prs, "Monthly Labor (BAC/EAC & VAC/BAC)", df_display, css)
+
+# ---------- save the PowerPoint ----------
+
+os.makedirs("output", exist_ok=True)
+ppt_path = os.path.join("output", "evms_tables.pptx")
+prs.save(ppt_path)
+print(f"Saved PowerPoint to: {ppt_path}")
