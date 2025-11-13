@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 
 from pptx import Presentation
-from pptx.util import Inches
+from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
 from IPython.display import display
 
@@ -39,69 +39,6 @@ def parse_css(style_str):
         elif key == "color":
             txt = val
     return bg, txt
-
-
-def add_df_slide(prs, title, df, fmt=None, cell_style=None, layout_index=5):
-    """
-    Add a slide with a (slightly smaller) table.
-
-    cell_style(row, col_name, value) -> (bg_hex, text_hex)
-    """
-    # layout_index=5 is usually "Title Only" in most themes – adjust if needed
-    layout_index = min(layout_index, len(prs.slide_layouts) - 1)
-    slide = prs.slides.add_slide(prs.slide_layouts[layout_index])
-    slide.shapes.title.text = title
-
-    rows = df.shape[0] + 1        # +1 for header
-    cols = df.shape[1] + 1        # +1 for index col
-
-    # slightly smaller than full slide so it’s easy to see
-    left = Inches(1.0)
-    top = Inches(1.6)
-    width = prs.slide_width - Inches(2.0)
-    height = prs.slide_height - Inches(3.0)
-
-    table = slide.shapes.add_table(rows, cols, left, top, width, height).table
-
-    # header row
-    table.cell(0, 0).text = df.index.name or "SUB_TEAM"
-    for j, col in enumerate(df.columns, start=1):
-        table.cell(0, j).text = str(col)
-
-    # data rows
-    for i, (idx, row) in enumerate(df.iterrows(), start=1):
-        table.cell(i, 0).text = str(idx)
-        for j, col_name in enumerate(df.columns, start=1):
-            val = row[col_name]
-
-            # text formatting
-            if fmt and col_name in fmt:
-                try:
-                    text = fmt[col_name].format(val)
-                except Exception:
-                    text = "" if (val is None or (isinstance(val, float) and np.isnan(val))) else str(val)
-            else:
-                text = "" if (val is None or (isinstance(val, float) and np.isnan(val))) else str(val)
-
-            cell = table.cell(i, j)
-            cell.text = text
-
-            # coloring
-            if cell_style is not None:
-                bg_hex, txt_hex = cell_style(row, col_name, val)
-
-                if bg_hex:
-                    rgb = hex_to_rgb(bg_hex)
-                    if rgb:
-                        cell.fill.solid()
-                        cell.fill.fore_color.rgb = RGBColor(*rgb)
-
-                if txt_hex and cell.text_frame.paragraphs:
-                    for p in cell.text_frame.paragraphs:
-                        for run in p.runs:
-                            rgb_txt = hex_to_rgb(txt_hex)
-                            if rgb_txt:
-                                run.font.color.rgb = RGBColor(*rgb_txt)
 
 
 def set_index(df, index_col="SUB_TEAM"):
@@ -144,6 +81,89 @@ def match_col(df, target):
     return None
 
 
+def add_df_slide(prs, title, df, fmt=None, cell_style=None, layout_index=5):
+    """
+    Add a slide with a (slightly smaller) table.
+    Handles custom themes that may lack a title placeholder.
+    """
+
+    # pick a valid layout index
+    layout_index = min(layout_index, len(prs.slide_layouts) - 1)
+    slide = prs.slides.add_slide(prs.slide_layouts[layout_index])
+
+    # ---- SAFE TITLE HANDLING ----
+    title_placeholder = None
+    try:
+        title_placeholder = slide.shapes.title
+    except Exception:
+        title_placeholder = None
+
+    if title_placeholder is not None:
+        title_placeholder.text = title
+    else:
+        # create a manual title text box if theme layout has no title
+        tx = slide.shapes.add_textbox(
+            Inches(0.5), Inches(0.3),
+            prs.slide_width - Inches(1.0), Inches(0.6)
+        )
+        tf = tx.text_frame
+        tf.text = title
+        p = tf.paragraphs[0]
+        p.font.size = Pt(32)
+        p.font.bold = True
+
+    # ---- TABLE AREA ----
+    rows = df.shape[0] + 1     # header
+    cols = df.shape[1] + 1     # index column
+
+    left = Inches(1.0)
+    top = Inches(1.2)
+    width = prs.slide_width - Inches(2.0)
+    height = prs.slide_height - Inches(2.0)
+
+    table = slide.shapes.add_table(rows, cols, left, top, width, height).table
+
+    # ---- HEADER ----
+    table.cell(0, 0).text = df.index.name or "SUB_TEAM"
+    for j, col in enumerate(df.columns, start=1):
+        table.cell(0, j).text = str(col)
+
+    # ---- BODY ----
+    for i, (idx, row) in enumerate(df.iterrows(), start=1):
+        table.cell(i, 0).text = str(idx)
+        for j, col_name in enumerate(df.columns, start=1):
+            val = row[col_name]
+
+            # formatting (skip COMMENT / non-numeric safely)
+            if fmt and col_name in fmt:
+                try:
+                    cell_text = fmt[col_name].format(val)
+                except Exception:
+                    cell_text = "" if pd.isna(val) else str(val)
+            else:
+                cell_text = "" if pd.isna(val) else str(val)
+
+            cell = table.cell(i, j)
+            cell.text = cell_text
+
+            # conditional coloring
+            if cell_style is not None:
+                bg_hex, txt_hex = cell_style(row, col_name, val)
+
+                if bg_hex:
+                    rgb = hex_to_rgb(bg_hex)
+                    if rgb:
+                        cell.fill.solid()
+                        cell.fill.fore_color.rgb = RGBColor(*rgb)
+
+                if txt_hex:
+                    rgb = hex_to_rgb(txt_hex)
+                    if rgb and cell.text_frame.paragraphs:
+                        for p in cell.text_frame.paragraphs:
+                            for run in p.runs:
+                                run.font.color.rgb = RGBColor(*rgb)
+
+
 # ========= Build the PowerPoint ==============================================
 
 outdir = "output"
@@ -151,7 +171,7 @@ os.makedirs(outdir, exist_ok=True)
 ppt_path = os.path.join(outdir, "evms_tables.pptx")
 
 # --- load theme presentation if available ---
-theme_path = os.path.join("data", "theme.pptx")  # adjust folder if needed
+theme_path = os.path.join("data", "theme.pptx")  # adjust if your theme lives elsewhere
 if os.path.exists(theme_path):
     print(f"Using theme from: {theme_path}")
     prs = Presentation(theme_path)
