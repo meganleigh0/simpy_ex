@@ -6,7 +6,6 @@
 #   Next Mo ETC  = next-month ETC  hours / 9/80 available hours
 # -------------------------------------------------------------
 
-# 1) Reload Cobra data WITHOUT the ANCHOR filter so we can see next month
 xl_cobra = pd.ExcelFile(DATA_PATH)
 cobra_all = xl_cobra.parse(SHEET_NAME)
 cobra_all["DATE"] = pd.to_datetime(cobra_all["DATE"], errors="coerce")
@@ -16,10 +15,12 @@ cobra_shc = cobra_all[cobra_all[GROUP_COL] == "SHC"].copy()
 cobra_shc["YEAR"] = cobra_shc["DATE"].dt.year
 cobra_shc["MONTH"] = cobra_shc["DATE"].dt.month
 
-# current and next month based on ANCHOR (which is a datetime.datetime)
-cur_year = ANCHOR.year
-cur_month = ANCHOR.month
+# --- use the last date that exists in the SHC data as the "current" month ---
+last_date = cobra_shc["DATE"].max()
+cur_year = int(last_date.year)
+cur_month = int(last_date.month)
 
+# compute next month/year
 if cur_month == 12:
     next_year = cur_year + 1
     next_month = 1
@@ -44,11 +45,11 @@ next_hours = (
     .sum()
 )
 
-# make sure required cost-sets exist
+# Ensure we always have ACWP / BCWS / ETC keys
 cur_hours = cur_hours.reindex(["ACWP", "BCWS", "ETC"], fill_value=0.0)
 next_hours = next_hours.reindex(["ACWP", "BCWS", "ETC"], fill_value=0.0)
 
-# 2) 9/80 schedule available hours (from OpPlan)
+# 9/80 schedule hours
 available_9_80 = {
     2024: [142, 160, 196, 156, 160, 191, 151, 160, 191, 160, 151, 155],
     2025: [124, 160, 200, 160, 160, 191, 152, 160, 191, 191, 160, 173],
@@ -58,17 +59,16 @@ available_9_80 = {
 }
 
 def get_available_hours(year, month):
-    month_idx = month - 1  # 0-based
-    return available_9_80[year][month_idx]
+    return available_9_80[year][month - 1]  # 0-based index
 
 cur_avail = get_available_hours(cur_year, cur_month)
 next_avail = get_available_hours(next_year, next_month)
 
-# 3) Convert hours to headcount (FTE) using available hours
-demand = cur_hours["BCWS"] / cur_avail
-actual = cur_hours["ACWP"] / cur_avail
+# Convert hours to FTE
+demand        = cur_hours["BCWS"] / cur_avail
+actual        = cur_hours["ACWP"] / cur_avail
 next_bcws_fte = next_hours["BCWS"] / next_avail
-next_etc_fte = next_hours["ETC"] / next_avail
+next_etc_fte  = next_hours["ETC"]  / next_avail
 
 program_manpower_tbl = pd.DataFrame(
     {
