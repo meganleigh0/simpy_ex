@@ -11,34 +11,44 @@ xl_cobra = pd.ExcelFile(DATA_PATH)
 cobra_all = xl_cobra.parse(SHEET_NAME)
 cobra_all["DATE"] = pd.to_datetime(cobra_all["DATE"], errors="coerce")
 
-# SHC only, bucket into calendar months
+# SHC only
 cobra_shc = cobra_all[cobra_all[GROUP_COL] == "SHC"].copy()
-cobra_shc["PERIOD"] = cobra_shc["DATE"].dt.to_period("M")
+cobra_shc["YEAR"] = cobra_shc["DATE"].dt.year
+cobra_shc["MONTH"] = cobra_shc["DATE"].dt.month
 
-cur_per  = ANCHOR.to_period("M")
-next_per = cur_per + 1
+# current and next month based on ANCHOR (which is a datetime.datetime)
+cur_year = ANCHOR.year
+cur_month = ANCHOR.month
+
+if cur_month == 12:
+    next_year = cur_year + 1
+    next_month = 1
+else:
+    next_year = cur_year
+    next_month = cur_month + 1
 
 # Sum hours by COST-SET for current and next month
 cur_hours = (
-    cobra_shc[cobra_shc["PERIOD"] == cur_per]
+    cobra_shc[
+        (cobra_shc["YEAR"] == cur_year) & (cobra_shc["MONTH"] == cur_month)
+    ]
     .groupby("COST-SET")["HOURS"]
     .sum()
 )
+
 next_hours = (
-    cobra_shc[cobra_shc["PERIOD"] == next_per]
+    cobra_shc[
+        (cobra_shc["YEAR"] == next_year) & (cobra_shc["MONTH"] == next_month)
+    ]
     .groupby("COST-SET")["HOURS"]
     .sum()
 )
 
-# Ensure all required COST-SETs exist
-for k in ["ACWP", "BCWS", "ETC"]:
-    if k not in cur_hours:
-        cur_hours.loc[k] = 0.0
-    if k not in next_hours:
-        next_hours.loc[k] = 0.0
+# make sure required cost-sets exist
+cur_hours = cur_hours.reindex(["ACWP", "BCWS", "ETC"], fill_value=0.0)
+next_hours = next_hours.reindex(["ACWP", "BCWS", "ETC"], fill_value=0.0)
 
-# 2) 9/80 schedule available hours (from the OpPlan screenshot)
-#    If you prefer to read from Excel, replace this dict with pd.read_excel logic.
+# 2) 9/80 schedule available hours (from OpPlan)
 available_9_80 = {
     2024: [142, 160, 196, 156, 160, 191, 151, 160, 191, 160, 151, 155],
     2025: [124, 160, 200, 160, 160, 191, 152, 160, 191, 191, 160, 173],
@@ -47,19 +57,18 @@ available_9_80 = {
     2028: [151, 160, 200, 160, 160, 191, 151, 160, 191, 160, 142, 160],
 }
 
-def get_available_hours(period):
-    year = period.year
-    month_idx = period.month - 1  # 0-based index
+def get_available_hours(year, month):
+    month_idx = month - 1  # 0-based
     return available_9_80[year][month_idx]
 
-cur_avail  = get_available_hours(cur_per)
-next_avail = get_available_hours(next_per)
+cur_avail = get_available_hours(cur_year, cur_month)
+next_avail = get_available_hours(next_year, next_month)
 
 # 3) Convert hours to headcount (FTE) using available hours
-demand       = cur_hours["BCWS"] / cur_avail
-actual       = cur_hours["ACWP"] / cur_avail
+demand = cur_hours["BCWS"] / cur_avail
+actual = cur_hours["ACWP"] / cur_avail
 next_bcws_fte = next_hours["BCWS"] / next_avail
-next_etc_fte  = next_hours["ETC"]  / next_avail
+next_etc_fte = next_hours["ETC"] / next_avail
 
 program_manpower_tbl = pd.DataFrame(
     {
