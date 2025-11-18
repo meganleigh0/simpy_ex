@@ -4,7 +4,7 @@ import plotly.graph_objects as go
 from IPython.display import display
 
 # -------------------------------------------------------------------
-# 0) Load Cobra data (uses DATA_PATH, SHEET_NAME, GROUP_COL, ANCHOR)
+# 0) Load Cobra data (uses existing DATA_PATH, SHEET_NAME, ANCHOR)
 # -------------------------------------------------------------------
 xl = pd.ExcelFile(DATA_PATH)
 cobra = xl.parse(SHEET_NAME)
@@ -13,9 +13,10 @@ cobra["DATE"] = pd.to_datetime(cobra["DATE"], errors="coerce")
 cobra = cobra[cobra["DATE"].notna()].copy()
 
 # -------------------------------------------------------------------
-# 1) PROGRAM MANPOWER TABLE  (SHC only, 9/80 schedule)
+# 1) PROGRAM MANPOWER TABLE  (Program total, labeled "SHC")
 # -------------------------------------------------------------------
 
+# 9/80 available hours table from OpPlan (2024–2028)
 available_9_80 = {
     2024: [142, 160, 196, 156, 160, 191, 151, 160, 191, 160, 151, 155],
     2025: [124, 160, 200, 160, 160, 191, 152, 160, 191, 191, 160, 173],
@@ -30,11 +31,24 @@ def get_available_hours(year, month):
     except KeyError:
         return np.nan
 
-shc = cobra[cobra[GROUP_COL] == "SHC"].copy()
-shc["YEAR"] = shc["DATE"].dt.year
-shc["MONTH"] = shc["DATE"].dt.month
+# Monthly totals for the *whole* program (no SUB_TEAM filter)
+month_totals = (
+    cobra.groupby([cobra["DATE"].dt.to_period("M"), "COST-SET"])["HOURS"]
+    .sum()
+    .unstack(fill_value=0.0)
+)
+# convert PeriodIndex -> Timestamp (end of month)
+month_totals.index = month_totals.index.to_timestamp("M")
 
-if shc.empty:
+# ensure required cost-sets exist
+for k in ["BCWS", "ACWP", "ETC", "BCWP"]:
+    if k not in month_totals.columns:
+        month_totals[k] = 0.0
+
+# current month = last month <= ANCHOR that exists in the data
+valid_idx = month_totals.index[month_totals.index <= ANCHOR]
+if len(valid_idx) == 0:
+    # no data before ANCHOR – just make an empty row
     program_manpower_tbl = pd.DataFrame(
         {
             "SUB_TEAM": ["SHC"],
@@ -45,50 +59,41 @@ if shc.empty:
         }
     )
 else:
-    # Prefer ANCHOR month if it exists in SHC, otherwise use last SHC month
-    anchor_y, anchor_m = ANCHOR.year, ANCHOR.month
-    has_anchor_month = ((shc["YEAR"] == anchor_y) & (shc["MONTH"] == anchor_m)).any()
+    cur_period = valid_idx.max()
 
-    if has_anchor_month:
-        cur_year, cur_month = anchor_y, anchor_m
+    # next month = first month > current that exists (if any)
+    future_idx = month_totals.index[month_totals.index > cur_period]
+    next_period = future_idx.min() if len(future_idx) > 0 else None
+
+    cur = month_totals.loc[cur_period]
+    if next_period is not None:
+        nxt = month_totals.loc[next_period]
     else:
-        last_date = shc["DATE"].max()
-        cur_year, cur_month = int(last_date.year), int(last_date.month)
+        # if there is no future month in Cobra, treat as zeros
+        nxt = pd.Series({"BCWS": 0.0, "ACWP": 0.0, "ETC": 0.0})
 
-    if cur_month == 12:
-        next_year, next_month = cur_year + 1, 1
-    else:
-        next_year, next_month = cur_year, cur_month + 1
-
-    cur_hours = (
-        shc[(shc["YEAR"] == cur_year) & (shc["MONTH"] == cur_month)]
-        .groupby("COST-SET")["HOURS"]
-        .sum()
-    )
-    next_hours = (
-        shc[(shc["YEAR"] == next_year) & (shc["MONTH"] == next_month)]
-        .groupby("COST-SET")["HOURS"]
-        .sum()
-    )
-
-    cur_hours = cur_hours.reindex(["BCWS", "ACWP", "ETC"], fill_value=0.0)
-    next_hours = next_hours.reindex(["BCWS", "ACWP", "ETC"], fill_value=0.0)
-
+    cur_year, cur_month = cur_period.year, cur_period.month
     cur_avail = get_available_hours(cur_year, cur_month)
-    next_avail = get_available_hours(next_year, next_month)
 
-    demand = cur_hours["BCWS"] / cur_avail if cur_avail and not np.isnan(cur_avail) else np.nan
-    actual = cur_hours["ACWP"] / cur_avail if cur_avail and not np.isnan(cur_avail) else np.nan
+    if next_period is not None:
+        next_year, next_month = next_period.year, next_period.month
+        next_avail = get_available_hours(next_year, next_month)
+    else:
+        next_avail = np.nan
+
+    # Convert hours -> FTE (headcount)
+    demand = cur["BCWS"] / cur_avail if cur_avail and not np.isnan(cur_avail) else np.nan
+    actual = cur["ACWP"] / cur_avail if cur_avail and not np.isnan(cur_avail) else np.nan
     next_bcws_fte = (
-        next_hours["BCWS"] / next_avail if next_avail and not np.isnan(next_avail) else np.nan
+        nxt["BCWS"] / next_avail if next_avail and not np.isnan(next_avail) else np.nan
     )
     next_etc_fte = (
-        next_hours["ETC"] / next_avail if next_avail and not np.isnan(next_avail) else np.nan
+        nxt["ETC"] / next_avail if next_avail and not np.isnan(next_avail) else np.nan
     )
 
     program_manpower_tbl = pd.DataFrame(
         {
-            "SUB_TEAM": ["SHC"],
+            "SUB_TEAM": ["SHC"],  # label like the dashboard
             "Demand": [round(demand, 1)],
             "Actual": [round(actual, 1)],
             "Next Month BCWS": [round(next_bcws_fte, 1)],
@@ -97,20 +102,9 @@ else:
     )
 
 # -------------------------------------------------------------------
-# 2) EVMS TABLE (Monthly & Cumulative CPI / SPI)
+# 2) EVMS TABLE (Monthly & Cumulative CPI / SPI) – using same month_totals
 # -------------------------------------------------------------------
-cobra_ctd = cobra[cobra["DATE"] <= ANCHOR].copy()
-
-ev = (
-    cobra_ctd.groupby([pd.Grouper(key="DATE", freq="M"), "COST-SET"])["HOURS"]
-    .sum()
-    .unstack(fill_value=0.0)
-    .sort_index()
-)
-
-for k in ["BCWP", "BCWS", "ACWP"]:
-    if k not in ev.columns:
-        ev[k] = 0.0
+ev = month_totals[month_totals.index <= ANCHOR].copy().sort_index()
 
 ev["CPI_month"] = np.where(ev["ACWP"] == 0, np.nan, ev["BCWP"] / ev["ACWP"])
 ev["SPI_month"] = np.where(ev["BCWS"] == 0, np.nan, ev["BCWP"] / ev["BCWS"])
@@ -127,12 +121,12 @@ evms_tbl["Month"] = evms_tbl.index.to_period("M").strftime("%b-%y")
 evms_tbl = evms_tbl.reset_index(drop=True)
 
 # -------------------------------------------------------------------
-# 3) EVMS PLOTLY CHART (bands + 4 series)
+# 3) EVMS PLOTLY CHART
 # -------------------------------------------------------------------
 fig = go.Figure()
 
 if not evms_tbl.empty:
-    # colored bands
+    # performance bands
     fig.add_hrect(y0=0.90, y1=0.95, fillcolor="#ff4d4d", opacity=0.3, line_width=0, layer="below")
     fig.add_hrect(y0=0.95, y1=1.00, fillcolor="#ffd633", opacity=0.3, line_width=0, layer="below")
     fig.add_hrect(y0=1.00, y1=1.10, fillcolor="#66cc66", opacity=0.3, line_width=0, layer="below")
