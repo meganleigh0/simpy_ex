@@ -1,93 +1,124 @@
-# Plotly visuals for XM30 – Sep hours by Org and Make/Buy part counts
 import plotly.express as px
+import plotly.graph_objects as go
 import pandas as pd
 
-# -------------------------------------------------------------------
-# 1) Sep labor hours by Org (using CWS labor hours on xm30_mbom_merged_2)
-# -------------------------------------------------------------------
+# ------------------------------------------------------------
+# 1. DEFINE DATA SOURCES
+# ------------------------------------------------------------
+df_xm30 = xm30_mbom_merged_2.copy()               # XM30 merged dataset
+df_sep  = v3_scr_lim_ang_makes.copy()             # SEP dataset (update if needed)
 
-# If your merged XM30 dataframe has a different name, update here:
-df_xm30 = xm30_mbom_merged_2.copy()
+# detect Make/Buy column
+mb_col = [c for c in df_xm30.columns if 'Make/Buy' in c][0]
 
-# If there is a specific September-hours column, put that name here.
-# Otherwise we’ll treat CWS as the September hours baseline.
-hours_col = 'CWS'   # change to e.g. 'Sep_hours' if you have that column
+# ------------------------------------------------------------
+# 2. CALCULATE 80% PREDICTED HOURS FOR XM30
+# ------------------------------------------------------------
+df_xm30['Pred_Hours'] = df_xm30['CWS'] * df_xm30['Children'] * 0.80
 
-sep_hours_by_org = (
-    df_xm30
-        .groupby('Org', as_index=False)[hours_col]
-        .sum()
-        .rename(columns={hours_col: 'Sep_hours'})
-        .sort_values('Sep_hours', ascending=False)
+# ------------------------------------------------------------
+# 3. GROUPED METRICS PER ORG
+# ------------------------------------------------------------
+
+# XM30 part counts by Make/Buy
+xm30_counts = (
+    df_xm30.groupby(['Org', mb_col], as_index=False)['Part_Number']
+    .nunique()
+    .rename(columns={'Part_Number': 'XM30_Parts'})
 )
 
-# Optional: enforce a logical Org order if you mainly use these sites
-org_order = ['TLH', 'SCR', 'LIM', 'GRW', 'COP']
-sep_hours_by_org['Org'] = pd.Categorical(
-    sep_hours_by_org['Org'],
-    categories=org_order + [o for o in sep_hours_by_org['Org'].unique() if o not in org_order],
-    ordered=True
-)
-sep_hours_by_org = sep_hours_by_org.sort_values('Org')
-
-fig_hours = px.bar(
-    sep_hours_by_org,
-    x='Org',
-    y='Sep_hours',
-    text='Sep_hours',
-    title='XM30 Sep Labor Hours by Org (CWS-based)'
-)
-fig_hours.update_traces(texttemplate='%{text:.0f}', textposition='outside')
-fig_hours.update_layout(
-    xaxis_title='Org',
-    yaxis_title='Labor Hours (Sep)',
-    uniformtext_minsize=8,
-    uniformtext_mode='hide'
+# SEP part counts by Make/Buy
+sep_counts = (
+    df_sep.groupby(['Org', mb_col], as_index=False)['Part_Number']
+    .nunique()
+    .rename(columns={'Part_Number': 'SEP_Parts'})
 )
 
-fig_hours.show()
-
-# -------------------------------------------------------------------
-# 2) Part counts by Make / Buy by Org for XM30
-# -------------------------------------------------------------------
-
-# Figure out which Make/Buy column exists in your merged XM30 df
-if 'Make/Buy_Oracle' in df_xm30.columns:
-    mb_col = 'Make/Buy_Oracle'
-elif 'Make/Buy' in df_xm30.columns:
-    mb_col = 'Make/Buy'
-else:
-    raise KeyError("No Make/Buy column found – expected 'Make/Buy_Oracle' or 'Make/Buy'.")
-
-parts_mb_org = (
-    df_xm30
-        .groupby(['Org', mb_col], as_index=False)['Part_Number']
-        .nunique()
-        .rename(columns={'Part_Number': 'Num_parts'})
+# SEP actual hours
+sep_hours = (
+    df_sep.groupby(['Org'], as_index=False)['CWS']
+    .sum()
+    .rename(columns={'CWS': 'SEP_Hours'})
 )
 
-# keep Org ordering consistent with the first chart
-parts_mb_org['Org'] = pd.Categorical(
-    parts_mb_org['Org'],
-    categories=sep_hours_by_org['Org'].cat.categories,
-    ordered=True
-)
-parts_mb_org = parts_mb_org.sort_values(['Org', mb_col])
-
-fig_parts = px.bar(
-    parts_mb_org,
-    x='Org',
-    y='Num_parts',
-    color=mb_col,
-    barmode='stack',      # change to 'group' if you prefer side-by-side bars
-    text='Num_parts',
-    title='XM30 Parts by Make/Buy and Org'
-)
-fig_parts.update_traces(texttemplate='%{text}', textposition='inside')
-fig_parts.update_layout(
-    xaxis_title='Org',
-    yaxis_title='Number of Unique Parts',
-    legend_title='Make / Buy'
+# XM30 predicted hours (80%)
+xm30_hours = (
+    df_xm30.groupby(['Org'], as_index=False)['Pred_Hours']
+    .sum()
+    .rename(columns={'Pred_Hours': 'XM30_Pred_Hours'})
 )
 
-fig_parts.show()
+# Combine metrics
+org_metrics = (
+    xm30_counts
+        .merge(sep_counts, on=['Org', mb_col], how='outer')
+        .merge(sep_hours, on='Org', how='left')
+        .merge(xm30_hours, on='Org', how='left')
+)
+
+# ------------------------------------------------------------
+# 4. CREATE VISUALS PER ORG
+# ------------------------------------------------------------
+orgs = org_metrics['Org'].unique()
+
+for org in orgs:
+    df_o = org_metrics[org_metrics['Org'] == org]
+
+    fig = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=(
+            f"{org} – Part Counts (Make/Buy)",
+            f"{org} – Hours (SEP vs XM30 Predicted)"
+        ),
+        specs=[[{"type": "bar"}, {"type": "bar"}]]
+    )
+
+    # --- LEFT: Part counts ---
+    fig.add_trace(
+        go.Bar(
+            x=df_o[mb_col],
+            y=df_o['XM30_Parts'],
+            name="XM30 Parts",
+            marker_color='#1f77b4'
+        ),
+        row=1, col=1
+    )
+    fig.add_trace(
+        go.Bar(
+            x=df_o[mb_col],
+            y=df_o['SEP_Parts'],
+            name="SEP Parts",
+            marker_color='#ff7f0e'
+        ),
+        row=1, col=1
+    )
+
+    # --- RIGHT: Hours ---
+    fig.add_trace(
+        go.Bar(
+            x=['SEP Hours'],
+            y=[df_o['SEP_Hours'].iloc[0]],
+            name='SEP Hours',
+            marker_color='#2ca02c'
+        ),
+        row=1, col=2
+    )
+    fig.add_trace(
+        go.Bar(
+            x=['XM30 Pred Hours'],
+            y=[df_o['XM30_Pred_Hours'].iloc[0]],
+            name='XM30 Pred. Hours (80%)',
+            marker_color='#d62728'
+        ),
+        row=1, col=2
+    )
+
+    fig.update_layout(
+        title=f"{org} – XM30 & SEP Summary",
+        barmode='group',
+        height=500,
+        width=1100,
+        showlegend=True
+    )
+
+    fig.show()
