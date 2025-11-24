@@ -1,219 +1,156 @@
-# ------------------------------------------------------------
-# Pies & Bars for Make/Buy Part Distributions and SEP Hours
-# ------------------------------------------------------------
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-# ---- 1. Source dataframes ----
-df_xm30 = xm30_mbom_merged_2.copy()       # XM30 merged dataset
-df_sep  = v3_scr_lim_ang_makes.copy()     # SEP dataset (change if needed)
+# ------------------------------------------------------------
+# Helper functions to find dataframes and clean Make/Buy
+# ------------------------------------------------------------
+def first_existing_df(names):
+    """Return the first dataframe from globals() that exists and is not None."""
+    g = globals()
+    for n in names:
+        if n in g and isinstance(g[n], pd.DataFrame):
+            return g[n].copy()
+    return None
 
-# Detect Make/Buy column name
-mb_candidates = [c for c in df_xm30.columns if 'Make/Buy' in c]
-if not mb_candidates:
-    raise KeyError("No column containing 'Make/Buy' found in XM30 dataset.")
-mb_col = mb_candidates[0]
+def detect_make_buy_col(df):
+    candidates = [c for c in df.columns if 'Make/Buy' in c]
+    if not candidates:
+        raise KeyError("No column containing 'Make/Buy' found in dataframe.")
+    return candidates[0]
 
-# Standardize Make/Buy labels into 'Make' / 'Buy'
-def clean_mb(s):
+def clean_mb_series(s):
     s = s.astype(str).str.strip().str.upper()
     out = np.where(s == 'MAKE', 'Make',
           np.where(s == 'BUY',  'Buy',  'Other'))
     return pd.Series(out, index=s.index)
 
-df_xm30['MB_group'] = clean_mb(df_xm30[mb_col])
-df_sep['MB_group']  = clean_mb(df_sep[mb_col])
-
-# Keep only Make/Buy (drop "Other", if any)
-df_xm30 = df_xm30[df_xm30['MB_group'].isin(['Make', 'Buy'])]
-df_sep  = df_sep[df_sep['MB_group'].isin(['Make', 'Buy'])]
-
-# ------------------------------------------------------------
-# 2. Aggregations for pies
-# ------------------------------------------------------------
-
-def agg_parts_by_org(df, mb_value):
-    """Unique part counts by Org for a specific Make/Buy value."""
-    sub = df[df['MB_group'] == mb_value]
-    if sub.empty:
-        return pd.DataFrame(columns=['Org', 'Num_Parts'])
-    out = (sub
-           .groupby('Org', as_index=False)['Part_Number']
+def summarize_bom(df, program, source):
+    """Return rows: Program, Source, MB_group, Num_Parts."""
+    if df is None:
+        return pd.DataFrame(columns=['Program','Source','MB_group','Num_Parts'])
+    mb_col = detect_make_buy_col(df)
+    tmp = df.copy()
+    tmp['MB_group'] = clean_mb_series(tmp[mb_col])
+    # group by Make/Buy; use unique Part_Number counts
+    grp = (
+        tmp.groupby('MB_group', as_index=False)['Part_Number']
            .nunique()
-           .rename(columns={'Part_Number': 'Num_Parts'}))
-    out = out[(out['Org'].notna()) & (out['Num_Parts'] > 0)]
-    return out
-
-# XM30 parts
-xm30_make_org = agg_parts_by_org(df_xm30, 'Make')
-xm30_buy_org  = agg_parts_by_org(df_xm30, 'Buy')
-
-# SEP parts
-sep_make_org = agg_parts_by_org(df_sep, 'Make')
-sep_buy_org  = agg_parts_by_org(df_sep, 'Buy')
-
-# SEP hours by Org (sum of CWS)
-sep_hours_org = (
-    df_sep.groupby('Org', as_index=False)['CWS']
-    .sum()
-    .rename(columns={'CWS': 'SEP_Hours'})
-)
-sep_hours_org = sep_hours_org[(sep_hours_org['Org'].notna()) &
-                              (sep_hours_org['SEP_Hours'] > 0)]
+           .rename(columns={'Part_Number': 'Num_Parts'})
+    )
+    grp['Program'] = program
+    grp['Source'] = source
+    # reorder columns
+    return grp[['Program','Source','MB_group','Num_Parts']]
 
 # ------------------------------------------------------------
-# 3. PIE CHART GRID
+# 1. Locate the BOM dataframes in your notebook
+# ------------------------------------------------------------
+xm30_oracle_df = first_existing_df(['xm30_oracle_mbom', 'xm30_oracle_mbom_merged'])
+xm30_tc_df     = first_existing_df(['xm30_tc_mbom', 'xm30_tc_mbom_merged'])
+sep_oracle_df  = first_existing_df(['sep_oracle_mbom', 'v3_oracle_mbom', 'sep_oracle_mbom_merged'])
+sep_tc_df      = first_existing_df(['sep_tc_mbom', 'v3_tc_mbom', 'sep_tc_mbom_merged'])
+
+# ------------------------------------------------------------
+# 2. Build the combined summary table
+# ------------------------------------------------------------
+summary_list = []
+summary_list.append(summarize_bom(xm30_oracle_df, 'XM30', 'Oracle'))
+summary_list.append(summarize_bom(xm30_tc_df,     'XM30', 'Teamcenter'))
+summary_list.append(summarize_bom(sep_oracle_df,  'SEP',  'Oracle'))
+summary_list.append(summarize_bom(sep_tc_df,      'SEP',  'Teamcenter'))
+
+summary = pd.concat(summary_list, ignore_index=True)
+summary = summary[summary['Num_Parts'] > 0]  # remove empties
+
+display(summary)  # optional: see the numeric table defining your universe
+
+# ------------------------------------------------------------
+# 3. PIE CHARTS – Make vs Buy for each Program & Source
 # ------------------------------------------------------------
 fig_pies = make_subplots(
-    rows=3, cols=2,
-    specs=[
-        [{"type": "domain"}, {"type": "domain"}],
-        [{"type": "domain"}, {"type": "domain"}],
-        [{"type": "domain"}, {"type": None}]
-    ],
+    rows=2, cols=2,
+    specs=[[{"type": "domain"}, {"type": "domain"}],
+           [{"type": "domain"}, {"type": "domain"}]],
     subplot_titles=(
-        "XM30 – MAKES: Parts by Org",
-        "XM30 – BUYS: Parts by Org",
-        "SEP – MAKES: Parts by Org",
-        "SEP – BUYS: Parts by Org",
-        "SEP – Hours by Org",
-        ""
+        "XM30 – Oracle (Make vs Buy)",
+        "XM30 – Teamcenter (Make vs Buy)",
+        "SEP – Oracle (Make vs Buy)",
+        "SEP – Teamcenter (Make vs Buy)"
     )
 )
 
-# XM30 Make
-if not xm30_make_org.empty:
+def add_pie(program, source, row, col):
+    sub = summary[(summary['Program'] == program) &
+                  (summary['Source'] == source)]
+    if sub.empty:
+        return
     fig_pies.add_trace(
         go.Pie(
-            labels=xm30_make_org['Org'],
-            values=xm30_make_org['Num_Parts'],
-            hole=0.4,
-            name="XM30 Make Parts"
+            labels=sub['MB_group'],
+            values=sub['Num_Parts'],
+            name=f"{program} {source}",
+            hole=0.4
         ),
-        row=1, col=1
+        row=row, col=col
     )
 
-# XM30 Buy
-if not xm30_buy_org.empty:
-    fig_pies.add_trace(
-        go.Pie(
-            labels=xm30_buy_org['Org'],
-            values=xm30_buy_org['Num_Parts'],
-            hole=0.4,
-            name="XM30 Buy Parts"
-        ),
-        row=1, col=2
-    )
+add_pie('XM30', 'Oracle',      1, 1)
+add_pie('XM30', 'Teamcenter',  1, 2)
+add_pie('SEP',  'Oracle',      2, 1)
+add_pie('SEP',  'Teamcenter',  2, 2)
 
-# SEP Make
-if not sep_make_org.empty:
-    fig_pies.add_trace(
-        go.Pie(
-            labels=sep_make_org['Org'],
-            values=sep_make_org['Num_Parts'],
-            hole=0.4,
-            name="SEP Make Parts"
-        ),
-        row=2, col=1
-    )
-
-# SEP Buy
-if not sep_buy_org.empty:
-    fig_pies.add_trace(
-        go.Pie(
-            labels=sep_buy_org['Org'],
-            values=sep_buy_org['Num_Parts'],
-            hole=0.4,
-            name="SEP Buy Parts"
-        ),
-        row=2, col=2
-    )
-
-# SEP Hours
-if not sep_hours_org.empty:
-    fig_pies.add_trace(
-        go.Pie(
-            labels=sep_hours_org['Org'],
-            values=sep_hours_org['SEP_Hours'],
-            hole=0.4,
-            name="SEP Hours"
-        ),
-        row=3, col=1
-    )
-
-# Text = label + percent + raw value
+# show label + percent + raw value
 fig_pies.update_traces(textinfo='label+percent+value')
 
 fig_pies.update_layout(
-    title_text="XM30 vs SEP – Make / Buy Part Distributions and SEP Hours by Org",
-    height=1100,
-    width=1100,
-    legend_title="Org"
+    title_text="XM30 & SEP – Make vs Buy Distribution by Source (Oracle vs Teamcenter)",
+    height=800,
+    width=1000
 )
 
 fig_pies.show()
 
 # ------------------------------------------------------------
-# 4. BAR CHARTS (my “must have” views)
+# 4. BAR CHARTS – High-level “universe” views
 # ------------------------------------------------------------
 
-# XM30 parts by Org & Make/Buy
-xm30_parts_org_mb = (
-    df_xm30
-    .groupby(['Org', 'MB_group'], as_index=False)['Part_Number']
-    .nunique()
-    .rename(columns={'Part_Number': 'Num_Parts'})
+# 4a. Total parts by Program & Source (regardless of Make/Buy)
+prog_source_totals = (
+    summary.groupby(['Program','Source'], as_index=False)['Num_Parts']
+           .sum()
 )
-xm30_parts_org_mb = xm30_parts_org_mb[xm30_parts_org_mb['Num_Parts'] > 0]
 
-fig_bar_xm30 = px.bar(
-    xm30_parts_org_mb,
-    x='Org',
+fig_bar1 = px.bar(
+    prog_source_totals,
+    x='Program',
     y='Num_Parts',
-    color='MB_group',
+    color='Source',
     barmode='group',
     text='Num_Parts',
-    title='XM30 – Number of Parts by Org and Make/Buy'
+    title='Total Unique Parts by Program and Source (Oracle vs Teamcenter)'
 )
-fig_bar_xm30.update_traces(textposition='outside')
-fig_bar_xm30.update_layout(yaxis_title='Number of Parts', xaxis_title='Org',
-                           legend_title='Make/Buy')
-fig_bar_xm30.show()
+fig_bar1.update_traces(textposition='outside')
+fig_bar1.update_layout(yaxis_title='Number of Unique Parts', xaxis_title='Program')
+fig_bar1.show()
 
-# SEP parts by Org & Make/Buy
-sep_parts_org_mb = (
-    df_sep
-    .groupby(['Org', 'MB_group'], as_index=False)['Part_Number']
-    .nunique()
-    .rename(columns={'Part_Number': 'Num_Parts'})
-)
-sep_parts_org_mb = sep_parts_org_mb[sep_parts_org_mb['Num_Parts'] > 0]
-
-fig_bar_sep = px.bar(
-    sep_parts_org_mb,
-    x='Org',
+# 4b. Parts by Program, Source, and Make/Buy (stacked)
+fig_bar2 = px.bar(
+    summary,
+    x='Program',
     y='Num_Parts',
     color='MB_group',
-    barmode='group',
+    pattern_shape='Source',
+    barmode='stack',
     text='Num_Parts',
-    title='SEP – Number of Parts by Org and Make/Buy'
+    title='Parts by Program, Source, and Make/Buy'
 )
-fig_bar_sep.update_traces(textposition='outside')
-fig_bar_sep.update_layout(yaxis_title='Number of Parts', xaxis_title='Org',
-                          legend_title='Make/Buy')
-fig_bar_sep.show()
-
-# SEP Hours by Org
-fig_bar_sep_hours = px.bar(
-    sep_hours_org,
-    x='Org',
-    y='SEP_Hours',
-    text='SEP_Hours',
-    title='SEP – Total Labor Hours (CWS) by Org'
+fig_bar2.update_traces(textposition='inside')
+fig_bar2.update_layout(
+    yaxis_title='Number of Unique Parts',
+    xaxis_title='Program',
+    legend_title='Make/Buy (pattern = Source)'
 )
-fig_bar_sep_hours.update_traces(texttemplate='%{text:.1f}', textposition='outside')
-fig_bar_sep_hours.update_layout(yaxis_title='Labor Hours (SEP)', xaxis_title='Org')
-fig_bar_sep_hours.show()
+fig_bar2.show()
