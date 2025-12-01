@@ -1,5 +1,5 @@
 # =========================================================
-# XM30 EVMS + BEI → 7-Slide PowerPoint Using Theme.pptx
+# XM30 EVMS + BEI → PowerPoint (data/Theme.pptx)
 # =========================================================
 import os
 from datetime import datetime, timedelta
@@ -7,7 +7,6 @@ from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-import plotly.io as pio
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
@@ -22,7 +21,7 @@ COBRA_SHEET      = "tbl_Weekly Extract"   # adjust if needed
 
 PENSKE_PATH      = "data/OpenPlan_Activity-Penske.xlsx"
 
-THEME_PATH       = "Theme.pptx"           # must exist
+THEME_PATH       = "data/Theme.pptx"      # <-- your theme location
 OUTPUT_PPTX      = f"{PROGRAM}_EVMS_Update.pptx"
 EV_PLOT_PATH     = "evms_chart.png"
 EV_PLOT_HTML     = "evms_chart.html"
@@ -34,14 +33,13 @@ COSTSET_COL = "COST-SET"
 HOURS_COL   = "HOURS"
 COST_SETS   = ["ACWP", "BCWP", "BCWS", "ETC"]
 
-# Penske columns (from your screenshot)
+# Penske columns
 P_BF_COL    = "Baseline Finish"
 P_AF_COL    = "Actual Finish"
 P_TYPE_COL  = "Activity_Type"
 P_ID_COL    = "Activity ID"
-P_GROUP_COL = "SubTeam"   # change if you want to group by Planner, CAM, etc.
+P_GROUP_COL = "SubTeam"   # grouping for BEI
 
-# Snapshot date (when the notebook is run)
 SNAPSHOT_DATE = datetime.now()
 
 # =========================================================
@@ -65,7 +63,7 @@ def cost_rollup(df, start=None, end=None, by_group=True):
     """
     Summarize ACWP / BCWP / BCWS / ETC.
     If by_group=True, returns SUB_TEAM x COST-SET table.
-    If by_group=False, returns dict of total values per COST-SET.
+    If by_group=False, returns dict of totals per COST-SET.
     """
     m = df[DATE_COL].notna()
     if start is not None:
@@ -90,11 +88,9 @@ def cost_rollup(df, start=None, end=None, by_group=True):
 ytd_start = datetime(SNAPSHOT_DATE.year, 1, 1)
 w4_start  = SNAPSHOT_DATE - timedelta(weeks=4)
 
-# By SUB_TEAM
 ctd_by_group = cost_rollup(cobra, end=SNAPSHOT_DATE, by_group=True)
 ytd_by_group = cost_rollup(cobra, start=ytd_start, end=SNAPSHOT_DATE, by_group=True)
 
-# Totals
 ctd_tot = cost_rollup(cobra, end=SNAPSHOT_DATE, by_group=False)
 ytd_tot = cost_rollup(cobra, start=ytd_start, end=SNAPSHOT_DATE, by_group=False)
 w4_tot  = cost_rollup(cobra, start=w4_start, end=SNAPSHOT_DATE, by_group=False)
@@ -122,6 +118,7 @@ labor_tbl = pd.DataFrame(
 )
 labor_tbl.index.name = GROUP_COL
 
+# TOTAL row
 tot_bac = ctd_tot["BCWS"]
 tot_acw = ctd_tot["ACWP"]
 tot_bcw = ctd_tot["BCWP"]
@@ -133,7 +130,7 @@ tot_pcomp = np.nan if np.isclose(tot_bac, 0) else round((tot_bcw / tot_bac) * 10
 labor_tbl.loc["TOTAL"] = [tot_bac, tot_acw, tot_bcw, tot_etc, tot_eac, tot_vac, tot_pcomp]
 labor_tbl_reset = labor_tbl.reset_index().rename(columns={GROUP_COL: "SUB_TEAM"})
 
-# ---- Monthly Labor Ratios table ----
+# ---- Monthly Labor Ratios ----
 labor_monthly_tbl = pd.DataFrame(
     {
         "SUB_TEAM": labor_tbl_reset["SUB_TEAM"],
@@ -144,9 +141,9 @@ labor_monthly_tbl = pd.DataFrame(
                             np.nan,
                             labor_tbl_reset["VAC"] / labor_tbl_reset["BAC"]),
     }
-).set_index("SUB_TEAM")
+)
 
-# ---- Cost & Schedule Performance tables ----
+# ---- Cost & Schedule Performance (CPI/SPI by SUB_TEAM) ----
 def build_cpi_spi(ctd_df, ytd_df):
     cpi_ctd = np.where(ctd_df["ACWP"].eq(0), np.nan, ctd_df["BCWP"] / ctd_df["ACWP"])
     cpi_ytd = np.where(ytd_df["ACWP"].eq(0), np.nan, ytd_df["BCWP"] / ytd_df["ACWP"])
@@ -172,6 +169,10 @@ def build_cpi_spi(ctd_df, ytd_df):
 
 cost_performance_tbl, schedule_performance_tbl = build_cpi_spi(ctd_by_group, ytd_by_group)
 
+# Add SUB_TEAM column so it shows up in tables
+cost_performance_tbl = cost_performance_tbl.reset_index().rename(columns={"index": "SUB_TEAM"})
+schedule_performance_tbl = schedule_performance_tbl.reset_index().rename(columns={"index": "SUB_TEAM"})
+
 # ---- EVMS Metrics table (program-level SPI/CPI for 4WK/YTD/CTD) ----
 spi_4wk = safe_div(w4_tot["BCWP"], w4_tot["BCWS"])
 spi_ytd = safe_div(ytd_tot["BCWP"], ytd_tot["BCWS"])
@@ -183,11 +184,11 @@ cpi_ctd = safe_div(ctd_tot["BCWP"], ctd_tot["ACWP"])
 
 evms_metrics_tbl = pd.DataFrame(
     {
+        "Metric": ["SPI", "CPI"],
         "4WK": [spi_4wk, cpi_4wk],
         "YTD": [spi_ytd, cpi_ytd],
         "CTD": [spi_ctd, cpi_ctd],
-    },
-    index=["SPI", "CPI"],
+    }
 ).round(2)
 
 # =========================================================
@@ -243,13 +244,14 @@ fig.update_layout(
     margin=dict(l=40, r=20, t=60, b=80),
 )
 
-# --- Try to save PNG in two ways; also always save HTML as a fallback ---
+# Try to save PNG; always save HTML backup
 ev_image_ok = False
 try:
     fig.write_image(EV_PLOT_PATH, format="png", width=1200, height=700, scale=2)
     ev_image_ok = True
 except Exception:
     try:
+        import plotly.io as pio  # if not imported yet
         img_bytes = fig.to_image(format="png", width=1200, height=700, scale=2)
         with open(EV_PLOT_PATH, "wb") as f:
             f.write(img_bytes)
@@ -257,19 +259,18 @@ except Exception:
     except Exception:
         ev_image_ok = False
 
-# Always save an HTML file so you can open the plot and screenshot it if needed
 try:
     fig.write_html(EV_PLOT_HTML)
 except Exception:
-    pass  # HTML is just a convenience, not required
+    pass
 
 # =========================================================
 # 5. BEI TABLE (Penske)
 # =========================================================
-# NOTE FOR SME (leave for your next meeting):
+# NOTE FOR SME:
 #   Assumptions used for BEI:
 #   - Baseline field: 'Baseline Finish'
-#   - A task is considered Completed when 'Actual Finish' is not null
+#   - A task is Completed when 'Actual Finish' is not null
 #   - Exclude Activity_Type in ['A', 'B'] (LOE, Milestones)
 #   - Grouping: 'SubTeam' (P_GROUP_COL)
 bei_filter = (
@@ -301,14 +302,13 @@ bei_tbl = bei_tbl.reset_index().rename(columns={P_GROUP_COL: "SubTeam"})
 bei_tbl["BEI"] = bei_tbl["BEI"].round(2)
 
 # =========================================================
-# 6. COLOR HELPERS FOR TABLE CELLS
+# 6. COLOR HELPERS
 # =========================================================
 def hex_to_rgb(hex_color):
     h = hex_color.lstrip("#")
     return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
 
 def spi_cpi_cell_color(val):
-    """Color SPI / CPI-style indices."""
     if val is None or (isinstance(val, float) and np.isnan(val)):
         return None, None
     v = float(val)
@@ -323,7 +323,6 @@ def spi_cpi_cell_color(val):
     return hex_to_rgb(bg), hex_to_rgb(fg)
 
 def vac_cell_color(val):
-    """Color VAC (or VAC/BAC ratios)."""
     if val is None or (isinstance(val, float) and np.isnan(val)):
         return None, None
     v = float(val)
@@ -336,21 +335,17 @@ def vac_cell_color(val):
     return hex_to_rgb(bg), hex_to_rgb(fg)
 
 # =========================================================
-# 7. POWERPOINT – USING Theme.pptx
+# 7. POWERPOINT – Theme, Title Slide, Tables
 # =========================================================
 if not os.path.exists(THEME_PATH):
     raise FileNotFoundError(
         f"Theme file '{THEME_PATH}' not found. "
-        "Place Theme.pptx in the working directory or update THEME_PATH."
+        "Update THEME_PATH or move Theme.pptx into data/."
     )
 
 prs = Presentation(THEME_PATH)
 
 def add_table_slide(prs, title, df, fmt=None, color_cols=None, layout_idx=5):
-    """
-    Adds a slide with title = `title` and a table from df.
-    Tables are sized to fit cleanly on the slide.
-    """
     if fmt is None:
         fmt = {}
     if color_cols is None:
@@ -359,14 +354,12 @@ def add_table_slide(prs, title, df, fmt=None, color_cols=None, layout_idx=5):
     layout_idx = min(layout_idx, len(prs.slide_layouts) - 1)
     slide = prs.slides.add_slide(prs.slide_layouts[layout_idx])
 
-    # Slide title (use table name / requested title)
     if slide.shapes.title:
         slide.shapes.title.text = title
 
     rows, cols = df.shape
     rows += 1  # header row
 
-    # Layout to keep tables tidy and visible
     left = Inches(0.4)
     top = Inches(1.2)
     width = prs.slide_width - Inches(0.8)
@@ -374,7 +367,7 @@ def add_table_slide(prs, title, df, fmt=None, color_cols=None, layout_idx=5):
 
     table = slide.shapes.add_table(rows, cols, left, top, width, height).table
 
-    # Headers
+    # headers
     for j, col in enumerate(df.columns):
         cell = table.cell(0, j)
         cell.text = str(col)
@@ -382,7 +375,7 @@ def add_table_slide(prs, title, df, fmt=None, color_cols=None, layout_idx=5):
         p.font.bold = True
         p.font.size = Pt(11)
 
-    # Body
+    # body
     for i, (_, row) in enumerate(df.iterrows(), start=1):
         for j, col in enumerate(df.columns):
             val = row[col]
@@ -397,9 +390,8 @@ def add_table_slide(prs, title, df, fmt=None, color_cols=None, layout_idx=5):
 
             cell = table.cell(i, j)
             cell.text = text
-
             p = cell.text_frame.paragraphs[0]
-            p.font.size = Pt(9)  # smaller so more rows fit
+            p.font.size = Pt(9)
 
             color_fn = color_cols.get(col)
             if color_fn:
@@ -412,11 +404,21 @@ def add_table_slide(prs, title, df, fmt=None, color_cols=None, layout_idx=5):
 
     return slide
 
-# ---- Slide 1: EVMS Plot (title = program + date) ----
+# ---- Slide 1: Title slide ----
+title_layout = prs.slide_layouts[0]  # usually title slide
+title_slide = prs.slides.add_slide(title_layout)
+if title_slide.shapes.title:
+    title_slide.shapes.title.text = PROGRAM
+# subtitle (current date)
+if len(title_slide.placeholders) > 1:
+    subtitle = title_slide.placeholders[1]
+    subtitle.text = SNAPSHOT_DATE.strftime("%Y-%m-%d")
+
+# ---- Slide 2: EV chart ----
 layout_idx_plot = 5 if len(prs.slide_layouts) > 5 else 1
 slide_plot = prs.slides.add_slide(prs.slide_layouts[layout_idx_plot])
 if slide_plot.shapes.title:
-    slide_plot.shapes.title.text = f"{PROGRAM} EVMS – {SNAPSHOT_DATE:%Y-%m-%d}"
+    slide_plot.shapes.title.text = "EV Indices (SPI / CPI)"
 
 if ev_image_ok and os.path.exists(EV_PLOT_PATH):
     left = Inches(0.6)
@@ -424,29 +426,28 @@ if ev_image_ok and os.path.exists(EV_PLOT_PATH):
     width = prs.slide_width - Inches(1.2)
     slide_plot.shapes.add_picture(EV_PLOT_PATH, left, top, width=width)
 else:
-    # If image export still fails, you still have evms_chart.html as a backup.
     tb = slide_plot.shapes.add_textbox(Inches(1), Inches(2), Inches(8), Inches(1.5))
     tb.text_frame.text = (
         "EVMS chart image could not be exported automatically.\n"
         f"Open '{EV_PLOT_HTML}' in a browser, screenshot it, and paste it here."
     )
 
-# ---- Slide 2: EVMS Metrics Table ----
+# ---- Slide 3: EVMS Metrics ----
 evms_fmt = {"4WK": "{:.2f}", "YTD": "{:.2f}", "CTD": "{:.2f}"}
 evms_colors = {"4WK": spi_cpi_cell_color, "YTD": spi_cpi_cell_color, "CTD": spi_cpi_cell_color}
 add_table_slide(prs, "EVMS Metrics Table", evms_metrics_tbl, fmt=evms_fmt, color_cols=evms_colors)
 
-# ---- Slide 3: Cost Performance Index Table ----
+# ---- Slide 4: Cost Performance Index ----
 cpi_fmt = {"YTD": "{:.2f}", "CTD": "{:.2f}"}
 cpi_colors = {"YTD": spi_cpi_cell_color, "CTD": spi_cpi_cell_color}
 add_table_slide(prs, "Cost Performance Index Table", cost_performance_tbl, fmt=cpi_fmt, color_cols=cpi_colors)
 
-# ---- Slide 4: Schedule Performance Index Table ----
+# ---- Slide 5: Schedule Performance Index ----
 spi_fmt = {"YTD": "{:.2f}", "CTD": "{:.2f}"}
 spi_colors = {"YTD": spi_cpi_cell_color, "CTD": spi_cpi_cell_color}
 add_table_slide(prs, "Schedule Performance Index Table", schedule_performance_tbl, fmt=spi_fmt, color_cols=spi_colors)
 
-# ---- Slide 5: Labor Hours Table ----
+# ---- Slide 6: Labor Hours ----
 labor_fmt = {
     "BAC": "{:,.0f}",
     "ACWP": "{:,.0f}",
@@ -459,18 +460,18 @@ labor_fmt = {
 labor_colors = {"VAC": vac_cell_color}
 add_table_slide(prs, "Labor Hours Table", labor_tbl_reset, fmt=labor_fmt, color_cols=labor_colors)
 
-# ---- Slide 6: Monthly Labor Ratios Table ----
+# ---- Slide 7: Monthly Labor Ratios ----
 labor_monthly_fmt = {"BAC/EAC": "{:.2f}", "VAC/BAC": "{:.2f}"}
 labor_monthly_colors = {"VAC/BAC": vac_cell_color}
 add_table_slide(
     prs,
     "Monthly Labor Ratios Table",
-    labor_monthly_tbl.reset_index(),
+    labor_monthly_tbl,
     fmt=labor_monthly_fmt,
     color_cols=labor_monthly_colors,
 )
 
-# ---- Slide 7: BEI Table ----
+# ---- Slide 8: BEI ----
 bei_fmt = {
     "Tasks w/ Baseline Finish ≤ Snapshot": "{:.0f}",
     "Completed Tasks": "{:.0f}",
@@ -481,4 +482,4 @@ add_table_slide(prs, "Baseline Execution Index (BEI) Table", bei_tbl, fmt=bei_fm
 prs.save(OUTPUT_PPTX)
 print(f"PowerPoint saved: {OUTPUT_PPTX}")
 print(f"EVMS chart PNG path (if export succeeded): {EV_PLOT_PATH}")
-print(f"EVMS chart HTML backup (always saved if possible): {EV_PLOT_HTML}")
+print(f"EVMS chart HTML backup: {EV_PLOT_HTML}")
