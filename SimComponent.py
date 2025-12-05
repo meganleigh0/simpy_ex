@@ -1,303 +1,291 @@
-# ===================================================================
-#  GDLS – EVMS DASHBOARD GENERATOR (Hardened Version)
-#  Supports: SPI, CPI, BEI, Labor, Cost, Schedule, LSP Logic
-# ===================================================================
-
 import pandas as pd
 import numpy as np
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from pptx import Presentation
-from pptx.util import Inches
+from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
-import plotly.graph_objects as go
 
-# ===============================================================
-# CONFIG
-# ===============================================================
+# ============================================================
+# USER CONFIG
+# ============================================================
+
 DATA_DIR = "data"
+OUTPUT = "EVMS_Dashboard_Output.pptx"
 
 PROGRAM_FILES = {
-    "Abrams_STS":       "Cobra-Abrams STS.xlsx",
-    "Abrams_STS_2022":  "Cobra-Abrams STS 2022.xlsx",
-    "XM30":             "Cobra-XM30.xlsx"
+    "Abrams_STS": "Cobra-Abrams STS.xlsx",
+    "XM30": "Cobra-XM30.xlsx",
 }
 
 OPENPLAN_FILE = "OpenPlan_Activity-Penske.xlsx"
-OUTPUT_DIR = "EVMS_Output"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-SNAPSHOT_DATE = datetime.now().date()
+COLOR_THRESHOLDS = {
+    "GOOD": RGBColor(0, 128, 0),
+    "WARN": RGBColor(255, 204, 0),
+    "BAD": RGBColor(204, 0, 0),
+}
 
-# ===============================================================
-# COLORS (GDLS SPEC)
-# ===============================================================
-BLUE   = RGBColor(31, 73, 125)
-TEAL   = RGBColor(142, 180, 227)
-GREEN  = RGBColor(51, 153, 102)
-YELLOW = RGBColor(255, 255, 153)
-RED    = RGBColor(192, 80, 77)
+# ============================================================
+# LOADERS
+# ============================================================
 
-
-# ===============================================================
-# AUTO-DETECT SHEET NAME
-# ===============================================================
-
-def detect_cobra_sheet(path):
+def load_cobra_auto(path):
+    """
+    Reads Cobra export when sheet name varies.
+    Automatically selects the sheet containing "Extract" or "Weekly".
+    """
     xl = pd.ExcelFile(path)
+    sheet = None
     for s in xl.sheet_names:
-        if any(k in s.lower() for k in ["extract", "weekly", "ev", "cap"]):
-            return s
-    return xl.sheet_names[0]
+        if ("extract" in s.lower()) or ("weekly" in s.lower()):
+            sheet = s
+            break
+    if sheet is None:
+        sheet = xl.sheet_names[0]
 
-
-# ===============================================================
-# LOAD COBRA
-# ===============================================================
-
-def load_cobra(path):
-    sheet = detect_cobra_sheet(path)
-    print(f"   → Using Cobra sheet: {sheet}")
-    
-    df = pd.read_excel(path, sheet_name=sheet)
-    df = df.loc[:, ~df.columns.str.contains("Unnamed")]
-
-    # Detect DATE column
-    date_cols = [c for c in df.columns if "DATE" in c.upper()]
-    if not date_cols:
-        raise ValueError(f"No DATE column in {path}")
-
-    df.rename(columns={date_cols[0]: "DATE"}, inplace=True)
+    df = xl.parse(sheet)
+    df = df.loc[:, ~df.columns.astype(str).str.contains("Unnamed")]
     df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
-    df = df.dropna(subset=["DATE"])
-
     return df
 
 
-# ===============================================================
-# EV CALC (CTD or LSP)
-# ===============================================================
-
-def compute_ev(df):
-    if "SUB_TEAM" not in df.columns:
-        raise ValueError("SUB_TEAM column missing in Cobra")
-
-    if "COST-SET" not in df.columns:
-        raise ValueError("COST-SET column missing in Cobra")
-
-    g = df.groupby(["SUB_TEAM", "COST-SET"])["HOURS"].sum().unstack(fill_value=0)
-
-    # Ensure cost set cols exist
-    for col in ["BCWS", "BCWP", "ACWP", "ETC"]:
-        if col not in g.columns:
-            g[col] = 0
-
-    g["SPI"] = np.where(g["BCWS"] == 0, np.nan, g["BCWP"] / g["BCWS"])
-    g["CPI"] = np.where(g["ACWP"] == 0, np.nan, g["BCWP"] / g["ACWP"])
-    g["%COMP"] = np.where(g["BCWS"] == 0, np.nan, (g["BCWP"] / g["BCWS"]) * 100)
-
-    return g.reset_index()
+def load_openplan(path):
+    df = pd.read_excel(path)
+    for c in ["Baseline Finish", "Actual Finish"]:
+        df[c] = pd.to_datetime(df[c], errors="coerce")
+    return df
 
 
-# ===============================================================
-# GET LSP ROWS
-# ===============================================================
+# ============================================================
+# EV CALCULATOR (ACWP, BCWP, BCWS, ETC)
+# ============================================================
 
-def get_lsp(df):
-    lsp = df["DATE"].max()
-    return df[df["DATE"] == lsp]
+def compute_ev(cobra_df):
+
+    df = cobra_df.copy()
+    df = df[df["DATE"].notna()]   # remove blanks
+    df = df[df["HOURS"].notna()]  # needed
+
+    pivot = df.pivot_table(
+        index=["SUB_TEAM", "DATE"],
+        columns="COST-SET",
+        values="HOURS",
+        aggfunc="sum",
+        fill_value=0
+    ).reset_index()
+
+    # CTD is max date
+    max_date = pivot["DATE"].max()
+    ctd = pivot[pivot["DATE"] == max_date].copy()
+
+    # LSP = previous period
+    prev_date = (pivot[pivot["DATE"] < max_date]["DATE"].max())
+    lsp = pivot[pivot["DATE"] == prev_date].copy()
+
+    # rename cost sets if missing
+    for col in ["ACWP", "BCWP", "BCWS", "ETC"]:
+        if col not in ctd.columns:
+            ctd[col] = 0
+        if col not in lsp.columns:
+            lsp[col] = 0
+
+    # computed values
+    def add_metrics(df):
+        df["SPI"] = np.where(df["BCWS"] == 0, np.nan, df["BCWP"] / df["BCWS"])
+        df["CPI"] = np.where(df["ACWP"] == 0, np.nan, df["BCWP"] / df["ACWP"])
+        df["%COMP"] = np.where(df["BCWS"] == 0, np.nan, (df["BCWP"] / df["BCWS"]) * 100)
+        df["BAC"] = df["BCWS"]
+        df["EAC"] = df["ACWP"] + df["ETC"]
+        df["VAC"] = df["BAC"] - df["EAC"]
+        return df
+
+    return add_metrics(ctd), add_metrics(lsp)
 
 
-# ===============================================================
-# FORCE DATE COLUMNS IN OPENPLAN
-# ===============================================================
+# ============================================================
+# BEI CALCULATOR
+# ============================================================
 
-def fix_date_column(df, col):
-    if col not in df.columns:
-        return pd.Series([pd.NaT] * len(df))
-    tmp = df[col].astype(str)
-    return pd.to_datetime(tmp, errors="coerce")
+def compute_bei(openplan_df, subteam_col="SubTeam"):
+    df = openplan_df.copy()
+
+    # total tasks: baseline finish <= snapshot date
+    SNAPSHOT = df["Baseline Finish"].max()
+
+    t_total = df[(df["Baseline Finish"].notna()) &
+                 (df["Baseline Finish"] <= SNAPSHOT)]
+
+    t_done = df[df["Actual Finish"].notna()]
+
+    total = t_total.groupby(subteam_col).size()
+    done = t_done.groupby(subteam_col).size()
+
+    all_idx = total.index.union(done.index)
+
+    total = total.reindex(all_idx, fill_value=0)
+    done = done.reindex(all_idx, fill_value=0)
+
+    bei = done / total.replace(0, np.nan)
+    bei_tbl = pd.DataFrame({"SUB_TEAM": all_idx, "BEI": bei.values})
+    return bei_tbl
 
 
-# ===============================================================
-# BEI CALC
-# ===============================================================
+# ============================================================
+# MERGE EV (CTD/LSP) + BEI
+# ============================================================
 
-def compute_bei(openplan, program, snapshot):
-    df = openplan.copy()
-    df = df[df["Program"] == program]
-
-    if df.empty:
-        print(f"⚠ No OpenPlan rows for {program}")
-        return pd.DataFrame({"SUB_TEAM": [], "BEI": []})
-
-    df["Baseline Finish"] = fix_date_column(df, "Baseline Finish")
-    df["Actual Finish"]   = fix_date_column(df, "Actual Finish")
-
-    if "Activity_Type" not in df.columns:
-        print("⚠ Missing Activity_Type → BEI unavailable")
-        return pd.DataFrame({"SUB_TEAM": df["SubTeam"], "BEI": np.nan})
-
-    df = df[df["Activity_Type"].isin(["A","B"])]
-
-    baseline = df[df["Baseline Finish"] <= pd.to_datetime(snapshot)]
-    complete = df[df["Actual Finish"] <= pd.to_datetime(snapshot)]
-
-    base_ct = baseline.groupby("SubTeam")["Activity ID"].count()
-    comp_ct = complete.groupby("SubTeam")["Activity ID"].count().reindex(base_ct.index, fill_value=0)
-
-    bei = pd.DataFrame({
-        "SUB_TEAM": base_ct.index,
-        "Baseline Tasks": base_ct.values,
-        "Completed Tasks": comp_ct.values
+def merge_ev(ev_ctd, ev_lsp, bei_tbl):
+    ev_ctd = ev_ctd.rename(columns={
+        "SPI": "SPI_CTD",
+        "CPI": "CPI_CTD",
+        "%COMP": "%COMP_CTD"
+    })
+    ev_lsp = ev_lsp.rename(columns={
+        "SPI": "SPI_LSP",
+        "CPI": "CPI_LSP",
+        "%COMP": "%COMP_LSP"
     })
 
-    bei["BEI"] = np.where(
-        bei["Baseline Tasks"] == 0,
-        np.nan,
-        bei["Completed Tasks"] / bei["Baseline Tasks"]
-    )
+    ev = ev_ctd.merge(ev_lsp[["SUB_TEAM", "SPI_LSP", "CPI_LSP", "%COMP_LSP"]],
+                      on="SUB_TEAM", how="left")
 
-    return bei
+    ev = ev.merge(bei_tbl, on="SUB_TEAM", how="left")
+    return ev
 
 
-# ===============================================================
-# COLOR RULES
-# ===============================================================
+# ============================================================
+# MANPOWER (DEMAND TABLE)
+# ============================================================
 
-def color_index(v):
-    if pd.isna(v): return None
-    if v >= 1.05: return BLUE
-    if 1.05 > v >= 0.98: return TEAL
-    if 0.98 > v >= 0.95: return GREEN
-    if 0.95 > v >= 0.90: return YELLOW
-    return RED
+def compute_manpower(cobra_df):
+    # Assume monthly demand = sum(BCWS) per month
+    cobra_df["MONTH"] = cobra_df["DATE"].dt.to_period("M")
 
-def color_vac(v):
-    if pd.isna(v): return None
-    if v >= 0.05: return BLUE
-    if 0.05 > v >= -0.02: return GREEN
-    if -0.02 > v >= -0.05: return YELLOW
-    if -0.05 > v >= -0.10: return TEAL
-    return RED
+    m = cobra_df.groupby("MONTH")["HOURS"].sum()
+
+    months = sorted(m.index)
+
+    if len(months) < 3:
+        return pd.DataFrame({"Metric": ["Demand", "Actual"], "Last Month": 0, "This Month": 0, "Next Month": 0})
+
+    lm, tm, nm = months[-3], months[-2], months[-1]
+
+    tbl = pd.DataFrame({
+        "Metric": ["Demand"],
+        "Last Month": [m[lm]],
+        "This Month": [m[tm]],
+        "Next Month": [m[nm]],
+        "%Var": [((m[tm] - m[lm]) / m[lm] * 100) if m[lm] != 0 else np.nan]
+    })
+    return tbl
 
 
-# ===============================================================
-# TABLE BUILDER
-# ===============================================================
+# ============================================================
+# COLORING FOR PPT
+# ============================================================
 
-def add_table(slide, df, color_fn=None):
-    rows, cols = df.shape
-    table = slide.shapes.add_table(
-        rows+1, cols,
-        Inches(0.3), Inches(1.0),
-        Inches(9), Inches(0.5*(rows+1))
-    ).table
-
-    # Header
-    for c, col in enumerate(df.columns):
-        cell = table.cell(0,c)
-        cell.text = col
+def color_cell(cell, val):
+    if pd.isna(val):
+        return
+    if val >= 0.98:
         cell.fill.solid()
-        cell.fill.fore_color.rgb = BLUE
-        cell.text_frame.paragraphs[0].font.color.rgb = RGBColor(255,255,255)
-
-    # Body
-    for r in range(rows):
-        for c in range(cols):
-            v = df.iloc[r,c]
-            cell = table.cell(r+1,c)
-            cell.text = "" if pd.isna(v) else str(round(v,3))
-
-            if color_fn and isinstance(v, (int,float)):
-                rgb = color_fn(v)
-                if rgb:
-                    cell.fill.solid()
-                    cell.fill.fore_color.rgb = rgb
+        cell.fill.fore_color.rgb = COLOR_THRESHOLDS["GOOD"]
+    elif val >= 0.90:
+        cell.fill.solid()
+        cell.fill.fore_color.rgb = COLOR_THRESHOLDS["WARN"]
+    else:
+        cell.fill.solid()
+        cell.fill.fore_color.rgb = COLOR_THRESHOLDS["BAD"]
 
 
-# ===============================================================
-# MAIN EXECUTION LOOP
-# ===============================================================
+# ============================================================
+# BUILD POWERPOINT
+# ============================================================
 
-openplan = pd.read_excel(os.path.join(DATA_DIR, OPENPLAN_FILE))
+def add_table_slide(prs, title, df):
+    slide = prs.slides.add_slide(prs.slide_layouts[5])
+    title_box = slide.shapes.title
+    title_box.text = title
 
-for program, cobra_file in PROGRAM_FILES.items():
+    rows, cols = df.shape[0] + 1, df.shape[1]
+    table = slide.shapes.add_table(rows, cols, Inches(0.5), Inches(1.2),
+                                   Inches(9), Inches(5)).table
 
-    print(f"\nProcessing → {program}")
-    cobra = load_cobra(os.path.join(DATA_DIR, cobra_file))
+    for j, col in enumerate(df.columns):
+        table.cell(0, j).text = col
 
-    ev_ctd = compute_ev(cobra)
-    ev_lsp = compute_ev(get_lsp(cobra))
+    for i in range(df.shape[0]):
+        for j in range(df.shape[1]):
+            val = df.iloc[i, j]
+            cell = table.cell(i + 1, j)
+            txt = "" if pd.isna(val) else str(val)
+            cell.text = txt
 
-    bei = compute_bei(openplan, program, SNAPSHOT_DATE)
-    ev_ctd = ev_ctd.merge(bei[["SUB_TEAM","BEI"]], on="SUB_TEAM", how="left")
+            # apply coloring to numeric performance columns
+            if df.columns[j] in ["CPI CTD", "CPI LSP", "SPI CTD", "SPI LSP", "BEI", "%COMP", "VAC"]:
+                if isinstance(val, (int, float)):
+                    color_cell(cell, val)
 
-    # Labor Table
-    labor = ev_ctd[["SUB_TEAM","%COMP","BCWS","ACWP","ETC"]].copy()
-    labor["BAC"] = labor["BCWS"]
-    labor["EAC"] = labor["ACWP"] + labor["ETC"]
-    labor["VAC"] = labor["BAC"] - labor["EAC"]
-    labor = labor[["SUB_TEAM","%COMP","BAC","EAC","VAC"]]
+    return slide
 
-    # Cost Performance
-    cost_tbl = pd.DataFrame({
-        "SUB_TEAM": ev_ctd["SUB_TEAM"],
-        "CPI CTD": ev_ctd["CPI"],
-        "CPI LSP": ev_lsp["CPI"].values,
-        "Comments": ""
-    })
 
-    # Schedule Performance
-    sched_tbl = pd.DataFrame({
-        "SUB_TEAM": ev_ctd["SUB_TEAM"],
-        "SPI CTD": ev_ctd["SPI"],
-        "SPI LSP": ev_lsp["SPI"].values,
-        "BEI CTD": ev_ctd["BEI"],
-        "Comments": ""
-    })
+# ============================================================
+# RUN PIPELINE
+# ============================================================
 
-    # EV Summary
+openplan = load_openplan(os.path.join(DATA_DIR, OPENPLAN_FILE))
+bei_tbl = compute_bei(openplan)
+
+prs = Presentation()
+
+for program, file in PROGRAM_FILES.items():
+
+    cobra = load_cobra_auto(os.path.join(DATA_DIR, file))
+    ev_ctd, ev_lsp = compute_ev(cobra)
+    ev = merge_ev(ev_ctd, ev_lsp, bei_tbl)
+
+    # COST PERFORMANCE TABLE
+    cost_tbl = ev[["SUB_TEAM", "CPI_LSP", "CPI_CTD"]].copy()
+    cost_tbl["Comments"] = ""
+
+    # SCHEDULE PERFORMANCE TABLE
+    sched_tbl = ev[["SUB_TEAM", "SPI_LSP", "SPI_CTD", "BEI"]].copy()
+    sched_tbl["Comments"] = ""
+
+    # LABOR HOURS TABLE
+    labor_tbl = ev[["SUB_TEAM", "%COMP_CTD", "BAC", "EAC", "VAC"]].copy()
+    labor_tbl.rename(columns={"%COMP_CTD": "%COMP"}, inplace=True)
+    labor_tbl["Comments"] = ""
+
+    # MANPOWER TABLE
+    manpower_tbl = compute_manpower(cobra)
+
+    # EV SUMMARY TABLE
     summary_tbl = pd.DataFrame({
-        "Metric": ["SPI","CPI","BEI","%COMP"],
-        "CTD": [ev_ctd["SPI"].mean(),
-                ev_ctd["CPI"].mean(),
-                ev_ctd["BEI"].mean(),
-                ev_ctd["%COMP"].mean()],
-        "LSP": [ev_lsp["SPI"].mean(),
-                ev_lsp["CPI"].mean(),
-                ev_ctd["BEI"].mean(),
-                ev_lsp["%COMP"].mean()],
-        "Comments": ["","","",""]
+        "Metric": ["SPI", "CPI", "BEI", "%COMP"],
+        "CTD": [
+            ev["SPI_CTD"].mean(),
+            ev["CPI_CTD"].mean(),
+            ev["BEI"].mean(),
+            ev["%COMP_CTD"].mean()
+        ],
+        "LSP": [
+            ev["SPI_LSP"].mean(),
+            ev["CPI_LSP"].mean(),
+            ev["BEI"].mean(),
+            ev["%COMP_LSP"].mean()
+        ],
+        "Comments": ""
     })
 
-    # PowerPoint
-    prs = Presentation()
-    blank = prs.slide_layouts[6]
+    # ADD SLIDES
+    add_table_slide(prs, f"{program} – EV Summary", summary_tbl)
+    add_table_slide(prs, f"{program} – Cost Performance", cost_tbl)
+    add_table_slide(prs, f"{program} – Schedule Performance", sched_tbl)
+    add_table_slide(prs, f"{program} – Labor Hours Performance", labor_tbl)
+    add_table_slide(prs, f"{program} – Demand Table", manpower_tbl)
 
-    # Slide 1 – Summary
-    s = prs.slides.add_slide(blank)
-    s.shapes.add_textbox(Inches(0.3), Inches(0.2), Inches(8), Inches(0.4)).text = f"{program} – EVMS Metrics"
-    add_table(s, summary_tbl, color_index)
+prs.save(OUTPUT)
 
-    # Slide 2 – Cost
-    s = prs.slides.add_slide(blank)
-    s.shapes.add_textbox(Inches(0.3), Inches(0.2), Inches(8), Inches(0.4)).text = f"{program} – Cost Performance (CPI)"
-    add_table(s, cost_tbl, color_index)
-
-    # Slide 3 – Schedule
-    s = prs.slides.add_slide(blank)
-    s.shapes.add_textbox(Inches(0.3), Inches(0.2), Inches(8), Inches(0.4)).text = f"{program} – Schedule Performance (SPI / BEI)"
-    add_table(s, sched_tbl, color_index)
-
-    # Slide 4 – Labor
-    s = prs.slides.add_slide(blank)
-    s.shapes.add_textbox(Inches(0.3), Inches(0.2), Inches(8), Inches(0.4)).text = f"{program} – Labor Hours Performance"
-    add_table(s, labor, color_vac)
-
-    # Save
-    out = os.path.join(OUTPUT_DIR, f"{program}_EVMS_Dashboard.pptx")
-    prs.save(out)
-    print(f"Saved → {out}")
-
-print("\n✔ ALL EVMS DASHBOARDS COMPLETE")
+print("\nEVMS DASHBOARD COMPLETE →", OUTPUT)
