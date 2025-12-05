@@ -1,6 +1,5 @@
 # ============================================================
-# EVMS Slide – EV Plot + CPI/SPI CTD & LSD Metrics (per program)
-# Uses Cobra exports + GDLS accounting calendar thresholds
+# EVMS Slides – Title + EV Plot + CPI/SPI CTD/LSD Metrics
 # ============================================================
 
 import os
@@ -12,10 +11,9 @@ import plotly.graph_objects as go
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
+from pptx.enum.shapes import PP_PLACEHOLDER
 
-# ------------------------------------------------------------
-# CONFIG – update these paths/programs for your environment
-# ------------------------------------------------------------
+# ---------------- CONFIG ----------------
 
 cobra_files = {
     "Abrams_STS_2022": "data/Cobra-Abrams STS 2022.xlsx",
@@ -23,11 +21,11 @@ cobra_files = {
     "XM30"           : "data/Cobra-XM30.xlsx",
 }
 
-THEME_PATH = "data/Theme.pptx"   # your PPT template (optional)
+THEME_PATH = "data/Theme.pptx"
 OUTPUT_DIR = "EVMS_Output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Accounting calendar (screenshot – DETROIT area 2025)
+# Accounting calendar closings (2025 Detroit)
 ACCOUNTING_CLOSINGS = {
     (2025, 1): 26,
     (2025, 2): 23,
@@ -43,15 +41,14 @@ ACCOUNTING_CLOSINGS = {
     (2025,12): 31,
 }
 
-# Color palette from the GDLS dashboard guideline
+# Threshold colors
 COLOR_BLUE_LIGHT = RGBColor(142, 180, 227)  # x >= 1.05
 COLOR_GREEN      = RGBColor( 51, 153, 102)  # 1.05 > x >= 0.98
 COLOR_YELLOW     = RGBColor(255, 255, 153)  # 0.98 > x >= 0.95
 COLOR_RED        = RGBColor(192,  80,  77)  # x < 0.95
 
-# ------------------------------------------------------------
-# Helpers: EVMS calculations
-# ------------------------------------------------------------
+
+# ------------- EVMS CALC HELPERS -------------
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df.rename(columns={
@@ -60,9 +57,6 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     })
 
 def map_cost_sets(cost_cols):
-    """
-    Map Cobra COST-SET column labels to BCWS / BCWP / ACWP using fuzzy text.
-    """
     cleaned = {
         col: col.replace(" ", "").replace("-", "").replace("_", "").upper()
         for col in cost_cols
@@ -78,14 +72,6 @@ def map_cost_sets(cost_cols):
     return bcws, bcwp, acwp
 
 def compute_ev_timeseries(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Build time series with Monthly & Cumulative CPI/SPI.
-
-    IMPORTANT FIX:
-      - Use raw hours for cumulative sums (zeros allowed)
-      - Only treat zero as NaN when it's the *denominator* for a ratio
-        so CTD values don't go NaN just because the current month has 0 hours.
-    """
     df = df.copy()
     df["DATE"] = pd.to_datetime(df["DATE"])
 
@@ -107,11 +93,9 @@ def compute_ev_timeseries(df: pd.DataFrame) -> pd.DataFrame:
     BCWP_raw = pivot[bcwp_col].fillna(0.0)
     ACWP_raw = pivot[acwp_col].fillna(0.0)
 
-    # Monthly indices (treat zero denominator as NaN)
     monthly_cpi = BCWP_raw / ACWP_raw.replace(0, np.nan)
     monthly_spi = BCWP_raw / BCWS_raw.replace(0, np.nan)
 
-    # Cumulative indices: cumulative sums first, then protect against /0
     cum_bcws = BCWS_raw.cumsum()
     cum_bcwp = BCWP_raw.cumsum()
     cum_acwp = ACWP_raw.cumsum()
@@ -119,20 +103,15 @@ def compute_ev_timeseries(df: pd.DataFrame) -> pd.DataFrame:
     cumulative_cpi = cum_bcwp / cum_acwp.replace(0, np.nan)
     cumulative_spi = cum_bcwp / cum_bcws.replace(0, np.nan)
 
-    out = pd.DataFrame({
+    return pd.DataFrame({
         "DATE": pivot["DATE"],
         "Monthly CPI": monthly_cpi,
         "Monthly SPI": monthly_spi,
         "Cumulative CPI": cumulative_cpi,
         "Cumulative SPI": cumulative_spi,
     })
-    return out
 
 def get_status_dates(dates: pd.Series):
-    """
-    Get current and last status-period dates using accounting closings.
-    Fallback: last two dates in the EV series.
-    """
     dates = pd.to_datetime(dates)
     max_date = dates.max()
 
@@ -141,7 +120,6 @@ def get_status_dates(dates: pd.Series):
         d = datetime(year, month, day)
         if d <= max_date:
             closing_dates.append(d)
-
     closing_dates = sorted(closing_dates)
 
     if len(closing_dates) >= 2:
@@ -153,26 +131,16 @@ def get_status_dates(dates: pd.Series):
         uniq = sorted(dates.unique())
         curr = uniq[-1]
         prev = uniq[-2] if len(uniq) > 1 else uniq[-1]
-
     return curr, prev
 
 def get_row_on_or_before(evdf: pd.DataFrame, date: datetime):
-    """Last EV row on or before a given date."""
     sub = evdf[evdf["DATE"] <= date]
     if sub.empty:
         return evdf.iloc[0]
     return sub.iloc[-1]
 
 def build_evms_metrics(evdf: pd.DataFrame):
-    """
-    Build 2x3 metrics table:
-        Metric | CTD | LSD
-        CPI    | ..  | ..
-        SPI    | ..  | ..
-    Both CTD and LSD are 'to date' (cumulative) using accounting status periods.
-    """
     curr_date, prev_date = get_status_dates(evdf["DATE"])
-
     row_curr = get_row_on_or_before(evdf, curr_date)
     row_prev = get_row_on_or_before(evdf, prev_date)
 
@@ -189,13 +157,6 @@ def build_evms_metrics(evdf: pd.DataFrame):
     return metrics, curr_date, prev_date
 
 def spi_cpi_color(x: float):
-    """
-    Apply SPI/CPI/BEI thresholds:
-        Blue   x >= 1.05
-        Green  1.05 > x >= 0.98
-        Yellow 0.98 > x >= 0.95
-        Red    x < 0.95
-    """
     if pd.isna(x):
         return None
     if x >= 1.05:
@@ -207,72 +168,113 @@ def spi_cpi_color(x: float):
     else:
         return COLOR_RED
 
-# ------------------------------------------------------------
-# Helpers: Plot + PowerPoint
-# ------------------------------------------------------------
+
+# ------------- PLOTTING & PPT HELPERS -------------
 
 def create_evms_plot(program: str, evdf: pd.DataFrame) -> go.Figure:
     fig = go.Figure()
 
-    # Background performance zones (same for CPI/SPI)
+    # background zones with your thresholds
     fig.add_hrect(y0=0.90, y1=0.95, fillcolor="red",      opacity=0.25, line_width=0)
     fig.add_hrect(y0=0.95, y1=0.98, fillcolor="yellow",   opacity=0.25, line_width=0)
     fig.add_hrect(y0=0.98, y1=1.05, fillcolor="green",    opacity=0.25, line_width=0)
     fig.add_hrect(y0=1.05, y1=1.20, fillcolor="lightblue",opacity=0.25, line_width=0)
 
-    # Monthly indices (markers)
     fig.add_trace(go.Scatter(
         x=evdf["DATE"], y=evdf["Monthly CPI"],
         mode="markers", name="Monthly CPI",
-        marker=dict(symbol="diamond", size=10, color="yellow")
+        marker=dict(symbol="diamond", size=7, color="yellow")
     ))
     fig.add_trace(go.Scatter(
         x=evdf["DATE"], y=evdf["Monthly SPI"],
         mode="markers", name="Monthly SPI",
-        marker=dict(size=8, color="black")
+        marker=dict(size=6, color="black")
     ))
-
-    # Cumulative indices (lines)
     fig.add_trace(go.Scatter(
         x=evdf["DATE"], y=evdf["Cumulative CPI"],
         mode="lines", name="Cumulative CPI",
-        line=dict(color="blue", width=4)
+        line=dict(color="blue", width=3)
     ))
     fig.add_trace(go.Scatter(
         x=evdf["DATE"], y=evdf["Cumulative SPI"],
         mode="lines", name="Cumulative SPI",
-        line=dict(color="darkgrey", width=4)
+        line=dict(color="darkgrey", width=3)
     ))
 
-    # NOTE: leave chart title off – the slide title will carry it
     fig.update_layout(
         xaxis_title="Month",
         yaxis_title="EV Index",
         yaxis=dict(range=[0.90, 1.20]),
         template="simple_white",
-        height=400,
-        margin=dict(l=60, r=20, t=20, b=60)
+        height=360,  # a bit shorter so table fits below
+        margin=dict(l=60, r=20, t=20, b=50)
     )
     return fig
 
-def find_blank_layout(prs: Presentation):
-    """Try to find an actual 'Blank' layout; otherwise use first layout."""
+def get_blank_layout(prs: Presentation):
     for layout in prs.slide_layouts:
         if "blank" in layout.name.lower():
             return layout
     return prs.slide_layouts[0]
 
-def add_title(slide, text):
-    box = slide.shapes.add_textbox(Inches(0.5), Inches(0.3),
-                                   Inches(9.0), Inches(0.6))
-    tf = box.text_frame
-    tf.text = text
-    p = tf.paragraphs[0]
-    p.font.bold = True
-    p.font.size = Pt(24)
+def populate_title_slide(prs: Presentation, program: str,
+                         curr_date: datetime, prev_date: datetime):
+    """
+    Use the existing first slide (if any) as the title slide; otherwise
+    create a new title slide and populate placeholders.
+    """
+    if len(prs.slides) > 0:
+        slide = prs.slides[0]
+    else:
+        title_layout = prs.slide_layouts[0]  # Title slide
+        slide = prs.slides.add_slide(title_layout)
+
+    title_shape = None
+    subtitle_shape = None
+    for shape in slide.shapes:
+        if not shape.has_text_frame:
+            continue
+        if shape.is_placeholder:
+            ph_type = shape.placeholder_format.type
+            if ph_type == PP_PLACEHOLDER.TITLE:
+                title_shape = shape
+            elif ph_type in (PP_PLACEHOLDER.SUBTITLE, PP_PLACEHOLDER.BODY):
+                subtitle_shape = shape
+
+    title_text = f"{program} EVMS Trend Overview"
+    subtitle_text = (
+        f"CTD as of {curr_date.date().isoformat()}   |   "
+        f"LSD as of {prev_date.date().isoformat()}"
+    )
+
+    if title_shape:
+        title_shape.text = title_text
+        p = title_shape.text_frame.paragraphs[0]
+        p.font.bold = True
+        p.font.size = Pt(36)
+    else:
+        # fallback: add a textbox near top
+        box = slide.shapes.add_textbox(Inches(0.5), Inches(0.5),
+                                       Inches(9.0), Inches(1.0))
+        tf = box.text_frame
+        tf.text = title_text
+        p = tf.paragraphs[0]
+        p.font.bold = True
+        p.font.size = Pt(36)
+
+    if subtitle_shape:
+        subtitle_shape.text = subtitle_text
+        p = subtitle_shape.text_frame.paragraphs[0]
+        p.font.size = Pt(18)
+    else:
+        box = slide.shapes.add_textbox(Inches(0.5), Inches(2.0),
+                                       Inches(9.0), Inches(0.6))
+        tf = box.text_frame
+        tf.text = subtitle_text
+        tf.paragraphs[0].font.size = Pt(18)
 
 def add_evms_metrics_table(slide, df: pd.DataFrame,
-                           left_in=0.6, top_in=4.9, width_in=8.8):
+                           left_in=0.6, top_in=4.6, width_in=8.8):
     rows, cols = df.shape
     shape = slide.shapes.add_table(
         rows + 1, cols,
@@ -289,7 +291,7 @@ def add_evms_metrics_table(slide, df: pd.DataFrame,
         p.font.bold = True
         p.font.size = Pt(12)
 
-    # Body with color coding for CTD/LSD numeric cells
+    # Body
     for i in range(rows):
         for j, col in enumerate(df.columns):
             val = df.iloc[i, j]
@@ -310,9 +312,8 @@ def add_evms_metrics_table(slide, df: pd.DataFrame,
                     cell.fill.fore_color.rgb = rgb
                     p.font.color.rgb = RGBColor(0, 0, 0)
 
-# ------------------------------------------------------------
-# MAIN – build one-slide PPT per program
-# ------------------------------------------------------------
+
+# ---------------- MAIN LOOP ----------------
 
 for program, path in cobra_files.items():
     print(f"Processing {program} ...")
@@ -320,44 +321,46 @@ for program, path in cobra_files.items():
     cobra = pd.read_excel(path)
     cobra = normalize_columns(cobra)
 
-    # Expect original columns: 'DATE', 'COST-SET', 'HOURS'
     required = {"DATE", "COSTSET", "HOURS"}
     missing = required - set(cobra.columns)
     if missing:
-        raise ValueError(f"{program}: missing columns after normalization: {missing}")
+        raise ValueError(f"{program}: missing columns {missing} after normalization.")
 
     evdf = compute_ev_timeseries(cobra)
     metrics_df, curr_date, prev_date = build_evms_metrics(evdf)
+    print(f"{program} metrics:\n{metrics_df}\n")
 
-    # Debug print so you can quickly confirm values
-    print(f"{program} EVMS Metrics:")
-    print(metrics_df)
-
-    # Plot
     fig = create_evms_plot(program, evdf)
     img_path = os.path.join(OUTPUT_DIR, f"{program}_EVMS.png")
     fig.write_image(img_path, scale=3)
 
-    # PPT
     prs = Presentation(THEME_PATH) if os.path.exists(THEME_PATH) else Presentation()
-    blank_layout = find_blank_layout(prs)
+
+    # 1) Title slide
+    populate_title_slide(prs, program, curr_date, prev_date)
+
+    # 2) EV plot + metrics slide
+    blank_layout = get_blank_layout(prs)
     slide = prs.slides.add_slide(blank_layout)
 
-    title_text = (f"{program} EVMS Trend "
-                  f"(CTD as of {curr_date.date()}, "
-                  f"LSD as of {prev_date.date()})")
-    add_title(slide, title_text)
+    # small title on this slide too (optional)
+    box = slide.shapes.add_textbox(Inches(0.5), Inches(0.3),
+                                   Inches(9.0), Inches(0.6))
+    tf = box.text_frame
+    tf.text = f"{program} EVMS Trend"
+    tf.paragraphs[0].font.bold = True
+    tf.paragraphs[0].font.size = Pt(24)
 
-    # Chart
-    slide.shapes.add_picture(img_path, Inches(0.6), Inches(1.1),
+    # chart (kept high enough that the table doesn't cover it)
+    slide.shapes.add_picture(img_path, Inches(0.6), Inches(1.0),
                              width=Inches(8.8))
 
-    # Metrics table under the chart
+    # metrics table under chart, non-overlapping
     add_evms_metrics_table(slide, metrics_df,
-                           left_in=0.6, top_in=4.9, width_in=8.8)
+                           left_in=0.6, top_in=4.6, width_in=8.8)
 
-    out_pptx = os.path.join(OUTPUT_DIR, f"{program}_EVMS_Slide.pptx")
+    out_pptx = os.path.join(OUTPUT_DIR, f"{program}_EVMS_Trend.pptx")
     prs.save(out_pptx)
-    print(f"   → Saved {out_pptx}")
+    print(f"   ➜ saved {out_pptx}")
 
-print("ALL PROGRAM EVMS SLIDES COMPLETE ✓")
+print("ALL PROGRAM EVMS TREND DECKS COMPLETE ✓")
