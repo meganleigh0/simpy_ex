@@ -1,5 +1,5 @@
 # =====================================================================
-# GDLS EVMS DASHBOARD GENERATOR (FINAL CLEAN VERSION)
+# GDLS EVMS DASHBOARD GENERATOR – FINAL WORKING VERSION
 # =====================================================================
 
 import os
@@ -11,7 +11,7 @@ from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
 
 # =====================================================================
-# CONFIG
+# INPUT CONFIGURATION
 # =====================================================================
 
 DATA_DIR = "data"
@@ -34,7 +34,7 @@ OUTPUT_DIR = "EVMS_Output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # =====================================================================
-# ACCOUNTING CLOSE CALENDAR
+# ACCOUNTING CLOSE CALENDAR FROM IMAGES
 # =====================================================================
 
 ACCOUNTING_CLOSE = {
@@ -43,35 +43,31 @@ ACCOUNTING_CLOSE = {
 }
 
 # =====================================================================
-# COLOR PALETTE (GDLS)
+# COLOR PALETTE
 # =====================================================================
 
-COLOR_BLUE   = RGBColor(31, 73, 125)
-COLOR_TEAL   = RGBColor(142, 180, 227)
-COLOR_GREEN  = RGBColor(51, 153, 102)
-COLOR_YELLOW = RGBColor(255, 255, 153)
-COLOR_RED    = RGBColor(192, 80, 77)
+COLOR_BLUE   = RGBColor(31,73,125)
+COLOR_TEAL   = RGBColor(142,180,227)
+COLOR_GREEN  = RGBColor(51,153,102)
+COLOR_YELLOW = RGBColor(255,255,153)
+COLOR_RED    = RGBColor(192,80,77)
 
 # =====================================================================
-# UTILITY FUNCTIONS
+# NORMALIZATION
 # =====================================================================
 
 def normalize(df):
-    """Normalize column names across files."""
     return df.rename(columns=lambda c: c.strip().upper().replace(" ", "_").replace("-", "_"))
 
+# =====================================================================
+# LSP SELECTION
+# =====================================================================
 
 def find_lsp(ev_index):
-    """
-    Determine LSP date safely:
-    → Use accounting close date if available
-    → Otherwise use last valid Cobra date ≤ end of month
-    → Always return a date that EXISTS in ev_index
-    """
     max_date = ev_index.max()
     y, m = max_date.year, max_date.month
 
-    # Option 1: Accounting close exists
+    # Use accounting close date if available
     if y in ACCOUNTING_CLOSE and m in ACCOUNTING_CLOSE[y]:
         close_day = ACCOUNTING_CLOSE[y][m]
         close_date = pd.Timestamp(year=y, month=m, day=close_day)
@@ -79,19 +75,21 @@ def find_lsp(ev_index):
         if len(valid) > 0:
             return valid.max()
 
-    # Option 2: fallback — last day of month
+    # Else fallback to last day of month
     end_month = pd.Timestamp(year=y, month=m, day=1) + pd.offsets.MonthEnd(1)
     valid = ev_index[ev_index <= end_month]
     return valid.max()
 
+# =====================================================================
+# COST SET AUTO-DETECTION
+# =====================================================================
 
 def map_cost_sets(cols):
-    """Auto-detect BCWS, BCWP, ACWP, ETC columns."""
-    cleaned = {c: c.replace("_", "").upper() for c in cols}
-    bcws = bcwp = acwp = etc = None
+    cleaned = {c: c.replace("_","").upper() for c in cols}
 
+    bcws = bcwp = acwp = etc = None
     for orig, clean in cleaned.items():
-        if "BUDGET" in clean or "BCWS" in clean:
+        if "BCWS" in clean or "BUDGET" in clean:
             bcws = orig
         if "BCWP" in clean or "PROGRESS" in clean or "EARNED" in clean:
             bcwp = orig
@@ -102,25 +100,24 @@ def map_cost_sets(cols):
 
     return bcws, bcwp, acwp, etc
 
-
 # =====================================================================
-# EV CALCULATION (FIXED + LSP SAFE + MONTHLY SP/CPI ADDED)
+# EV CALCULATION (100% FIXED)
 # =====================================================================
 
 def compute_ev_from_cobra(df_raw):
-    df = normalize(df_raw)
+    df = normalize(df_raw.copy())
 
-    # Identify columns
-    required = ["COST_SET", "DATE", "HOURS"]
+    # Find required columns
+    req = ["COST_SET","DATE","HOURS"]
     colmap = {}
-    for r in required:
+    for r in req:
         for c in df.columns:
             if r in c:
                 colmap[r] = c
                 break
 
     if len(colmap) < 3:
-        raise ValueError(f"Could not locate COST_SET/DATE/HOURS. Found: {df.columns.tolist()}")
+        raise ValueError(f"Missing COST_SET/DATE/HOURS. Found columns: {df.columns.tolist()}")
 
     df.rename(columns={
         colmap["COST_SET"]: "COST_SET",
@@ -128,17 +125,13 @@ def compute_ev_from_cobra(df_raw):
         colmap["HOURS"]: "HOURS"
     }, inplace=True)
 
-    df["DATE"] = pd.to_datetime(df["DATE"])
+    df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
 
-    # Pivot
     pivot = df.pivot_table(
-        index="DATE",
-        columns="COST_SET",
-        values="HOURS",
-        aggfunc="sum"
+        index="DATE", columns="COST_SET",
+        values="HOURS", aggfunc="sum"
     ).fillna(0).sort_index()
 
-    # Map cost sets
     bcws_col, bcwp_col, acwp_col, etc_col = map_cost_sets(pivot.columns)
 
     ev = pd.DataFrame(index=pivot.index)
@@ -152,17 +145,22 @@ def compute_ev_from_cobra(df_raw):
     ev["BCWP_CUM"] = ev["BCWP"].cumsum()
     ev["ACWP_CUM"] = ev["ACWP"].cumsum()
 
-    # monthly index values
-    ev["SPI_M"] = ev["BCWP"] / ev["BCWS"].replace(0, np.nan)
-    ev["CPI_M"] = ev["BCWP"] / ev["ACWP"].replace(0, np.nan)
+    # monthly
+    ev["SPI_M"] = ev["BCWP"] / ev["BCWS"].replace(0,np.nan)
+    ev["CPI_M"] = ev["BCWP"] / ev["ACWP"].replace(0,np.nan)
 
-    ev["SPI_CUM"] = ev["BCWP_CUM"] / ev["BCWS_CUM"].replace(0, np.nan)
-    ev["CPI_CUM"] = ev["BCWP_CUM"] / ev["ACWP_CUM"].replace(0, np.nan)
+    # cumulative SPI/CPI
+    ev["SPI_CUM"] = ev["BCWP_CUM"] / ev["BCWS_CUM"].replace(0,np.nan)
+    ev["CPI_CUM"] = ev["BCWP_CUM"] / ev["ACWP_CUM"].replace(0,np.nan)
 
-    # LSP — SAFE VERSION
-    lsp_date = find_lsp(ev.index)
+    # LSP
+    lsp = find_lsp(ev.index)
+    valid = ev.index[ev.index <= lsp]
+    lsp_eff = valid.max()
 
-    # CTD metrics
+    row_lsp = ev.loc[lsp_eff]
+
+    # summary metrics
     BCWS_CTD = ev["BCWS_CUM"].iloc[-1]
     BCWP_CTD = ev["BCWP_CUM"].iloc[-1]
     ACWP_CTD = ev["ACWP_CUM"].iloc[-1]
@@ -175,11 +173,6 @@ def compute_ev_from_cobra(df_raw):
     CPI_CTD = BCWP_CTD / ACWP_CTD if ACWP_CTD else np.nan
     PCT_CTD = BCWP_CTD / BCWS_CTD if BCWS_CTD else np.nan
 
-    # LSP row (SAFE)
-    valid = ev.index[ev.index <= lsp_date]
-    lsp_effective = valid.max()
-
-    row_lsp = ev.loc[lsp_effective]
     SPI_LSP = row_lsp["BCWP"] / row_lsp["BCWS"] if row_lsp["BCWS"] else np.nan
     CPI_LSP = row_lsp["BCWP"] / row_lsp["ACWP"] if row_lsp["ACWP"] else np.nan
 
@@ -194,39 +187,59 @@ def compute_ev_from_cobra(df_raw):
         CPI_LSP=CPI_LSP,
         PCT_COMP_CTD=PCT_CTD,
         PCT_COMP_LSP=PCT_CTD,
-        LSP_DATE=lsp_effective
+        LSP_DATE=lsp_eff
     )
 
     return ev, summary
 
-
 # =====================================================================
-# OPENPLAN BEI COMPUTATION
+# BEI (SAFE DETECTION VERSION)
 # =====================================================================
 
 def compute_bei(openplan_df, program_key):
 
     df = normalize(openplan_df.copy())
-    prog = PROGRAM_NAME_MAP[program_key]
 
+    prog = PROGRAM_NAME_MAP[program_key]
     df = df[df["PROGRAM"].str.upper() == prog.upper()]
+
     if df.empty:
         return np.nan, np.nan
 
-    col_base = next(c for c in df.columns if "BASELINE_FINISH" in c)
-    col_status = next(c for c in df.columns if "STATUS" in c or "DATA_DATE" in c)
+    # SAFE column detection
+    def safe_find(df, keys):
+        for c in df.columns:
+            for k in keys:
+                if k in c:
+                    return c
+        return None
 
-    df[col_base] = pd.to_datetime(df[col_base])
-    df[col_status] = pd.to_datetime(df[col_status])
+    col_base = safe_find(df, ["BASELINE_FINISH","BL_FINISH","PLAN_FINISH"])
+    col_status = safe_find(df, ["STATUS_DATE","STATUS","DATA_DATE"])
+    col_act = safe_find(df, ["ACTUAL_FINISH","FINISH_ACTUAL","ACT_FINISH"])
+
+    if col_base is None or col_status is None:
+        print(f"⚠️ Warning: Missing BEI fields for {prog}.")
+        return np.nan, np.nan
+
+    df[col_base] = pd.to_datetime(df[col_base], errors="coerce")
+    df[col_status] = pd.to_datetime(df[col_status], errors="coerce")
+    if col_act:
+        df[col_act] = pd.to_datetime(df[col_act], errors="coerce")
 
     lsp = df[col_status].max()
 
     denom = df[df[col_base] <= lsp]
-    num = denom  # assume completed tasks not provided
+    if len(denom) == 0:
+        return np.nan, np.nan
+
+    if col_act:
+        num = denom[(denom[col_act].notna()) & (denom[col_act] <= lsp)]
+    else:
+        num = denom  # fallback
 
     bei = len(num) / len(denom) if len(denom) else np.nan
     return bei, bei
-
 
 # =====================================================================
 # COLOR FUNCTIONS
@@ -248,7 +261,6 @@ def vac_color(v):
     if v >= -0.05: return COLOR_TEAL
     return COLOR_RED
 
-
 # =====================================================================
 # PPT HELPERS
 # =====================================================================
@@ -257,8 +269,8 @@ def add_table(slide, rows, cols, left, top, width, height, headers=None):
     shape = slide.shapes.add_table(rows, cols, left, top, width, height)
     table = shape.table
     if headers:
-        for j,h in enumerate(headers):
-            cell = table.cell(0,j)
+        for j, h in enumerate(headers):
+            cell = table.cell(0, j)
             cell.text = h
             cell.text_frame.paragraphs[0].font.bold = True
     return table
@@ -269,7 +281,6 @@ def set_bg(cell, color):
     fill.solid()
     fill.fore_color.rgb = color
 
-
 # =====================================================================
 # EVMS TREND CHART
 # =====================================================================
@@ -277,29 +288,31 @@ def set_bg(cell, color):
 def make_ev_chart(program, ev):
     fig = go.Figure()
 
-    fig.add_hrect(y0=0.90, y1=0.95, fillcolor="red", opacity=0.2, line_width=0)
-    fig.add_hrect(y0=0.95, y1=0.98, fillcolor="yellow", opacity=0.2, line_width=0)
-    fig.add_hrect(y0=0.98, y1=1.02, fillcolor="green", opacity=0.2, line_width=0)
-    fig.add_hrect(y0=1.02, y1=1.05, fillcolor="lightblue", opacity=0.2, line_width=0)
-    fig.add_hrect(y0=1.05, y1=1.20, fillcolor="rgb(200,220,255)", opacity=0.2, line_width=0)
+    # threshold bands
+    fig.add_hrect(y0=0.90,y1=0.95,fillcolor="red",opacity=0.2,line_width=0)
+    fig.add_hrect(y0=0.95,y1=0.98,fillcolor="yellow",opacity=0.2,line_width=0)
+    fig.add_hrect(y0=0.98,y1=1.02,fillcolor="green",opacity=0.2,line_width=0)
+    fig.add_hrect(y0=1.02,y1=1.05,fillcolor="lightblue",opacity=0.2,line_width=0)
+    fig.add_hrect(y0=1.05,y1=1.20,fillcolor="rgb(200,220,255)",opacity=0.2,line_width=0)
 
     fig.add_trace(go.Scatter(x=ev.index, y=ev["CPI_CUM"], mode='lines',
-                             line=dict(color="blue", width=3), name="Cumulative CPI"))
+                             line=dict(color="blue",width=3), name="Cumulative CPI"))
     fig.add_trace(go.Scatter(x=ev.index, y=ev["SPI_CUM"], mode='lines',
-                             line=dict(color="gray", width=3), name="Cumulative SPI"))
+                             line=dict(color="gray",width=3), name="Cumulative SPI"))
     fig.add_trace(go.Scatter(x=ev.index, y=ev["CPI_M"], mode='markers',
                              marker=dict(color="gold"), name="Monthly CPI"))
     fig.add_trace(go.Scatter(x=ev.index, y=ev["SPI_M"], mode='markers',
                              marker=dict(color="black"), name="Monthly SPI"))
 
-    fig.update_layout(title=f"{program} EVMS Trend",
-                      yaxis=dict(range=[0.9,1.2]),
-                      template="simple_white")
+    fig.update_layout(
+        title=f"{program} EVMS Trend",
+        template="simple_white",
+        yaxis=dict(range=[0.9,1.2])
+    )
     return fig
 
-
 # =====================================================================
-# MAIN LOOP
+# MAIN EXECUTION
 # =====================================================================
 
 openplan_df = pd.read_excel(openplan_path)
@@ -314,13 +327,12 @@ for program, path in cobra_files.items():
     summary["BEI_CTD"] = bei_ctd
     summary["BEI_LSP"] = bei_lsp
 
-    # ---------------------------------------------------------
-    # BUILD POWERPOINT
-    # ---------------------------------------------------------
     prs = Presentation()
     blank = prs.slide_layouts[6]
 
-    # SLIDE 1 – EVMS METRICS
+    # ---------------------------------------------------------
+    # SLIDE 1 – EV METRICS
+    # ---------------------------------------------------------
     s1 = prs.slides.add_slide(blank)
     title = s1.shapes.add_textbox(Inches(0.3), Inches(0.1), Inches(9), Inches(0.5))
     title.text_frame.text = f"{program} – EVMS Metrics"
@@ -344,18 +356,20 @@ for program, path in cobra_files.items():
         set_bg(t.cell(i,1), idx_color(ctd))
         set_bg(t.cell(i,2), idx_color(lsp))
 
+    # Comment box
     cb = s1.shapes.add_textbox(Inches(6.5), Inches(0.8), Inches(3), Inches(2.4))
     cb.text_frame.text = "Comments (RC/CA):\n"
 
     footer = s1.shapes.add_textbox(Inches(0.3), Inches(3.0), Inches(4), Inches(0.3))
     footer.text_frame.text = f"LSP: {summary['LSP_DATE'].date()}"
 
-    # SLIDE 2 – LABOR & MANPOWER
+    # ---------------------------------------------------------
+    # SLIDE 2 – LABOR + MANPOWER
+    # ---------------------------------------------------------
     s2 = prs.slides.add_slide(blank)
     title2 = s2.shapes.add_textbox(Inches(0.3), Inches(0.1), Inches(9), Inches(0.5))
     title2.text_frame.text = f"{program} – Labor & Manpower"
 
-    # Labor
     t2 = add_table(s2, rows=2, cols=5,
                    left=Inches(0.3), top=Inches(0.8),
                    width=Inches(6.5), height=Inches(1),
@@ -367,7 +381,7 @@ for program, path in cobra_files.items():
     ETC = summary["ETC"]
     pct = summary["PCT_COMP_CTD"]
 
-    vals = [BAC, EAC, VAC, ETC, pct*100 if pct else np.nan]
+    vals = [BAC,EAC,VAC,ETC,pct*100 if pct else np.nan]
     for j,v in enumerate(vals):
         t2.cell(1,j).text = "" if pd.isna(v) else f"{v:,.1f}"
 
@@ -389,7 +403,9 @@ for program, path in cobra_files.items():
 
     s2.shapes.add_textbox(Inches(6.5), Inches(0.8), Inches(3), Inches(2.5)).text_frame.text = "Comments (RC/CA):\n"
 
+    # ---------------------------------------------------------
     # SLIDE 3 – TREND CHART
+    # ---------------------------------------------------------
     s3 = prs.slides.add_slide(blank)
     title3 = s3.shapes.add_textbox(Inches(0.3), Inches(0.1), Inches(9), Inches(0.5))
     title3.text_frame.text = f"{program} – EVMS Trend"
@@ -397,6 +413,7 @@ for program, path in cobra_files.items():
     fig = make_ev_chart(program, ev)
     chart_path = os.path.join(OUTPUT_DIR, f"{program}_EVMS.png")
     fig.write_image(chart_path, scale=3)
+
     s3.shapes.add_picture(chart_path, Inches(0.3), Inches(0.8), width=Inches(9))
 
     # SAVE PPT
