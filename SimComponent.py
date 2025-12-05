@@ -2,7 +2,7 @@
 # EVMS Deck per Program – 3 Slides
 #   1) EVMS Trend Overview
 #   2) EVMS Detail – Sub Team Labor & Manpower
-#   3) EVMS Detail – Sub Team CPI/SPI/BEI Metrics
+#   3) EVMS Detail – Sub Team CPI/SPI Metrics
 # ============================================================
 
 import os
@@ -82,7 +82,7 @@ def map_cost_sets(cost_cols):
     return bcws, bcwp, acwp, etc
 
 def spi_cpi_color(x: float):
-    """SPI / CPI / BEI thresholds."""
+    """SPI / CPI thresholds (also used for BEI at program level)."""
     if pd.isna(x):
         return None
     if x >= 1.05:
@@ -199,7 +199,7 @@ def compute_ev_timeseries(df: pd.DataFrame) -> pd.DataFrame:
     })
 
 # ============================================================
-# BEI FROM OPENPLAN PENSKE
+# BEI FROM OPENPLAN PENSKE (program-level only)
 # ============================================================
 
 PENSKE = pd.read_excel(PENSKE_PATH)
@@ -226,7 +226,7 @@ def compute_program_bei(program_name: str,
     base_col = next((c for c in df.columns if "BASELINEFINISH" in c or ("BASELINE" in c and "FINISH" in c)), None)
     act_col  = next((c for c in df.columns if "ACTUALFINISH"   in c or ("ACTUAL"   in c and "FINISH" in c)), None)
     if base_col is None or act_col is None:
-        return np.nan, np.nan, None, None
+        return np.nan, np.nan
 
     df[base_col] = pd.to_datetime(df[base_col], errors="coerce")
     df[act_col]  = pd.to_datetime(df[act_col],  errors="coerce")
@@ -236,44 +236,11 @@ def compute_program_bei(program_name: str,
         df = df[~df[lev_col].isin(["A", "B"])]   # drop LOE & milestones
 
     if df.empty:
-        return np.nan, np.nan, None, None
+        return np.nan, np.nan
 
     bei_ctd = _bei_for_df(df, base_col, act_col, status_date)
     bei_lsd = _bei_for_df(df, base_col, act_col, prev_status_date)
-    return bei_ctd, bei_lsd, df, (base_col, act_col)
-
-def compute_bei_by_subteam(program_name: str,
-                           subteams,
-                           status_date: datetime,
-                           prev_status_date: datetime):
-    """
-    Return dict: subteam -> (BEI_CTD, BEI_LSD)
-    Uses TEAM for mapping when available; falls back to program-level BEI.
-    """
-    prog_ctd, prog_lsd, df_prog, cols = compute_program_bei(
-        program_name, status_date, prev_status_date
-    )
-    if df_prog is None or cols is None:
-        return {st: (np.nan, np.nan) for st in subteams}
-
-    base_col, act_col = cols
-    team_col = "TEAM" if "TEAM" in df_prog.columns else None
-
-    result = {}
-    for st in subteams:
-        if team_col:
-            mask = df_prog[team_col].astype(str).str.upper() == str(st).upper()
-            sub = df_prog[mask]
-        else:
-            sub = pd.DataFrame()
-
-        if sub.empty:
-            result[st] = (prog_ctd, prog_lsd)
-        else:
-            bei_ctd = _bei_for_df(sub, base_col, act_col, status_date)
-            bei_lsd = _bei_for_df(sub, base_col, act_col, prev_status_date)
-            result[st] = (bei_ctd, bei_lsd)
-    return result
+    return bei_ctd, bei_lsd
 
 # ============================================================
 # TABLE BUILDERS
@@ -323,19 +290,18 @@ def build_labor_table(cobra: pd.DataFrame) -> pd.DataFrame:
     return labor_df
 
 def build_subteam_metric_table(cobra: pd.DataFrame,
-                               program_name: str,
                                curr_date: datetime,
                                prev_date: datetime) -> pd.DataFrame:
     """
     Sub-team level EVMS metrics:
-      CPI CTD/LSD, SPI CTD/LSD, BEI CTD/LSD
+      CPI CTD/LSD, SPI CTD/LSD
+      (no BEI columns for this slide by request)
     """
     df = cobra.copy()
     if "SUBTEAM" not in df.columns:
         raise ValueError("Metric table requires SUBTEAM column (from SUB_TEAM).")
 
     subteams = sorted(df["SUBTEAM"].unique())
-    bei_map = compute_bei_by_subteam(program_name, subteams, curr_date, prev_date)
 
     out_rows = []
     for st in subteams:
@@ -355,16 +321,12 @@ def build_subteam_metric_table(cobra: pd.DataFrame,
         else:
             cpi_ctd = cpi_lsd = spi_ctd = spi_lsd = np.nan
 
-        bei_ctd, bei_lsd = bei_map.get(st, (np.nan, np.nan))
-
         out_rows.append({
             "Sub Team": st,
             "CPI CTD": cpi_ctd,
             "CPI LSD": cpi_lsd,
             "SPI CTD": spi_ctd,
             "SPI LSD": spi_lsd,
-            "BEI CTD": bei_ctd,
-            "BEI LSD": bei_lsd,
         })
 
     metrics_df = pd.DataFrame(out_rows)
@@ -492,7 +454,7 @@ def add_simple_table(slide, df: pd.DataFrame,
                      left_in, top_in, width_in, height_in=None):
     """
     Create a table for a DataFrame; return (pptx table object, height_inches).
-    CPI/SPI/BEI metrics and CTD/LSD columns shown with 2 decimals.
+    CPI/SPI metrics and CTD/LSD columns shown with 2 decimals.
     Percents (%COMP, % Var) shown with 2 decimal places.
     """
     rows, cols = df.shape
@@ -516,7 +478,7 @@ def add_simple_table(slide, df: pd.DataFrame,
         p.font.bold = True
         p.font.size = Pt(11)
 
-    metric_cols = {"CPI CTD","CPI LSD","SPI CTD","SPI LSD","BEI CTD","BEI LSD","CTD","LSD"}
+    metric_cols = {"CPI CTD","CPI LSD","SPI CTD","SPI LSD","CTD","LSD"}
 
     # body
     for i in range(rows):
@@ -605,7 +567,7 @@ for program, path in cobra_files.items():
     spi_lsd = row_prev["Cumulative SPI"]
 
     # Program-level BEI CTD/LSD
-    prog_bei_ctd, prog_bei_lsd, _, _ = compute_program_bei(program, curr_date, prev_date)
+    prog_bei_ctd, prog_bei_lsd = compute_program_bei(program, curr_date, prev_date)
 
     metrics_df = pd.DataFrame({
         "Metric": ["CPI", "SPI", "BEI"],
@@ -623,7 +585,7 @@ for program, path in cobra_files.items():
 
     # Subteam tables & manpower
     labor_df    = build_labor_table(cobra)
-    metrics_sub = build_subteam_metric_table(cobra, program, curr_date, prev_date)
+    metrics_sub = build_subteam_metric_table(cobra, curr_date, prev_date)
     manpower_df = build_manpower_table(cobra, curr_date, prev_date)
 
     # --- PowerPoint deck per program ---
@@ -686,7 +648,7 @@ for program, path in cobra_files.items():
             cell.fill.solid()
             cell.fill.fore_color.rgb = rgb
 
-    # Program Manpower table under labor table
+    # Program Manpower table under labor table (for every program)
     top_mp = top + labor_h + 0.2
     mp_label = slide2.shapes.add_textbox(
         Inches(0.5), Inches(top_mp - 0.3),
@@ -722,10 +684,10 @@ for program, path in cobra_files.items():
                  left_in=0.5, top_in=bottom_top2, width_in=9.0, height_in=1.0)
 
     # ---------------------------------------------------
-    # Slide 3 – Sub Team CPI/SPI/BEI Metrics
+    # Slide 3 – Sub Team CPI/SPI Metrics (no BEI columns)
     # ---------------------------------------------------
     slide3 = prs.slides.add_slide(blank_layout)
-    add_title(slide3, f"{program} EVMS Detail – Sub Team CPI / SPI / BEI Metrics")
+    add_title(slide3, f"{program} EVMS Detail – Sub Team CPI / SPI Metrics")
 
     top3 = 0.9
     metrics_tbl, metrics_h = add_simple_table(
@@ -734,9 +696,9 @@ for program, path in cobra_files.items():
         width_in=9.0
     )
 
-    # Color CPI/SPI/BEI cells
+    # Color CPI/SPI cells
     cols_m = list(metrics_sub.columns)
-    metric_cols = ["CPI CTD","CPI LSD","SPI CTD","SPI LSD","BEI CTD","BEI LSD"]
+    metric_cols = ["CPI CTD","CPI LSD","SPI CTD","SPI LSD"]
     metric_indices = {c: cols_m.index(c) for c in metric_cols}
     for i in range(len(metrics_sub)):
         for name, j in metric_indices.items():
