@@ -1,6 +1,6 @@
 # ============================================================
-# EVMS Deck per Program – Cleaned Layout
-#   Slide 1: EVMS Trend Overview (chart + CPI/SPI/BEI CTD/LSD + RC box)
+# EVMS Deck per Program – Trend + Detail Tables
+#   Slide 1: EVMS Trend Overview (chart + CPI/SPI/BEI CTD/LSD + Legend + RC box)
 #   Slide 2: Sub Team Performance (Labor + CPI/SPI/BEI) + Program Manpower + RC box
 # ============================================================
 
@@ -220,8 +220,7 @@ def compute_bei_by_subteam(program_name: str,
        subteam -> (BEI_CTD, BEI_LSD)
 
     Uses Penske PROGRAM + TEAM columns when possible.
-    If TEAM has no match for a given subteam, falls back to program-level BEI
-    so BEI is always populated.
+    If TEAM has no match for a given subteam, falls back to program-level BEI.
     """
     df = PENSKE.copy()
 
@@ -358,10 +357,9 @@ def build_manpower_table(cobra: pd.DataFrame,
                          curr_date: datetime,
                          prev_date: datetime) -> pd.DataFrame:
     """
-    Program Manpower (FTE):
-      Row, Demand, Actual, % Var, Next Mo BCWS, Next Mo ETC
-    Demand/Actual based on BCWS/ACWP for the status month.
-    Next month based on BCWS and ETC cost sets.
+    Program Manpower (FTE) – CTD based:
+      Demand FTE (CTD), Actual FTE (CTD), % Var,
+      Next Mo BCWS FTE, Next Mo ETC FTE
     """
     df = cobra.copy()
     df["DATE"] = pd.to_datetime(df["DATE"])
@@ -374,43 +372,45 @@ def build_manpower_table(cobra: pd.DataFrame,
     ).fillna(0)
 
     if pivot.empty:
-        return pd.DataFrame(columns=["Row", "Demand", "Actual", "% Var",
+        return pd.DataFrame(columns=["Demand", "Actual", "% Var",
                                      "Next Mo BCWS", "Next Mo ETC"])
 
     bcws_col, _, acwp_col, etc_col = map_cost_sets(pivot.columns)
     if bcws_col is None or acwp_col is None:
-        return pd.DataFrame(columns=["Row", "Demand", "Actual", "% Var",
+        return pd.DataFrame(columns=["Demand", "Actual", "% Var",
                                      "Next Mo BCWS", "Next Mo ETC"])
 
     demand_hrs = pivot[bcws_col]
     actual_hrs = pivot[acwp_col]
-    etc_hrs    = pivot[etc_col] if (etc_col is not None and etc_col in pivot.columns) else None
+    etc_hrs    = pivot[etc_col] if (etc_col is not None and etc_col in pivot.columns) else pd.Series(0, index=pivot.index)
 
-    demand_fte = demand_hrs / HOURS_PER_FTE
-    actual_fte = actual_hrs / HOURS_PER_FTE
-    etc_fte    = etc_hrs / HOURS_PER_FTE if etc_hrs is not None else None
+    # CTD (cumulative) FTE for status month
+    cum_demand_fte = demand_hrs.cumsum() / HOURS_PER_FTE
+    cum_actual_fte = actual_hrs.cumsum() / HOURS_PER_FTE
 
     status_period = pd.Period(curr_date, freq="M")
     next_period   = status_period + 1
 
-    demand = demand_fte.get(status_period, np.nan)
-    actual = actual_fte.get(status_period, np.nan)
-    next_bcws = demand_fte.get(next_period, np.nan)
-    next_etc  = etc_fte.get(next_period, np.nan) if etc_fte is not None else np.nan
+    demand = cum_demand_fte.get(status_period, np.nan)
+    actual = cum_actual_fte.get(status_period, np.nan)
 
     if demand is not None and not pd.isna(demand) and demand != 0:
         pct_var = actual / demand
     else:
         pct_var = np.nan
 
-    return pd.DataFrame({
-        "Row": ["Program Manpower (FTE)"],
+    # Next month non-cumulative BCWS & ETC in FTE
+    next_bcws_fte = (demand_hrs / HOURS_PER_FTE).get(next_period, np.nan)
+    next_etc_fte  = (etc_hrs    / HOURS_PER_FTE).get(next_period, np.nan)
+
+    manpower_df = pd.DataFrame({
         "Demand": [demand],
         "Actual": [actual],
         "% Var": [pct_var],
-        "Next Mo BCWS": [next_bcws],
-        "Next Mo ETC": [next_etc],
+        "Next Mo BCWS": [next_bcws_fte],
+        "Next Mo ETC": [next_etc_fte],
     })
+    return manpower_df
 
 # ============================================================
 # PLOTTING & PPT HELPERS
@@ -471,14 +471,16 @@ def add_title(slide, text, left=0.5, top=0.3):
     p.font.size = Pt(24)
 
 def add_simple_table(slide, df: pd.DataFrame,
-                     left_in, top_in, width_in, height_in=None) -> object:
+                     left_in, top_in, width_in, height_in=None):
     """
     Create a table for a DataFrame; return pptx table object.
     If height_in is None, a default height is computed; otherwise uses the given height.
+
+    All CPI/SPI/BEI values are printed to 2 decimal places.
     """
     rows, cols = df.shape
     if height_in is None:
-        height_in = 0.6 + 0.28 * rows  # simple default
+        height_in = 0.6 + 0.26 * rows
     shape = slide.shapes.add_table(
         rows + 1, cols,
         Inches(left_in), Inches(top_in),
@@ -505,8 +507,9 @@ def add_simple_table(slide, df: pd.DataFrame,
                 if "%COMP" in col.upper() or "VAR" in col.upper():
                     cell.text = "" if pd.isna(val) else f"{val:.1%}"
                 elif col in metric_cols:
-                    cell.text = "" if pd.isna(val) else f"{val:.3f}"
+                    cell.text = "" if pd.isna(val) else f"{val:.2f}"
                 else:
+                    # generic numeric (BAC/EAC/VAC/FTEs)
                     cell.text = "" if pd.isna(val) else f"{val:,.1f}"
             else:
                 cell.text = "" if pd.isna(val) else str(val)
@@ -517,7 +520,7 @@ def add_simple_table(slide, df: pd.DataFrame,
     return table
 
 def add_rcca_box(slide, label="Comments / Root Cause & Corrective Actions",
-                 left_in=0.5, top_in=5.0, width_in=9.0, height_in=1.3):
+                 left_in=0.5, top_in=5.5, width_in=9.0, height_in=1.0):
     box = slide.shapes.add_textbox(
         Inches(left_in), Inches(top_in),
         Inches(width_in), Inches(height_in)
@@ -528,6 +531,29 @@ def add_rcca_box(slide, label="Comments / Root Cause & Corrective Actions",
     p.font.bold = True
     p.font.size = Pt(14)
     tf.add_paragraph()  # blank line for notes
+
+def add_threshold_legend(slide, left_in=6.2, top_in=3.7, width_in=3.5, height_in=1.8):
+    """Add a small legend describing the color thresholds."""
+    box = slide.shapes.add_textbox(
+        Inches(left_in), Inches(top_in),
+        Inches(width_in), Inches(height_in)
+    )
+    tf = box.text_frame
+    tf.text = "Color Coding Thresholds:"
+    p0 = tf.paragraphs[0]
+    p0.font.bold = True
+    p0.font.size = Pt(10)
+
+    lines = [
+        "• CPI / SPI / BEI: Blue ≥ 1.05, Green 0.98–1.05, Yellow 0.95–0.98, Red < 0.95.",
+        "• VAC/BAC: Blue ≥ +5%, Green +5% to −2%, Yellow −2% to −5%, Red < −5%.",
+        "• Manpower % Var: Green 90–105%, Yellow 85–90% or 105–110%, Red <85% or ≥110%."
+    ]
+    for text in lines:
+        p = tf.add_paragraph()
+        p.text = text
+        p.level = 1
+        p.font.size = Pt(8)
 
 # ============================================================
 # MAIN LOOP – Build decks
@@ -556,7 +582,7 @@ for program, path in cobra_files.items():
     cpi_lsd = row_prev["Cumulative CPI"]
     spi_lsd = row_prev["Cumulative SPI"]
 
-    # Program-level BEI (program fallback)
+    # Program-level BEI using program fallback ("PROGRAM" pseudo-subteam)
     prog_bei_map = compute_bei_by_subteam(program, ["PROGRAM"], curr_date, prev_date)
     bei_ctd, bei_lsd = prog_bei_map["PROGRAM"]
 
@@ -567,7 +593,7 @@ for program, path in cobra_files.items():
     })
 
     print(f"  CTD date: {curr_date.date()}, LSD date: {prev_date.date()}")
-    print(metrics_df, "\n")
+    print(metrics_df.round(2), "\n")
 
     # EVMS plot
     fig = create_evms_plot(program, evdf)
@@ -575,8 +601,8 @@ for program, path in cobra_files.items():
     fig.write_image(img_path, scale=3)
 
     # Subteam combined performance & manpower tables
-    subteam_tbl   = build_subteam_performance_table(cobra, program, curr_date, prev_date)
-    manpower_tbl  = build_manpower_table(cobra, curr_date, prev_date)
+    subteam_tbl = build_subteam_performance_table(cobra, program, curr_date, prev_date)
+    manpower_df = build_manpower_table(cobra, curr_date, prev_date)
 
     # --- PowerPoint deck per program ---
     prs = Presentation(THEME_PATH) if os.path.exists(THEME_PATH) else Presentation()
@@ -594,7 +620,9 @@ for program, path in cobra_files.items():
         width=Inches(5.5)
     )
 
-    tbl1 = add_simple_table(slide1, metrics_df, left_in=6.2, top_in=1.0, width_in=3.5)
+    tbl1 = add_simple_table(slide1, metrics_df,
+                            left_in=6.2, top_in=1.0,
+                            width_in=3.5, height_in=1.1)
     # color CTD/LSD cells
     for i in range(1, len(metrics_df) + 1):
         for col_name, col_idx in (("CTD", 1), ("LSD", 2)):
@@ -605,6 +633,8 @@ for program, path in cobra_files.items():
                 cell.fill.solid()
                 cell.fill.fore_color.rgb = rgb
 
+    # Legend and RC box
+    add_threshold_legend(slide1)
     add_rcca_box(slide1)
 
     # ---------------------------------------------------
@@ -613,10 +643,12 @@ for program, path in cobra_files.items():
     slide2 = prs.slides.add_slide(blank_layout)
     add_title(slide2, f"{program} EVMS Detail – Sub Team Performance")
 
-    # Big combined subteam table across the top (fixed height so it doesn't overlap)
+    # Sub-team table across top; cap height so Abrams doesn't run off page
+    rows_sub = len(subteam_tbl)
+    sub_height = min(3.0, 0.6 + 0.18 * rows_sub)
     tbl_sub = add_simple_table(slide2, subteam_tbl,
                                left_in=0.5, top_in=0.9,
-                               width_in=9.0, height_in=3.2)
+                               width_in=9.0, height_in=sub_height)
 
     # Color VAC and metric cells
     cols = list(subteam_tbl.columns)
@@ -644,16 +676,16 @@ for program, path in cobra_files.items():
                 cell.fill.solid()
                 cell.fill.fore_color.rgb = rgb
 
-    # Program Manpower table in the lower middle (clear of subteam table)
-    tbl_mp = add_simple_table(slide2, manpower_tbl,
-                              left_in=0.5, top_in=4.3,
+    # Program Manpower CTD table – no "row" label, just the numbers
+    tbl_mp = add_simple_table(slide2, manpower_df,
+                              left_in=0.5, top_in=4.1,
                               width_in=6.0, height_in=1.0)
 
     # Color manpower % Var cell
-    if "% Var" in manpower_tbl.columns:
-        var_idx = list(manpower_tbl.columns).index("% Var")
-        for i in range(len(manpower_tbl)):
-            var_ratio = manpower_tbl.iloc[i]["% Var"]
+    if "% Var" in manpower_df.columns:
+        var_idx = list(manpower_df.columns).index("% Var")
+        for i in range(len(manpower_df)):
+            var_ratio = manpower_df.iloc[i]["% Var"]
             rgb = manpower_var_color(var_ratio)
             if rgb is not None:
                 cell = tbl_mp.cell(i+1, var_idx)
@@ -663,7 +695,7 @@ for program, path in cobra_files.items():
     # Comments across bottom
     add_rcca_box(slide2,
                  label="Comments / Root Cause & Corrective Actions",
-                 left_in=0.5, top_in=5.5, width_in=9.0, height_in=1.0)
+                 left_in=0.5, top_in=5.3, width_in=9.0, height_in=1.0)
 
     # Save deck
     out_pptx = os.path.join(OUTPUT_DIR, f"{program}_EVMS_Deck.pptx")
