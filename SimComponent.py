@@ -1,385 +1,327 @@
-# =====================================================================
-# GDLS MASTER EVMS PIPELINE – CPI/SPI/BEI + LABOR HOURS + MANPOWER
-# Produces complete 5-slide EVMS dashboard PPT for each program
-# =====================================================================
+# ============================================================
+# EVMS DASHBOARD – Full Automated Pipeline (Final Version)
+# Programs: Abrams_STS, Abrams_STS_2022, XM30
+# ============================================================
 
-import os
-import numpy as np
 import pandas as pd
+import numpy as np
+import os
+from datetime import datetime
 import plotly.graph_objects as go
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
 
-# =====================================================================
-# PATHS / INPUTS
-# =====================================================================
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
 DATA_DIR = "data"
+OPENPLAN_FILE = "OpenPlan_Activity-Penske.xlsx"
 
 PROGRAM_FILES = {
-    "Abrams_STS_2022": "Cobra-Abrams STS 2022.xlsx",
-    "Abrams_STS":      "Cobra-Abrams STS.xlsx",
-    "XM30":            "Cobra-XM30.xlsx"
+    "Abrams_STS":       "Cobra-Abrams STS.xlsx",
+    "Abrams_STS_2022":  "Cobra-Abrams STS 2022.xlsx",
+    "XM30":             "Cobra-XM30.xlsx"
 }
 
-OPENPLAN_PATH = os.path.join(DATA_DIR, "OpenPlan_Activity-Penske.xlsx")
+COBRA_SHEET = "tbl_Weekly Extract"
 
 OUTPUT_DIR = "EVMS_Output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# =====================================================================
-# COLOR PALETTE (GDLS THRESHOLD KEY)
-# =====================================================================
+SNAPSHOT_DATE = datetime.now().date()
 
-BLUE      = RGBColor(31,73,125)
-LT_BLUE   = RGBColor(142,180,227)
-GREEN     = RGBColor(51,153,102)
-YELLOW    = RGBColor(255,255,153)
-RED       = RGBColor(192,80,77)
-GRAY      = RGBColor(220,220,220)
 
-# =====================================================================
-# THRESHOLD LOGIC
-# =====================================================================
+# ============================================================
+# COLOR RULES (Using thresholds exactly from your image)
+# ============================================================
 
-def idx_color(x):
-    """Color for SPI/CPI/BEI thresholds"""
-    if pd.isna(x): return None
-    if x >= 1.05: return BLUE
-    if x >= 1.02: return LT_BLUE
-    if x >= 0.98: return GREEN
-    if x >= 0.95: return YELLOW
-    return RED
+# For SPI, CPI, BEI (ratio-based)
+def color_spi_cpi(val):
+    if pd.isna(val): return None
+    if val >= 1.05: return RGBColor(31, 73, 125)     # blue
+    if 1.05 > val >= 0.98: return RGBColor(142, 180, 227)  # light blue
+    if 0.98 > val >= 0.95: return RGBColor(51, 153, 102)   # green
+    if 0.95 > val >= 0.90: return RGBColor(255, 255, 153)  # yellow
+    return RGBColor(192, 80, 77)  # red
 
-def vac_color(x):
-    """Color for VAC/BAC thresholds"""
-    if pd.isna(x): return None
-    if x >= 0.05: return BLUE
-    if x >= 0.02: return GREEN
-    if x >= -0.02: return YELLOW
-    if x >= -0.05: return LT_BLUE
-    return RED
 
-# =====================================================================
-# NORMALIZE COLUMN NAMES
-# =====================================================================
+# For VAC thresholds
+def color_vac(val):
+    if pd.isna(val): return None
+    if val >= 0.05: return RGBColor(31, 73, 125)      # blue
+    if 0.05 > val >= -0.02: return RGBColor(142, 180, 227)
+    if -0.02 > val >= -0.05: return RGBColor(255, 255, 153)
+    if -0.05 > val >= -0.10: return RGBColor(255, 204, 153)
+    return RGBColor(192, 80, 77)  # red
 
-def clean(df):
-    df = df.rename(columns=lambda c: c.strip().upper().replace(" ","_"))
-    return df
 
-# =====================================================================
-# FIND LSP DATE (last status period)
-# =====================================================================
+# ============================================================
+# CLEAN COBRA INPUT
+# ============================================================
 
-def find_lsp(df):
-    dates = pd.to_datetime(df["DATE"])
-    return dates.max()
-
-# =====================================================================
-# COMPUTE EV (BCWS / BCWP / ACWP / ETC)
-# =====================================================================
-
-def compute_ev(df_raw):
-    df = clean(df_raw.copy())
+def load_cobra(path):
+    df = pd.read_excel(path, sheet_name=COBRA_SHEET)
+    df = df.loc[:, ~df.columns.str.contains("Unnamed")]
     df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
-    df = df[df["DATE"].notna()]
+    return df.dropna(subset=["DATE"])
 
-    pivot = df.pivot_table(
-        index="DATE",
-        columns="COST_SET",
-        values="HOURS",
-        aggfunc="sum",
-        fill_value=0
-    ).sort_index()
 
-    # map cost-sets
-    cols = {c: c.replace("_","") for c in pivot.columns}
-    def match(k): return next((orig for orig,new in cols.items() if k in new), None)
+# ============================================================
+# GET LAST STATUS PERIOD (LSP)
+# ============================================================
 
-    bcws = match("BCWS")
-    bcwp = match("BCWP") or match("PROGRESS")
-    acwp = match("ACWP")
-    etc  = match("ETC")
+def get_lsp(df):
+    last = df["DATE"].max()
+    df_lsp = df[df["DATE"] == last]
+    return last, df_lsp
 
-    ev = pd.DataFrame()
-    ev["BCWS"] = pivot[bcws]
-    ev["BCWP"] = pivot[bcwp]
-    ev["ACWP"] = pivot[acwp]
-    ev["ETC"]  = pivot[etc] if etc else 0
 
-    ev["BCWS_CUM"] = ev["BCWS"].cumsum()
-    ev["BCWP_CUM"] = ev["BCWP"].cumsum()
-    ev["ACWP_CUM"] = ev["ACWP"].cumsum()
+# ============================================================
+# COMPUTE EV METRICS (SPI, CPI, BEI, %COMPLETE)
+# ============================================================
 
-    lsp = ev.index.max()
+def compute_ev_metrics(df):
+    g = df.groupby(["SUB_TEAM", "COST-SET"])["HOURS"].sum().unstack(fill_value=0)
 
-    # CTD metrics
-    BCWS_CTD = ev["BCWS_CUM"].iloc[-1]
-    BCWP_CTD = ev["BCWP_CUM"].iloc[-1]
-    ACWP_CTD = ev["ACWP_CUM"].iloc[-1]
-    ETC_TOT  = ev["ETC"].iloc[-1]
+    for col in ["BCWP", "BCWS", "ACWP"]:
+        if col not in g.columns:
+            g[col] = 0
 
-    EAC = ACWP_CTD + ETC_TOT
-    VAC = BCWS_CTD - EAC
+    g["SPI"] = np.where(g["BCWS"] == 0, np.nan, g["BCWP"] / g["BCWS"])
+    g["CPI"] = np.where(g["ACWP"] == 0, np.nan, g["BCWP"] / g["ACWP"])
 
-    SPI_CTD = BCWP_CTD / BCWS_CTD if BCWS_CTD else np.nan
-    CPI_CTD = BCWP_CTD / ACWP_CTD if ACWP_CTD else np.nan
-    PCT_COMP = BCWP_CTD / BCWS_CTD if BCWS_CTD else np.nan
-
-    # LSP metrics
-    row = ev.loc[lsp]
-    SPI_LSP = row["BCWP"] / row["BCWS"] if row["BCWS"] else np.nan
-    CPI_LSP = row["BCWP"] / row["ACWP"] if row["ACWP"] else np.nan
-
-    summary = dict(
-        LSP=lsp,
-        SPI_CTD=SPI_CTD, CPI_CTD=CPI_CTD,
-        SPI_LSP=SPI_LSP, CPI_LSP=CPI_LSP,
-        BEI_CTD=np.nan, BEI_LSP=np.nan,   # filled after BEI
-        PCT_COMP=PCT_COMP,
-        BAC=BCWS_CTD, EAC=EAC, VAC=VAC
+    # Percent Complete
+    g["%COMP"] = np.where(
+        g["BCWS"] == 0, np.nan, (g["BCWP"] / g["BCWS"]) * 100
     )
 
-    return ev, summary
+    return g.reset_index()
 
-# =====================================================================
-# COMPUTE BEI (from OpenPlan)
-# =====================================================================
 
-def compute_bei(openplan, program_name, lsp):
-    df = clean(openplan.copy())
-    df = df[df["PROGRAM"].str.upper() == program_name.upper()]
+# ============================================================
+# COMPUTE BEI FROM OPENPLAN
+# ============================================================
 
-    # required fields
-    if "BASELINE_FINISH" not in df.columns: return np.nan, np.nan
-    if "ACTUAL_FINISH" not in df.columns: return np.nan, np.nan
+def compute_bei(openplan, snapshot, program):
+    op = openplan.copy()
 
-    df["BASELINE_FINISH"] = pd.to_datetime(df["BASELINE_FINISH"], errors="coerce")
-    df["ACTUAL_FINISH"]   = pd.to_datetime(df["ACTUAL_FINISH"], errors="coerce")
+    # Filter to program and valid tasks
+    op = op[op["Program"] == program]
+    op = op[op["Activity_Type"].isin(["A", "B"])]
 
-    # exclude milestones & LOE if present
-    if "ACTIVITY_TYPE" in df.columns:
-        df = df[~df["ACTIVITY_TYPE"].isin(["M","LOE"])]
+    op["Baseline Finish"] = pd.to_datetime(op["Baseline Finish"], errors="coerce")
+    op["Actual Finish"] = pd.to_datetime(op["Actual Finish"], errors="coerce")
 
-    denom = df[df["BASELINE_FINISH"] <= lsp]
-    num   = denom[denom["ACTUAL_FINISH"].notna() & (denom["ACTUAL_FINISH"] <= lsp)]
+    baseline_tasks = op[op["Baseline Finish"] <= snapshot]
+    completed_tasks = op[op["Actual Finish"] <= snapshot]
 
-    bei = len(num) / len(denom) if len(denom) else np.nan
-    return bei, bei
+    total_baseline = baseline_tasks.groupby("SubTeam")["Activity ID"].count()
+    total_completed = completed_tasks.groupby("SubTeam")["Activity ID"].count()
 
-# =====================================================================
-# SUBTEAM EV TABLES (CPI/SPI)
-# =====================================================================
+    bei = pd.DataFrame({
+        "SubTeam": total_baseline.index,
+        "Baseline Tasks": total_baseline.values,
+        "Completed Tasks": total_completed.reindex(total_baseline.index).fillna(0).values
+    })
 
-def build_subteam_ev(df_raw):
-    df = clean(df_raw.copy())
-    df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
-    df = df[df["DATE"].notna()]
+    bei["BEI"] = np.where(
+        bei["Baseline Tasks"] == 0, np.nan,
+        bei["Completed Tasks"] / bei["Baseline Tasks"]
+    )
 
-    # aggregate by subteam + cost-set + date
-    g = df.groupby(["SUB_TEAM","COST_SET","DATE"])["HOURS"].sum().unstack("COST_SET").fillna(0)
+    return bei
 
-    out = []
-    for sub in g.index.unique():
-        x = g.loc[sub].sort_index()
-        BCWS = x.get("BCWS", pd.Series([0]))
-        BCWP = x.get("BCWP", pd.Series([0]))
-        ACWP = x.get("ACWP", pd.Series([0]))
 
-        SPI_LSP = BCWP.iloc[-1] / BCWS.iloc[-1] if BCWS.iloc[-1] else np.nan
-        CPI_LSP = BCWP.iloc[-1] / ACWP.iloc[-1] if ACWP.iloc[-1] else np.nan
-
-        SPI_CTD = BCWP.sum() / BCWS.sum() if BCWS.sum() else np.nan
-        CPI_CTD = BCWP.sum() / ACWP.sum() if ACWP.sum() else np.nan
-
-        out.append([sub, SPI_LSP, SPI_CTD, CPI_LSP, CPI_CTD])
-
-    df_out = pd.DataFrame(out, columns=["SUB_TEAM","SPI_LSP","SPI_CTD","CPI_LSP","CPI_CTD"])
-    return df_out
-
-# =====================================================================
+# ============================================================
 # LABOR HOURS PERFORMANCE TABLE
-# =====================================================================
+# ============================================================
 
-def labor_hours_table(df_raw):
-    df = clean(df_raw.copy())
-    df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
+def compute_labor(cobra_ev):
+    df = cobra_ev.copy()
+    df["BAC"] = df["BCWS"]
+    df["EAC"] = df["ACWP"] + df.get("ETC", 0)
+    df["VAC"] = df["BAC"] - df["EAC"]
+    return df[["SUB_TEAM", "%COMP", "BAC", "EAC", "VAC"]]
 
-    g = df.groupby(["SUB_TEAM","COST_SET"])["HOURS"].sum().unstack("COST_SET").fillna(0)
 
-    BAC = g["BCWS"]
-    EAC = g["ACWP"] + g.get("ETC",0)
-    VAC = BAC - EAC
-    PCOMP = np.where(BAC==0, np.nan, (g["BCWP"] / BAC) * 100)
+# ============================================================
+# COST PERFORMANCE TABLE (CPI CTD + CPI LSP)
+# ============================================================
 
-    tbl = pd.DataFrame({
-        "SUB_TEAM": g.index,
-        "%COMP": PCOMP.round(1),
-        "BAC": BAC.round(1),
-        "EAC": EAC.round(1),
-        "VAC": VAC.round(1),
-    })
+def make_cpi_table(ev_ctd, ev_lsp):
+    df = pd.DataFrame()
+    df["SUB_TEAM"] = ev_ctd["SUB_TEAM"]
+    df["CPI CTD"] = ev_ctd["CPI"]
+    df["CPI LSP"] = ev_lsp["CPI"]
+    df["Comments"] = ""
+    return df
 
-    return tbl
 
-# =====================================================================
-# MANPOWER TABLE
-# =====================================================================
+# ============================================================
+# SCHEDULE PERFORMANCE TABLE (SPI + BEI)
+# ============================================================
 
-def manpower_table(ev):
-    """Demand & Actual based on monthly BCWS/ACWP divided by SHC=980hrs"""
-    SHC = 980
-    ev2 = ev.copy()
-    ev2["MONTH"] = ev2.index.to_period("M")
+def make_spi_bei_table(ev_ctd, ev_lsp, bei):
+    df = pd.DataFrame()
+    df["SUB_TEAM"] = ev_ctd["SUB_TEAM"]
+    df["SPI CTD"] = ev_ctd["SPI"]
+    df["SPI LSP"] = ev_lsp["SPI"]
+    df["BEI CTD"] = bei.groupby("SubTeam")["BEI"].max().reindex(ev_ctd["SUB_TEAM"]).values
+    df["BEI LSP"] = df["BEI CTD"]  # If separate needed, replace
+    df["Comments"] = ""
+    return df
 
-    m = ev2.groupby("MONTH")[["BCWS","ACWP"]].sum()
 
-    m["DEMAND"] = m["BCWS"] / SHC
-    m["ACTUAL"] = m["ACWP"] / SHC
+# ============================================================
+# EV TREND PLOT
+# ============================================================
 
-    last = m.iloc[-2] if len(m)>=2 else m.iloc[-1]
-    now  = m.iloc[-1]
-    nxt  = np.nan
-
-    pct_var = (now["ACTUAL"] - now["DEMAND"]) / now["DEMAND"] if now["DEMAND"] else np.nan
-
-    out = pd.DataFrame({
-        "Last Month Demand":[last["DEMAND"]],
-        "This Month Demand":[now["DEMAND"]],
-        "Next Month Demand":[nxt],
-        "Actual":[now["ACTUAL"]],
-        "%Var":[pct_var]
-    })
-
-    return out.round(2)
-
-# =====================================================================
-# PLOT
-# =====================================================================
-
-def make_ev_plot(ev, program):
+def make_ev_plot(ev_dates, program):
     fig = go.Figure()
 
-    # threshold bands
-    bands = [
-        (1.05, 2.0, "lightblue"),
-        (1.02, 1.05, "blue"),
-        (0.98, 1.02, "green"),
-        (0.95, 0.98, "yellow"),
-        (0.0, 0.95, "red")
-    ]
-    for low,high,col in bands:
-        fig.add_hrect(y0=low, y1=high, fillcolor=col, opacity=0.15, line_width=0)
+    fig.add_trace(go.Scatter(
+        x=ev_dates["DATE"], y=ev_dates["SPI"], name="SPI (CTD)",
+        line=dict(width=3)
+    ))
+    fig.add_trace(go.Scatter(
+        x=ev_dates["DATE"], y=ev_dates["CPI"], name="CPI (CTD)",
+        line=dict(width=3)
+    ))
 
-    fig.add_trace(go.Scatter(x=ev.index, y=ev["BCWP_CUM"]/ev["ACWP_CUM"], mode="lines",
-                             name="CPI (Cum)", line=dict(color="blue")))
-    fig.add_trace(go.Scatter(x=ev.index, y=ev["BCWP_CUM"]/ev["BCWS_CUM"], mode="lines",
-                             name="SPI (Cum)", line=dict(color="black")))
-    fig.update_layout(title=f"{program} EVMS Trend", yaxis=dict(range=[0.8,1.2]))
-    path = os.path.join(OUTPUT_DIR, f"{program}_EV_plot.png")
-    fig.write_image(path, scale=3)
-    return path
+    fig.update_layout(
+        title=f"{program} – EVMS Trend",
+        template="plotly_white",
+        yaxis=dict(range=[0, 2])
+    )
 
-# =====================================================================
-# PPT TABLE HELPER
-# =====================================================================
+    out = os.path.join(OUTPUT_DIR, f"{program}_EV_Trend.png")
+    fig.write_image(out, scale=3)
+    return out
 
-def add_table(slide, df, left, top, width):
+
+# ============================================================
+# ADD TABLE TO POWERPOINT WITH COLORING
+# ============================================================
+
+def add_table_to_slide(slide, df, title, color_rule):
     rows, cols = df.shape
-    shape = slide.shapes.add_table(rows+1, cols, left, top, width, Inches(0.2))
-    tbl = shape.table
-    # headers
-    for j, c in enumerate(df.columns):
-        cell = tbl.cell(0,j)
-        cell.text = c
-        cell.text_frame.paragraphs[0].font.bold = True
-    # body
-    for i in range(rows):
-        for j in range(cols):
-            val = df.iloc[i,j]
-            cell = tbl.cell(i+1,j)
-            cell.text = "" if pd.isna(val) else str(val)
-            # color
-            if df.columns[j] in ["SPI_LSP","SPI_CTD","CPI_LSP","CPI_CTD","BEI_LSP","BEI_CTD"]:
-                bg = idx_color(float(val))
-                if bg: cell.fill.solid(); cell.fill.fore_color.rgb = bg
-            if df.columns[j]=="VAC":
-                bg = vac_color(float(val/df.iloc[i]["BAC"]) if df.iloc[i]["BAC"] else np.nan)
-                if bg: cell.fill.solid(); cell.fill.fore_color.rgb = bg
-    return tbl
+    table = slide.shapes.add_table(rows+1, cols, Inches(0.3), Inches(1.0), Inches(9), Inches(0.3*(rows+1))).table
 
-# =====================================================================
-# MAIN LOOP
-# =====================================================================
+    # Write header
+    for c, col in enumerate(df.columns):
+        table.cell(0, c).text = col
+        table.cell(0, c).text_frame.paragraphs[0].font.bold = True
+        table.cell(0, c).fill.solid()
+        table.cell(0, c).fill.fore_color.rgb = RGBColor(31, 73, 125)
+        table.cell(0, c).text_frame.paragraphs[0].font.color.rgb = RGBColor(255, 255, 255)
 
-openplan = pd.read_excel(OPENPLAN_PATH)
+    # Write body
+    for r in range(rows):
+        for c in range(cols):
+            val = df.iloc[r, c]
+            cell = table.cell(r+1, c)
+            cell.text = "" if pd.isna(val) else str(round(val, 3) if isinstance(val, float) else val)
 
-for program, file in PROGRAM_FILES.items():
+            # Apply color if rule provided
+            if color_rule and isinstance(val, (int, float)):
+                color = color_rule(val)
+                if color:
+                    cell.fill.solid()
+                    cell.fill.fore_color.rgb = color
 
+
+# ============================================================
+# MAIN PROCESSING LOOP
+# ============================================================
+
+openplan = pd.read_excel(os.path.join(DATA_DIR, OPENPLAN_FILE))
+
+for program, cobra_file in PROGRAM_FILES.items():
     print(f"\nProcessing → {program}")
-    cobra = pd.read_excel(os.path.join(DATA_DIR, file))
 
-    # EV + summary
-    ev, summary = compute_ev(cobra)
+    cobra_path = os.path.join(DATA_DIR, cobra_file)
+    cobra = load_cobra(cobra_path)
+
+    # CTD EV
+    ev_ctd = compute_ev_metrics(cobra)
+
+    # LSP EV
+    lsp_date, cobra_lsp = get_lsp(cobra)
+    ev_lsp = compute_ev_metrics(cobra_lsp)
 
     # BEI
-    bei_ctd, bei_lsp = compute_bei(openplan, program, summary["LSP"])
-    summary["BEI_CTD"] = bei_ctd
-    summary["BEI_LSP"] = bei_lsp
+    bei = compute_bei(openplan, SNAPSHOT_DATE, program)
 
-    # labor hours
-    labor_tbl = labor_hours_table(cobra)
+    # Labor Hours
+    labor = compute_labor(ev_ctd)
 
-    # subteam ev
-    st_ev = build_subteam_ev(cobra)
+    # Cost Performance
+    cpi_tbl = make_cpi_table(ev_ctd, ev_lsp)
 
-    # schedule table merges SPI/BEI
-    sched = st_ev[["SUB_TEAM","SPI_LSP","SPI_CTD"]].copy()
-    sched["BEI_LSP"] = bei_lsp
-    sched["BEI_CTD"] = bei_ctd
+    # Schedule Performance
+    spi_tbl = make_spi_bei_table(ev_ctd, ev_lsp, bei)
 
-    # cost table
-    cost = st_ev[["SUB_TEAM","CPI_LSP","CPI_CTD"]].copy()
+    # EV Trend Plot
+    plot_path = make_ev_plot(ev_ctd.rename(columns={"DATE":"DATE"}).assign(DATE=cobra["DATE"]), program)
 
-    # manpower
-    mp = manpower_table(ev)
+    # Build PowerPoint
+    prs = Presentation()
+    blank = prs.slide_layouts[6]
 
-    # EV summary table
+    # Slide 1 — EVMS Summary / Metrics
+    slide = prs.slides.add_slide(blank)
+    slide.shapes.title = slide.shapes.title or slide.shapes.add_textbox(Inches(0.3), Inches(0.2), Inches(9), Inches(0.5))
+    slide.shapes.title.text = f"{program} – EVMS Metrics"
+
     summary_tbl = pd.DataFrame({
-        "Metric":["SPI","CPI","BEI","% Complete"],
-        "CTD":[summary["SPI_CTD"],summary["CPI_CTD"],summary["BEI_CTD"],summary["PCT_COMP"]],
-        "LSP":[summary["SPI_LSP"],summary["CPI_LSP"],summary["BEI_LSP"],summary["PCT_COMP"]],
+        "Metric": ["SPI", "CPI", "BEI", "% Complete"],
+        "CTD": [
+            ev_ctd["SPI"].mean(),
+            ev_ctd["CPI"].mean(),
+            bei["BEI"].mean(),
+            ev_ctd["%COMP"].mean()
+        ],
+        "LSP": [
+            ev_lsp["SPI"].mean(),
+            ev_lsp["CPI"].mean(),
+            bei["BEI"].mean(),
+            ev_lsp["%COMP"].mean()
+        ],
+        "Comments": ["", "", "", ""]
     })
 
-    # Build PPT
-    prs = Presentation()
+    add_table_to_slide(slide, summary_tbl, "EV Summary", color_spi_cpi)
 
-    # Slide 1 – EV Summary
-    s1 = prs.slides.add_slide(prs.slide_layouts[6])
-    add_table(s1, summary_tbl.round(3), Inches(0.3), Inches(0.3), Inches(8))
+    # Slide 2 — Labor Hours Performance
+    slide = prs.slides.add_slide(blank)
+    slide.shapes.title = slide.shapes.add_textbox(Inches(0.3), Inches(0.2), Inches(9), Inches(0.5))
+    slide.shapes.title.text = f"{program} – Labor Hours Performance"
+    add_table_to_slide(slide, labor, "Labor", color_vac)
 
-    # Slide 2 – Labor Hours
-    s2 = prs.slides.add_slide(prs.slide_layouts[6])
-    add_table(s2, labor_tbl, Inches(0.3), Inches(0.3), Inches(9))
+    # Slide 3 — Cost Performance
+    slide = prs.slides.add_slide(blank)
+    slide.shapes.title = slide.shapes.add_textbox(Inches(0.3), Inches(0.2), Inches(9), Inches(0.5))
+    slide.shapes.title.text = f"{program} – Cost Performance"
+    add_table_to_slide(slide, cpi_tbl, "CPI", color_spi_cpi)
 
-    # Slide 3 – Cost Performance
-    s3 = prs.slides.add_slide(prs.slide_layouts[6])
-    add_table(s3, cost.round(3), Inches(0.3), Inches(0.3), Inches(8))
+    # Slide 4 — Schedule Performance
+    slide = prs.slides.add_slide(blank)
+    slide.shapes.title = slide.shapes.add_textbox(Inches(0.3), Inches(0.2), Inches(9), Inches(0.5))
+    slide.shapes.title.text = f"{program} – Schedule Performance"
+    add_table_to_slide(slide, spi_tbl, "SPI/BEI", color_spi_cpi)
 
-    # Slide 4 – Schedule Performance
-    s4 = prs.slides.add_slide(prs.slide_layouts[6])
-    add_table(s4, sched.round(3), Inches(0.3), Inches(0.3), Inches(8))
+    # Slide 5 — Trend Plot
+    slide = prs.slides.add_slide(blank)
+    slide.shapes.title = slide.shapes.add_textbox(Inches(0.3), Inches(0.2), Inches(9), Inches(0.5))
+    slide.shapes.title.text = f"{program} – EVMS Trend"
+    slide.shapes.add_picture(plot_path, Inches(0.5), Inches(1.0), width=Inches(8))
 
-    # Slide 5 – EV Plot
-    s5 = prs.slides.add_slide(prs.slide_layouts[6])
-    plot_path = make_ev_plot(ev, program)
-    s5.shapes.add_picture(plot_path, Inches(0.3), Inches(0.3), width=Inches(9))
-
-    # SAVE
+    # Save file
     out = os.path.join(OUTPUT_DIR, f"{program}_EVMS_Dashboard.pptx")
     prs.save(out)
-    print("Saved →", out)
+    print(f"✔ Saved → {out}")
 
 print("\nALL EVMS DASHBOARDS COMPLETE ✔")
