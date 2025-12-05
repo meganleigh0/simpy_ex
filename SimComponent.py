@@ -204,6 +204,13 @@ def compute_ev_timeseries(df: pd.DataFrame) -> pd.DataFrame:
 PENSKE = pd.read_excel(PENSKE_PATH)
 PENSKE = normalize_columns(PENSKE)
 
+def _bei_for_df(df: pd.DataFrame, base_col: str, act_col: str, as_of: datetime):
+    denom = df[df[base_col] <= as_of]
+    if denom.empty:
+        return np.nan
+    numer = denom[denom[act_col].notna() & (denom[act_col] <= as_of)]
+    return len(numer) / len(denom)
+
 def compute_bei_by_subteam(program_name: str,
                            subteams,
                            status_date: datetime,
@@ -211,48 +218,51 @@ def compute_bei_by_subteam(program_name: str,
     """
     Return dict:
        subteam -> (BEI_CTD, BEI_LSD)
-    Uses Penske PROGRAM + TEAM columns when available.
+
+    Uses Penske PROGRAM + TEAM columns when possible.
+    If TEAM has no match for a given subteam, falls back to program-level BEI
+    so BEI is always populated.
     """
     df = PENSKE.copy()
 
+    # filter by program name if possible
     if "PROGRAM" in df.columns:
         mask = df["PROGRAM"].astype(str).str.contains(program_name, case=False, na=False)
         if mask.any():
             df = df[mask]
 
-    base_col = next((c for c in df.columns if "BASELINEFINISH" in c), None)
-    act_col  = next((c for c in df.columns if "ACTUALFINISH"   in c), None)
+    base_col = next((c for c in df.columns if "BASELINEFINISH" in c or ("BASELINE" in c and "FINISH" in c)), None)
+    act_col  = next((c for c in df.columns if "ACTUALFINISH"   in c or ("ACTUAL"   in c and "FINISH" in c)), None)
     if base_col is None or act_col is None:
         return {st: (np.nan, np.nan) for st in subteams}
 
     df[base_col] = pd.to_datetime(df[base_col], errors="coerce")
     df[act_col]  = pd.to_datetime(df[act_col],  errors="coerce")
 
+    # exclude LOE / milestones if such a column exists
     lev_col = next((c for c in df.columns if "LEVTYPE" in c), None)
     if lev_col is not None:
         df = df[~df[lev_col].isin(["A", "B"])]
+
+    # program-level BEI for fallback
+    prog_ctd = _bei_for_df(df, base_col, act_col, status_date)
+    prog_lsd = _bei_for_df(df, base_col, act_col, prev_status_date)
 
     team_col = "TEAM" if "TEAM" in df.columns else None
 
     result = {}
     for st in subteams:
-        if team_col:
+        sub = None
+        if team_col and df[team_col].notna().any():
             sub = df[df[team_col].astype(str).str.upper() == str(st).upper()]
-        else:
-            sub = df  # fallback – program level
-
-        if sub.empty:
-            result[st] = (np.nan, np.nan)
+        if sub is None or sub.empty:
+            # fallback to program-level values
+            result[st] = (prog_ctd, prog_lsd)
             continue
 
-        def _bei(d):
-            denom = sub[sub[base_col] <= d]
-            if denom.empty:
-                return np.nan
-            numer = denom[denom[act_col].notna() & (denom[act_col] <= d)]
-            return len(numer) / len(denom)
-
-        result[st] = (_bei(status_date), _bei(prev_status_date))
+        bei_ctd = _bei_for_df(sub, base_col, act_col, status_date)
+        bei_lsd = _bei_for_df(sub, base_col, act_col, prev_status_date)
+        result[st] = (bei_ctd, bei_lsd)
 
     return result
 
@@ -313,7 +323,7 @@ def build_subteam_performance_table(cobra: pd.DataFrame,
     labor_tbl = build_labor_table(cobra)
     subteams = labor_tbl["Sub Team"].tolist()
 
-    # BEI by subteam from Penske
+    # BEI by subteam (with program fallback)
     bei_map = compute_bei_by_subteam(program_name, subteams, curr_date, prev_date)
 
     # Initialize metric columns
@@ -347,7 +357,12 @@ def build_subteam_performance_table(cobra: pd.DataFrame,
 def build_manpower_table(cobra: pd.DataFrame,
                          curr_date: datetime,
                          prev_date: datetime) -> pd.DataFrame:
-    """Program Manpower: Demand, Actual, %Var, Last Mo, Next Mo (FTEs)."""
+    """
+    Program Manpower (FTE):
+      Row, Demand, Actual, % Var, Next Mo BCWS, Next Mo ETC
+    Demand/Actual based on BCWS/ACWP for the status month.
+    Next month based on BCWS and ETC cost sets.
+    """
     df = cobra.copy()
     df["DATE"] = pd.to_datetime(df["DATE"])
 
@@ -359,28 +374,29 @@ def build_manpower_table(cobra: pd.DataFrame,
     ).fillna(0)
 
     if pivot.empty:
-        return pd.DataFrame(columns=["Label", "Demand FTE", "Actual FTE",
-                                     "% Var (Act/Demand)", "Last Mo Demand FTE", "Next Mo Demand FTE"])
+        return pd.DataFrame(columns=["Row", "Demand", "Actual", "% Var",
+                                     "Next Mo BCWS", "Next Mo ETC"])
 
-    bcws_col, _, acwp_col, _ = map_cost_sets(pivot.columns)
+    bcws_col, _, acwp_col, etc_col = map_cost_sets(pivot.columns)
     if bcws_col is None or acwp_col is None:
-        return pd.DataFrame(columns=["Label", "Demand FTE", "Actual FTE",
-                                     "% Var (Act/Demand)", "Last Mo Demand FTE", "Next Mo Demand FTE"])
+        return pd.DataFrame(columns=["Row", "Demand", "Actual", "% Var",
+                                     "Next Mo BCWS", "Next Mo ETC"])
 
     demand_hrs = pivot[bcws_col]
     actual_hrs = pivot[acwp_col]
+    etc_hrs    = pivot[etc_col] if (etc_col is not None and etc_col in pivot.columns) else None
 
     demand_fte = demand_hrs / HOURS_PER_FTE
     actual_fte = actual_hrs / HOURS_PER_FTE
+    etc_fte    = etc_hrs / HOURS_PER_FTE if etc_hrs is not None else None
 
     status_period = pd.Period(curr_date, freq="M")
-    last_period   = pd.Period(prev_date, freq="M")
     next_period   = status_period + 1
 
     demand = demand_fte.get(status_period, np.nan)
     actual = actual_fte.get(status_period, np.nan)
-    last   = demand_fte.get(last_period,   np.nan)
-    nxt    = demand_fte.get(next_period,   np.nan)
+    next_bcws = demand_fte.get(next_period, np.nan)
+    next_etc  = etc_fte.get(next_period, np.nan) if etc_fte is not None else np.nan
 
     if demand is not None and not pd.isna(demand) and demand != 0:
         pct_var = actual / demand
@@ -388,12 +404,12 @@ def build_manpower_table(cobra: pd.DataFrame,
         pct_var = np.nan
 
     return pd.DataFrame({
-        "Label": ["Program Manpower"],
-        "Demand FTE": [demand],
-        "Actual FTE": [actual],
-        "% Var (Act/Demand)": [pct_var],
-        "Last Mo Demand FTE": [last],
-        "Next Mo Demand FTE": [nxt],
+        "Row": ["Program Manpower (FTE)"],
+        "Demand": [demand],
+        "Actual": [actual],
+        "% Var": [pct_var],
+        "Next Mo BCWS": [next_bcws],
+        "Next Mo ETC": [next_etc],
     })
 
 # ============================================================
@@ -455,13 +471,18 @@ def add_title(slide, text, left=0.5, top=0.3):
     p.font.size = Pt(24)
 
 def add_simple_table(slide, df: pd.DataFrame,
-                     left_in, top_in, width_in) -> object:
-    """Create a table for a DataFrame; return pptx table object."""
+                     left_in, top_in, width_in, height_in=None) -> object:
+    """
+    Create a table for a DataFrame; return pptx table object.
+    If height_in is None, a default height is computed; otherwise uses the given height.
+    """
     rows, cols = df.shape
+    if height_in is None:
+        height_in = 0.6 + 0.28 * rows  # simple default
     shape = slide.shapes.add_table(
         rows + 1, cols,
         Inches(left_in), Inches(top_in),
-        Inches(width_in), Inches(0.6 + 0.28 * rows)
+        Inches(width_in), Inches(height_in)
     )
     table = shape.table
 
@@ -496,7 +517,7 @@ def add_simple_table(slide, df: pd.DataFrame,
     return table
 
 def add_rcca_box(slide, label="Comments / Root Cause & Corrective Actions",
-                 left_in=0.5, top_in=4.9, width_in=9.0, height_in=1.5):
+                 left_in=0.5, top_in=5.0, width_in=9.0, height_in=1.3):
     box = slide.shapes.add_textbox(
         Inches(left_in), Inches(top_in),
         Inches(width_in), Inches(height_in)
@@ -535,9 +556,9 @@ for program, path in cobra_files.items():
     cpi_lsd = row_prev["Cumulative CPI"]
     spi_lsd = row_prev["Cumulative SPI"]
 
-    # Program-level BEI CTD/LSD (aggregated)
-    bei_prog_map = compute_bei_by_subteam(program, ["PROGRAM"], curr_date, prev_date)
-    bei_ctd, bei_lsd = bei_prog_map["PROGRAM"]
+    # Program-level BEI (program fallback)
+    prog_bei_map = compute_bei_by_subteam(program, ["PROGRAM"], curr_date, prev_date)
+    bei_ctd, bei_lsd = prog_bei_map["PROGRAM"]
 
     metrics_df = pd.DataFrame({
         "Metric": ["CPI", "SPI", "BEI"],
@@ -592,9 +613,10 @@ for program, path in cobra_files.items():
     slide2 = prs.slides.add_slide(blank_layout)
     add_title(slide2, f"{program} EVMS Detail – Sub Team Performance")
 
-    # Big combined subteam table across the top
+    # Big combined subteam table across the top (fixed height so it doesn't overlap)
     tbl_sub = add_simple_table(slide2, subteam_tbl,
-                               left_in=0.5, top_in=0.9, width_in=9.0)
+                               left_in=0.5, top_in=0.9,
+                               width_in=9.0, height_in=3.2)
 
     # Color VAC and metric cells
     cols = list(subteam_tbl.columns)
@@ -622,23 +644,16 @@ for program, path in cobra_files.items():
                 cell.fill.solid()
                 cell.fill.fore_color.rgb = rgb
 
-    # Program Manpower table in the middle bottom
-    mp_tbl = manpower_tbl.rename(columns={
-        "Label": "Row",
-        "Demand FTE": "Demand FTE",
-        "Actual FTE": "Actual FTE",
-        "% Var (Act/Demand)": "% Var",
-        "Last Mo Demand FTE": "Last Mo Demand FTE",
-        "Next Mo Demand FTE": "Next Mo Demand FTE",
-    })
-    tbl_mp = add_simple_table(slide2, mp_tbl,
-                              left_in=0.5, top_in=3.7, width_in=5.5)
+    # Program Manpower table in the lower middle (clear of subteam table)
+    tbl_mp = add_simple_table(slide2, manpower_tbl,
+                              left_in=0.5, top_in=4.3,
+                              width_in=6.0, height_in=1.0)
 
     # Color manpower % Var cell
-    if "% Var" in mp_tbl.columns:
-        var_idx = list(mp_tbl.columns).index("% Var")
-        for i in range(len(mp_tbl)):
-            var_ratio = mp_tbl.iloc[i]["% Var"]
+    if "% Var" in manpower_tbl.columns:
+        var_idx = list(manpower_tbl.columns).index("% Var")
+        for i in range(len(manpower_tbl)):
+            var_ratio = manpower_tbl.iloc[i]["% Var"]
             rgb = manpower_var_color(var_ratio)
             if rgb is not None:
                 cell = tbl_mp.cell(i+1, var_idx)
@@ -648,7 +663,7 @@ for program, path in cobra_files.items():
     # Comments across bottom
     add_rcca_box(slide2,
                  label="Comments / Root Cause & Corrective Actions",
-                 left_in=0.5, top_in=5.0, width_in=9.0, height_in=1.3)
+                 left_in=0.5, top_in=5.5, width_in=9.0, height_in=1.0)
 
     # Save deck
     out_pptx = os.path.join(OUTPUT_DIR, f"{program}_EVMS_Deck.pptx")
