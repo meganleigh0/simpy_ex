@@ -88,18 +88,23 @@ def spi_cpi_color(x: float):
         return RGBColor(192,  80,  77)  # red
 
 def vac_color_from_ratio(r: float):
-    """VAC/BAC thresholds."""
+    """
+    VAC/BAC thresholds – using the decimal cutoffs from the dashboard key:
+      Blue  : X ≥ +0.055
+      Green : +0.055 > X ≥ -0.025
+      Yellow: -0.025 > X ≥ -0.055
+      Red   : X < -0.055
+    """
     if pd.isna(r):
         return None
-    # ≥ +5% blue; +5%..−2% green; −2%..−5% yellow; < −5% red
-    if r >= 0.05:
-        return RGBColor(142, 180, 227)
-    elif r >= -0.02:
-        return RGBColor( 51, 153, 102)
-    elif r >= -0.05:
-        return RGBColor(255, 255, 153)
+    if r >= 0.055:
+        return RGBColor(142, 180, 227)  # blue
+    elif r >= -0.025:
+        return RGBColor( 51, 153, 102)  # green
+    elif r >= -0.055:
+        return RGBColor(255, 255, 153)  # yellow
     else:
-        return RGBColor(192,  80,  77)
+        return RGBColor(192,  80,  77)  # red
 
 def manpower_var_color(r: float):
     """Program manpower %Var thresholds based on Actual/Demand ratio."""
@@ -532,7 +537,8 @@ def add_threshold_legend(slide, left_in=6.2, top_in=3.7, width_in=3.5, height_in
 
     lines = [
         "• CPI / SPI / BEI: Blue ≥ 1.05; Green 0.98–1.05; Yellow 0.95–0.98; Red < 0.95.",
-        "• VAC/BAC: Blue ≥ +5%; Green +5% to −2%; Yellow −2% to −5%; Red < −5%.",
+        "• VAC/BAC: Blue X ≥ +0.055; Green +0.055 > X ≥ −0.025; "
+        "Yellow −0.025 > X ≥ −0.055; Red X < −0.055.",
         "• Manpower % Var: Green 90–105%; Yellow 85–90% or 105–110%; Red <85% or ≥110%.",
     ]
     for text in lines:
