@@ -1,291 +1,541 @@
-import pandas as pd
-import numpy as np
+# ============================================================
+# EVMS Pipeline - Multi-Program EV Plot + Tables + PPT Decks
+# ============================================================
+
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
 
-# ============================================================
-# USER CONFIG
-# ============================================================
+# ------------------------------------------------------------
+# CONFIG: update paths / program names as needed
+# ------------------------------------------------------------
 
-DATA_DIR = "data"
-OUTPUT = "EVMS_Dashboard_Output.pptx"
-
-PROGRAM_FILES = {
-    "Abrams_STS": "Cobra-Abrams STS.xlsx",
-    "XM30": "Cobra-XM30.xlsx",
+cobra_files = {
+    # Program name           # Cobra export path
+    "Abrams_STS_2022": "data/Cobra-Abrams STS 2022.xlsx",
+    "Abrams_STS"     : "data/Cobra-Abrams STS.xlsx",
+    "XM30"           : "data/Cobra-XM30.xlsx",
 }
 
-OPENPLAN_FILE = "OpenPlan_Activity-Penske.xlsx"
+OPENPLAN_PATH = "data/OpenPlan_Activity-Penske.xlsx"  # BEI source
+THEME_PATH     = "data/Theme.pptx"                    # optional PPT theme
 
-COLOR_THRESHOLDS = {
-    "GOOD": RGBColor(0, 128, 0),
-    "WARN": RGBColor(255, 204, 0),
-    "BAD": RGBColor(204, 0, 0),
-}
+OUTPUT_DIR = "EVMS_Output"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# ============================================================
-# LOADERS
-# ============================================================
+# ASSUMPTIONS (for you to confirm with the team):
+# 1) BAC = total BCWS hours by Sub-Team.
+# 2) EAC = ACWP + ETC hours (if ETC cost set exists); else EAC = ACWP.
+# 3) VAC = BAC - EAC and VAC% = VAC / BAC. VAC cells are color-coded from VAC%.
+#       <= -3% red, -3–0% yellow, 0–+3% green, >+3% light blue.
+# 4) EV Cost/Schedule CTD metrics use last row of Cumulative CPI/SPI.
+#    LSD metrics use last row of Monthly CPI/SPI.
+# 5) BEI CTD/LSD are computed from OpenPlan using Baseline Finish vs Actual Finish.
+#    Status date = max Cobra DATE for that program.
+# 6) Program Manpower is calculated at the program level in FTE using:
+#       FTE = Hours / 173.33  (40-hr 9/80 schedule approximation).
+#    Demand = BCWS hours, Actual = ACWP hours for the status month.
+# ------------------------------------------------------------
 
-def load_cobra_auto(path):
-    """
-    Reads Cobra export when sheet name varies.
-    Automatically selects the sheet containing "Extract" or "Weekly".
-    """
-    xl = pd.ExcelFile(path)
-    sheet = None
-    for s in xl.sheet_names:
-        if ("extract" in s.lower()) or ("weekly" in s.lower()):
-            sheet = s
-            break
-    if sheet is None:
-        sheet = xl.sheet_names[0]
 
-    df = xl.parse(sheet)
-    df = df.loc[:, ~df.columns.astype(str).str.contains("Unnamed")]
-    df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
+# ------------------------- Helpers --------------------------
+
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize column names: strip, upper, remove spaces / hyphens / underscores."""
+    df = df.rename(columns={c: c.strip().upper()
+                              .replace(" ", "")
+                              .replace("-", "")
+                              .replace("_", "") for c in df.columns})
     return df
 
 
-def load_openplan(path):
-    df = pd.read_excel(path)
-    for c in ["Baseline Finish", "Actual Finish"]:
-        df[c] = pd.to_datetime(df[c], errors="coerce")
-    return df
+def map_cost_sets(cost_cols):
+    """
+    Map Cobra COST-SET labels to BCWS / BCWP / ACWP / ETC using fuzzy text matching.
+    Works even when column names are weird, as long as they contain key words.
+    """
+    cleaned = {col: col.replace(" ", "").replace("-", "").replace("_", "").upper()
+               for col in cost_cols}
+
+    bcws = bcwp = acwp = etc = None
+
+    for orig, clean in cleaned.items():
+        # ACWP detection
+        if ("ACWP" in clean) or ("ACTUAL" in clean) or ("ACWPHRS" in clean):
+            acwp = orig
+
+        # BCWS detection (Budget / Plan)
+        elif ("BCWS" in clean) or ("BUDGET" in clean) or ("PLAN" in clean):
+            bcws = orig
+
+        # BCWP detection (Earned / Progress)
+        elif ("BCWP" in clean) or ("PROGRESS" in clean) or ("EARNED" in clean):
+            bcwp = orig
+
+        # ETC detection
+        elif "ETC" in clean:
+            etc = orig
+
+    return bcws, bcwp, acwp, etc
 
 
-# ============================================================
-# EV CALCULATOR (ACWP, BCWP, BCWS, ETC)
-# ============================================================
+def compute_ev_metrics(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute Monthly & Cumulative CPI / SPI time-series at the program level.
+    Expects normalized Cobra dataframe with DATE, COSTSET, HOURS.
+    """
+    if "COSTSET" not in df.columns:
+        raise ValueError("Missing COSTSET column after normalization.")
 
-def compute_ev(cobra_df):
-
-    df = cobra_df.copy()
-    df = df[df["DATE"].notna()]   # remove blanks
-    df = df[df["HOURS"].notna()]  # needed
+    # Ensure DATE is datetime
+    df["DATE"] = pd.to_datetime(df["DATE"])
 
     pivot = df.pivot_table(
-        index=["SUB_TEAM", "DATE"],
-        columns="COST-SET",
+        index="DATE",
+        columns="COSTSET",
         values="HOURS",
-        aggfunc="sum",
-        fill_value=0
+        aggfunc="sum"
     ).reset_index()
 
-    # CTD is max date
-    max_date = pivot["DATE"].max()
-    ctd = pivot[pivot["DATE"] == max_date].copy()
+    cost_cols = [c for c in pivot.columns if c != "DATE"]
+    bcws_col, bcwp_col, acwp_col, _ = map_cost_sets(cost_cols)
 
-    # LSP = previous period
-    prev_date = (pivot[pivot["DATE"] < max_date]["DATE"].max())
-    lsp = pivot[pivot["DATE"] == prev_date].copy()
+    missing = []
+    if bcws_col is None:
+        missing.append("BCWS")
+    if bcwp_col is None:
+        missing.append("BCWP")
+    if acwp_col is None:
+        missing.append("ACWP")
+    if missing:
+        raise ValueError(f"Missing required cost sets: {missing}, found: {cost_cols}")
 
-    # rename cost sets if missing
-    for col in ["ACWP", "BCWP", "BCWS", "ETC"]:
-        if col not in ctd.columns:
-            ctd[col] = 0
-        if col not in lsp.columns:
-            lsp[col] = 0
+    # Replace zeros with NaN to avoid divide-by-zero noise
+    BCWS = pivot[bcws_col].replace(0, np.nan)
+    BCWP = pivot[bcwp_col].replace(0, np.nan)
+    ACWP = pivot[acwp_col].replace(0, np.nan)
 
-    # computed values
-    def add_metrics(df):
-        df["SPI"] = np.where(df["BCWS"] == 0, np.nan, df["BCWP"] / df["BCWS"])
-        df["CPI"] = np.where(df["ACWP"] == 0, np.nan, df["BCWP"] / df["ACWP"])
-        df["%COMP"] = np.where(df["BCWS"] == 0, np.nan, (df["BCWP"] / df["BCWS"]) * 100)
-        df["BAC"] = df["BCWS"]
-        df["EAC"] = df["ACWP"] + df["ETC"]
-        df["VAC"] = df["BAC"] - df["EAC"]
-        return df
+    out = pd.DataFrame({"DATE": pivot["DATE"]})
+    out["Monthly CPI"] = BCWP / ACWP
+    out["Monthly SPI"] = BCWP / BCWS
 
-    return add_metrics(ctd), add_metrics(lsp)
+    out["Cumulative CPI"] = BCWP.cumsum() / ACWP.cumsum()
+    out["Cumulative SPI"] = BCWP.cumsum() / BCWS.cumsum()
 
-
-# ============================================================
-# BEI CALCULATOR
-# ============================================================
-
-def compute_bei(openplan_df, subteam_col="SubTeam"):
-    df = openplan_df.copy()
-
-    # total tasks: baseline finish <= snapshot date
-    SNAPSHOT = df["Baseline Finish"].max()
-
-    t_total = df[(df["Baseline Finish"].notna()) &
-                 (df["Baseline Finish"] <= SNAPSHOT)]
-
-    t_done = df[df["Actual Finish"].notna()]
-
-    total = t_total.groupby(subteam_col).size()
-    done = t_done.groupby(subteam_col).size()
-
-    all_idx = total.index.union(done.index)
-
-    total = total.reindex(all_idx, fill_value=0)
-    done = done.reindex(all_idx, fill_value=0)
-
-    bei = done / total.replace(0, np.nan)
-    bei_tbl = pd.DataFrame({"SUB_TEAM": all_idx, "BEI": bei.values})
-    return bei_tbl
+    return out
 
 
-# ============================================================
-# MERGE EV (CTD/LSP) + BEI
-# ============================================================
+def create_evms_plot(program: str, evdf: pd.DataFrame) -> go.Figure:
+    """Build EVMS CPI/SPI plot with background performance zones."""
 
-def merge_ev(ev_ctd, ev_lsp, bei_tbl):
-    ev_ctd = ev_ctd.rename(columns={
-        "SPI": "SPI_CTD",
-        "CPI": "CPI_CTD",
-        "%COMP": "%COMP_CTD"
-    })
-    ev_lsp = ev_lsp.rename(columns={
-        "SPI": "SPI_LSP",
-        "CPI": "CPI_LSP",
-        "%COMP": "%COMP_LSP"
-    })
+    fig = go.Figure()
 
-    ev = ev_ctd.merge(ev_lsp[["SUB_TEAM", "SPI_LSP", "CPI_LSP", "%COMP_LSP"]],
-                      on="SUB_TEAM", how="left")
+    # Background performance bands for CPI/SPI
+    fig.add_hrect(y0=0.90, y1=0.97, fillcolor="red",      opacity=0.25, line_width=0)
+    fig.add_hrect(y0=0.97, y1=1.00, fillcolor="yellow",   opacity=0.25, line_width=0)
+    fig.add_hrect(y0=1.00, y1=1.07, fillcolor="green",    opacity=0.25, line_width=0)
+    fig.add_hrect(y0=1.07, y1=1.20, fillcolor="lightblue",opacity=0.25, line_width=0)
 
-    ev = ev.merge(bei_tbl, on="SUB_TEAM", how="left")
-    return ev
+    # Monthly CPI / SPI (markers)
+    fig.add_trace(go.Scatter(
+        x=evdf["DATE"], y=evdf["Monthly CPI"],
+        mode="markers", name="Monthly CPI",
+        marker=dict(symbol="diamond", size=10, color="yellow")
+    ))
+    fig.add_trace(go.Scatter(
+        x=evdf["DATE"], y=evdf["Monthly SPI"],
+        mode="markers", name="Monthly SPI",
+        marker=dict(size=8, color="black")
+    ))
 
+    # Cumulative CPI / SPI (lines)
+    fig.add_trace(go.Scatter(
+        x=evdf["DATE"], y=evdf["Cumulative CPI"],
+        mode="lines", name="Cumulative CPI",
+        line=dict(color="blue", width=4)
+    ))
+    fig.add_trace(go.Scatter(
+        x=evdf["DATE"], y=evdf["Cumulative SPI"],
+        mode="lines", name="Cumulative SPI",
+        line=dict(color="darkgrey", width=4)
+    ))
 
-# ============================================================
-# MANPOWER (DEMAND TABLE)
-# ============================================================
+    fig.update_layout(
+        title=f"{program} EVMS Trend",
+        xaxis_title="Month",
+        yaxis_title="EV Index",
+        yaxis=dict(range=[0.90, 1.20]),
+        template="simple_white",
+        height=600,
+    )
 
-def compute_manpower(cobra_df):
-    # Assume monthly demand = sum(BCWS) per month
-    cobra_df["MONTH"] = cobra_df["DATE"].dt.to_period("M")
-
-    m = cobra_df.groupby("MONTH")["HOURS"].sum()
-
-    months = sorted(m.index)
-
-    if len(months) < 3:
-        return pd.DataFrame({"Metric": ["Demand", "Actual"], "Last Month": 0, "This Month": 0, "Next Month": 0})
-
-    lm, tm, nm = months[-3], months[-2], months[-1]
-
-    tbl = pd.DataFrame({
-        "Metric": ["Demand"],
-        "Last Month": [m[lm]],
-        "This Month": [m[tm]],
-        "Next Month": [m[nm]],
-        "%Var": [((m[tm] - m[lm]) / m[lm] * 100) if m[lm] != 0 else np.nan]
-    })
-    return tbl
+    return fig
 
 
-# ============================================================
-# COLORING FOR PPT
-# ============================================================
+def build_labor_hours_table(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Labor Hours Performance by Sub-Team with %COMP, BAC, EAC, VAC.
+    BAC = total BCWS; EAC = ACWP + ETC (if ETC present, else ACWP).
+    """
+    if "SUBTEAM" not in df.columns:
+        raise ValueError("Expected SUBTEAM column after normalization for Labor table.")
 
-def color_cell(cell, val):
-    if pd.isna(val):
-        return
-    if val >= 0.98:
-        cell.fill.solid()
-        cell.fill.fore_color.rgb = COLOR_THRESHOLDS["GOOD"]
-    elif val >= 0.90:
-        cell.fill.solid()
-        cell.fill.fore_color.rgb = COLOR_THRESHOLDS["WARN"]
+    pivot = df.pivot_table(
+        index="SUBTEAM",
+        columns="COSTSET",
+        values="HOURS",
+        aggfunc="sum"
+    ).fillna(0)
+
+    cost_cols = list(pivot.columns)
+    bcws_col, bcwp_col, acwp_col, etc_col = map_cost_sets(cost_cols)
+
+    missing = []
+    if bcws_col is None:
+        missing.append("BCWS")
+    if bcwp_col is None:
+        missing.append("BCWP")
+    if acwp_col is None:
+        missing.append("ACWP")
+    if missing:
+        raise ValueError(f"Missing cost sets for Labor table: {missing}")
+
+    BAC = pivot[bcws_col]
+    if etc_col is not None and etc_col in pivot.columns:
+        ETC = pivot[etc_col]
     else:
-        cell.fill.solid()
-        cell.fill.fore_color.rgb = COLOR_THRESHOLDS["BAD"]
+        ETC = 0.0  # assumption: no ETC column, treat ETC as 0
+
+    ACWP = pivot[acwp_col]
+
+    EAC = ACWP + ETC
+    VAC = BAC - EAC
+    PCT_COMP = np.where(BAC != 0, pivot[bcwp_col] / BAC, np.nan)
+
+    out = pd.DataFrame({
+        "Sub Team": pivot.index,
+        "%COMP": PCT_COMP,
+        "BAC": BAC,
+        "EAC": EAC,
+        "VAC": VAC,
+    }).reset_index(drop=True)
+
+    return out
 
 
-# ============================================================
-# BUILD POWERPOINT
-# ============================================================
+def compute_bei_from_openplan(openplan_df: pd.DataFrame,
+                              status_date: pd.Timestamp,
+                              program_name: str | None = None) -> tuple[float, float]:
+    """
+    Compute BEI CTD & LSD from OpenPlan activity file.
+    BEI = (Total tasks completed) / (Tasks with Baseline Finish <= time_now).
 
-def add_table_slide(prs, title, df):
-    slide = prs.slides.add_slide(prs.slide_layouts[5])
-    title_box = slide.shapes.title
-    title_box.text = title
+    status_date is typically the last Cobra status DATE for that program.
+    If a PROGRAM column exists, we try to filter rows for that program name.
+    """
+    df = normalize_columns(openplan_df.copy())
 
-    rows, cols = df.shape[0] + 1, df.shape[1]
-    table = slide.shapes.add_table(rows, cols, Inches(0.5), Inches(1.2),
-                                   Inches(9), Inches(5)).table
+    # Try to filter by program if possible
+    if program_name and "PROGRAM" in df.columns:
+        mask = df["PROGRAM"].astype(str).str.contains(program_name, case=False, na=False)
+        if mask.any():
+            df = df[mask]
 
+    # Identify baseline/actual finish columns
+    base_col = None
+    act_col = None
+    for c in df.columns:
+        if "BASELINEFINISH" in c and base_col is None:
+            base_col = c
+        if ("ACTUALFINISH" in c or "ACTFINISH" in c) and act_col is None:
+            act_col = c
+
+    if base_col is None or act_col is None:
+        # If columns are missing, return NaNs so table still builds
+        return np.nan, np.nan
+
+    df[base_col] = pd.to_datetime(df[base_col], errors="coerce")
+    df[act_col] = pd.to_datetime(df[act_col], errors="coerce")
+
+    # CTD as of status_date
+    denom_ctd = df[df[base_col] <= status_date]
+    numer_ctd = denom_ctd[
+        denom_ctd[act_col].notna() & (denom_ctd[act_col] <= status_date)
+    ]
+    bei_ctd = (len(numer_ctd) / len(denom_ctd)) if len(denom_ctd) else np.nan
+
+    # LSD = previous month-end
+    status_period = status_date.to_period("M")
+    prev_period_end = (status_period - 1).to_timestamp("M")
+
+    denom_lsd = df[df[base_col] <= prev_period_end]
+    numer_lsd = denom_lsd[
+        denom_lsd[act_col].notna() & (denom_lsd[act_col] <= prev_period_end)
+    ]
+    bei_lsd = (len(numer_lsd) / len(denom_lsd)) if len(denom_lsd) else np.nan
+
+    return bei_ctd, bei_lsd
+
+
+def build_cost_and_schedule_tables(evdf: pd.DataFrame,
+                                   bei_ctd: float,
+                                   bei_lsd: float) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Cost Performance: CPI CTD / LSD
+    Schedule Performance: SPI CTD / LSD + BEI CTD / LSD.
+    """
+    cpi_ctd = evdf["Cumulative CPI"].iloc[-1]
+    cpi_lsd = evdf["Monthly CPI"].iloc[-1]
+    spi_ctd = evdf["Cumulative SPI"].iloc[-1]
+    spi_lsd = evdf["Monthly SPI"].iloc[-1]
+
+    cost_df = pd.DataFrame({
+        "Metric": ["CPI"],
+        "CTD": [cpi_ctd],
+        "LSD": [cpi_lsd],
+    })
+
+    sched_df = pd.DataFrame({
+        "Metric": ["SPI", "BEI"],
+        "CTD": [spi_ctd, bei_ctd],
+        "LSD": [spi_lsd, bei_lsd],
+    })
+
+    return cost_df, sched_df
+
+
+def build_manpower_table(df: pd.DataFrame,
+                         hours_per_fte: float = 173.33) -> pd.DataFrame:
+    """
+    Program manpower table for the status month:
+    Demand FTE, Actual FTE, %Var, Last Month Demand FTE, Next Month Demand FTE.
+    """
+    df = df.copy()
+    df["DATE"] = pd.to_datetime(df["DATE"])
+
+    pivot = df.pivot_table(
+        index=df["DATE"].dt.to_period("M"),
+        columns="COSTSET",
+        values="HOURS",
+        aggfunc="sum"
+    ).fillna(0)
+
+    cost_cols = list(pivot.columns)
+    bcws_col, _, acwp_col, _ = map_cost_sets(cost_cols)
+
+    if bcws_col is None or acwp_col is None:
+        # If we can't find BCWS / ACWP, return empty table to avoid hard fail.
+        return pd.DataFrame(columns=["Period", "Demand FTE", "Actual FTE",
+                                     "% Var", "Last Month Demand FTE",
+                                     "Next Month Demand FTE"])
+
+    demand_hrs = pivot[bcws_col]
+    actual_hrs = pivot[acwp_col]
+
+    periods = demand_hrs.index.sort_values()
+    status_period = periods[-1]
+    last_period = periods[-2] if len(periods) > 1 else status_period
+    next_period = status_period + 1
+
+    demand_fte = demand_hrs / hours_per_fte
+    actual_fte = actual_hrs / hours_per_fte
+
+    status_demand = demand_fte.loc[status_period]
+    status_actual = actual_fte.loc[status_period]
+    last_demand = demand_fte.loc[last_period]
+    next_demand = demand_fte.get(next_period, np.nan)
+
+    pct_var = ((status_actual - status_demand) / status_demand
+               if status_demand != 0 else np.nan)
+
+    out = pd.DataFrame({
+        "Period": [str(status_period)],
+        "Demand FTE": [status_demand],
+        "Actual FTE": [status_actual],
+        "% Var": [pct_var],
+        "Last Month Demand FTE": [last_demand],
+        "Next Month Demand FTE": [next_demand],
+    })
+
+    return out
+
+
+# ------------- PowerPoint helpers ---------------------------
+
+def vac_rgb(vac_val, bac_val):
+    """Color for VAC cell based on VAC% thresholds."""
+    if pd.isna(vac_val) or pd.isna(bac_val) or bac_val == 0:
+        return None
+    vac_pct = vac_val / bac_val
+    if vac_pct <= -0.03:
+        return RGBColor(192, 0, 0)      # red
+    elif vac_pct <= 0:
+        return RGBColor(255, 192, 0)    # yellow
+    elif vac_pct <= 0.03:
+        return RGBColor(0, 176, 80)     # green
+    else:
+        return RGBColor(0, 112, 192)    # light blue
+
+
+def add_title_box(slide, text):
+    """Add a slide title at the top."""
+    tx_box = slide.shapes.add_textbox(Inches(0.5), Inches(0.3),
+                                      Inches(9), Inches(0.6))
+    tf = tx_box.text_frame
+    tf.text = text
+    p = tf.paragraphs[0]
+    p.font.bold = True
+    p.font.size = Pt(24)
+
+
+def add_df_table(slide, df: pd.DataFrame,
+                 top_in=1.0, left_in=0.5, width_in=9.0,
+                 vac_color: bool = False):
+    """Render a pandas DataFrame as a PowerPoint table."""
+    rows, cols = df.shape
+    table_shape = slide.shapes.add_table(
+        rows + 1, cols,
+        Inches(left_in), Inches(top_in),
+        Inches(width_in), Inches(0.6 + 0.3 * rows)
+    )
+    table = table_shape.table
+
+    # Header
     for j, col in enumerate(df.columns):
-        table.cell(0, j).text = col
+        cell = table.cell(0, j)
+        cell.text = str(col)
+        para = cell.text_frame.paragraphs[0]
+        para.font.bold = True
+        para.font.size = Pt(12)
 
-    for i in range(df.shape[0]):
-        for j in range(df.shape[1]):
+    # Body
+    for i in range(rows):
+        for j, col in enumerate(df.columns):
             val = df.iloc[i, j]
             cell = table.cell(i + 1, j)
-            txt = "" if pd.isna(val) else str(val)
-            cell.text = txt
 
-            # apply coloring to numeric performance columns
-            if df.columns[j] in ["CPI CTD", "CPI LSP", "SPI CTD", "SPI LSP", "BEI", "%COMP", "VAC"]:
-                if isinstance(val, (int, float)):
-                    color_cell(cell, val)
+            if isinstance(val, (float, np.floating)):
+                if "%COMP" in col.upper() or "% VAR" in col.upper():
+                    cell.text = "" if np.isnan(val) else f"{val:.1%}"
+                else:
+                    cell.text = "" if np.isnan(val) else f"{val:,.1f}"
+            else:
+                cell.text = "" if pd.isna(val) else str(val)
 
-    return slide
+            para = cell.text_frame.paragraphs[0]
+            para.font.size = Pt(11)
+
+    # VAC color coding (Labor table)
+    if vac_color and "VAC" in df.columns and "BAC" in df.columns:
+        vac_idx = list(df.columns).index("VAC")
+        bac_idx = list(df.columns).index("BAC")
+        for i in range(rows):
+            vac_val = df.iloc[i, vac_idx]
+            bac_val = df.iloc[i, bac_idx]
+            rgb = vac_rgb(vac_val, bac_val)
+            if rgb is not None:
+                cell = table.cell(i + 1, vac_idx)
+                cell.fill.solid()
+                cell.fill.fore_color.rgb = rgb
+                # Make text stand out
+                cell.text_frame.paragraphs[0].font.color.rgb = RGBColor(0, 0, 0)
 
 
 # ============================================================
-# RUN PIPELINE
+# MAIN LOOP – build outputs for each program
 # ============================================================
 
-openplan = load_openplan(os.path.join(DATA_DIR, OPENPLAN_FILE))
-bei_tbl = compute_bei(openplan)
+openplan_raw = pd.read_excel(OPENPLAN_PATH)
 
-prs = Presentation()
+for program, path in cobra_files.items():
+    print(f"Processing {program} …")
 
-for program, file in PROGRAM_FILES.items():
+    # --- Load & normalize Cobra ---
+    cobra_df = pd.read_excel(path)
+    cobra_df = normalize_columns(cobra_df)
 
-    cobra = load_cobra_auto(os.path.join(DATA_DIR, file))
-    ev_ctd, ev_lsp = compute_ev(cobra)
-    ev = merge_ev(ev_ctd, ev_lsp, bei_tbl)
+    # Ensure required columns exist
+    required_cols = {"DATE", "COSTSET", "HOURS"}
+    missing_cols = required_cols - set(cobra_df.columns)
+    if missing_cols:
+        raise ValueError(f"{program}: Cobra file missing columns {missing_cols}")
 
-    # COST PERFORMANCE TABLE
-    cost_tbl = ev[["SUB_TEAM", "CPI_LSP", "CPI_CTD"]].copy()
-    cost_tbl["Comments"] = ""
+    cobra_df["DATE"] = pd.to_datetime(cobra_df["DATE"])
 
-    # SCHEDULE PERFORMANCE TABLE
-    sched_tbl = ev[["SUB_TEAM", "SPI_LSP", "SPI_CTD", "BEI"]].copy()
-    sched_tbl["Comments"] = ""
+    # --- EV metrics & status date ---
+    evdf = compute_ev_metrics(cobra_df)
+    status_date = evdf["DATE"].max()
 
-    # LABOR HOURS TABLE
-    labor_tbl = ev[["SUB_TEAM", "%COMP_CTD", "BAC", "EAC", "VAC"]].copy()
-    labor_tbl.rename(columns={"%COMP_CTD": "%COMP"}, inplace=True)
-    labor_tbl["Comments"] = ""
+    # --- BEI (CTD & LSD) from OpenPlan ---
+    bei_ctd, bei_lsd = compute_bei_from_openplan(
+        openplan_raw, status_date=status_date, program_name=program
+    )
 
-    # MANPOWER TABLE
-    manpower_tbl = compute_manpower(cobra)
+    # --- Tables ---
+    labor_tbl   = build_labor_hours_table(cobra_df)
+    cost_tbl, sched_tbl = build_cost_and_schedule_tables(evdf, bei_ctd, bei_lsd)
+    manpower_tbl = build_manpower_table(cobra_df)
 
-    # EV SUMMARY TABLE
-    summary_tbl = pd.DataFrame({
-        "Metric": ["SPI", "CPI", "BEI", "%COMP"],
-        "CTD": [
-            ev["SPI_CTD"].mean(),
-            ev["CPI_CTD"].mean(),
-            ev["BEI"].mean(),
-            ev["%COMP_CTD"].mean()
-        ],
-        "LSP": [
-            ev["SPI_LSP"].mean(),
-            ev["CPI_LSP"].mean(),
-            ev["BEI"].mean(),
-            ev["%COMP_LSP"].mean()
-        ],
-        "Comments": ""
-    })
+    # --- EVMS Plot ---
+    fig = create_evms_plot(program, evdf)
+    png_path  = os.path.join(OUTPUT_DIR, f"{program}_EVMS.png")
+    html_path = os.path.join(OUTPUT_DIR, f"{program}_EVMS.html")
+    fig.write_image(png_path, scale=3)
+    fig.write_html(html_path)
 
-    # ADD SLIDES
-    add_table_slide(prs, f"{program} – EV Summary", summary_tbl)
-    add_table_slide(prs, f"{program} – Cost Performance", cost_tbl)
-    add_table_slide(prs, f"{program} – Schedule Performance", sched_tbl)
-    add_table_slide(prs, f"{program} – Labor Hours Performance", labor_tbl)
-    add_table_slide(prs, f"{program} – Demand Table", manpower_tbl)
+    # --- PowerPoint Deck ---
+    if os.path.exists(THEME_PATH):
+        prs = Presentation(THEME_PATH)
+    else:
+        prs = Presentation()
 
-prs.save(OUTPUT)
+    # Try to use blank layout; fall back if not available
+    try:
+        blank_layout = prs.slide_layouts[6]
+    except IndexError:
+        blank_layout = prs.slide_layouts[1]
 
-print("\nEVMS DASHBOARD COMPLETE →", OUTPUT)
+    # Slide 1 – EVMS Plot
+    slide1 = prs.slides.add_slide(blank_layout)
+    add_title_box(slide1, f"{program} – EVMS Trend")
+    slide1.shapes.add_picture(png_path,
+                              Inches(0.5), Inches(1.1),
+                              width=Inches(9.0))
+
+    # Slide 2 – Labor Hours Performance
+    slide2 = prs.slides.add_slide(blank_layout)
+    add_title_box(slide2, f"{program} – Labor Hours Performance")
+    add_df_table(slide2, labor_tbl, top_in=1.1, vac_color=True)
+
+    # Slide 3 – Cost Performance
+    slide3 = prs.slides.add_slide(blank_layout)
+    add_title_box(slide3, f"{program} – Cost Performance (CPI)")
+    add_df_table(slide3, cost_tbl, top_in=1.1)
+
+    # Slide 4 – Schedule Performance (SPI + BEI)
+    slide4 = prs.slides.add_slide(blank_layout)
+    add_title_box(slide4, f"{program} – Schedule Performance (SPI & BEI)")
+    add_df_table(slide4, sched_tbl, top_in=1.1)
+
+    # Slide 5 – Program Manpower
+    slide5 = prs.slides.add_slide(blank_layout)
+    add_title_box(slide5, f"{program} – Program Manpower")
+    add_df_table(slide5, manpower_tbl, top_in=1.1)
+
+    # Save PPTX
+    pptx_path = os.path.join(OUTPUT_DIR, f"{program}_EVMS_Deck.pptx")
+    prs.save(pptx_path)
+
+    print(f"✓ Completed EVMS outputs for {program}")
+    print(f"   PNG:  {png_path}")
+    print(f"   HTML: {html_path}")
+    print(f"   PPTX: {pptx_path}")
+
+print("ALL PROGRAM EVMS COMPLETE ✓")
+print("\nNOTE: Please validate assumptions for BAC/EAC/VAC, FTE hours, and BEI logic with the team on Monday.")
