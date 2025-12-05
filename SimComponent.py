@@ -1,5 +1,8 @@
 # ============================================================
-# EVMS Deck per Program – Trend + Detail Tables (2 slides)
+# EVMS Deck per Program – 3 Slides
+#   1) EVMS Trend Overview
+#   2) EVMS Detail – Sub Team Labor & Manpower
+#   3) EVMS Detail – Sub Team CPI/SPI/BEI Metrics
 # ============================================================
 
 import os
@@ -474,7 +477,7 @@ def get_blank_layout(prs: Presentation):
     for layout in prs.slide_layouts:
         if "blank" in layout.name.lower():
             return layout
-    return prs.slide_layouts[0]
+    return prs.slides[0].slide_layout
 
 def add_title(slide, text, left=0.5, top=0.3):
     box = slide.shapes.add_textbox(Inches(left), Inches(top),
@@ -490,7 +493,7 @@ def add_simple_table(slide, df: pd.DataFrame,
     """
     Create a table for a DataFrame; return (pptx table object, height_inches).
     CPI/SPI/BEI metrics and CTD/LSD columns shown with 2 decimals.
-    Percents (%COMP, % Var) shown with 2 decimal places as well.
+    Percents (%COMP, % Var) shown with 2 decimal places.
     """
     rows, cols = df.shape
     base_h = 0.45
@@ -522,13 +525,13 @@ def add_simple_table(slide, df: pd.DataFrame,
             cell = table.cell(i + 1, j)
 
             if isinstance(val, (float, np.floating)):
-                if "%COMP" in col.upper() or "% VAR" in col.upper() or col.upper().endswith("VAR"):
+                ucol = col.upper()
+                if "%COMP" in ucol or "VAR" in ucol:
                     # percentages (ratio 0–1)
                     cell.text = "" if pd.isna(val) else f"{val*100:.2f}%"
                 elif col in metric_cols:
                     cell.text = "" if pd.isna(val) else f"{val:.2f}"
                 else:
-                    # generic numeric (hours/FTE etc.)
                     cell.text = "" if pd.isna(val) else f"{val:,.1f}"
             else:
                 cell.text = "" if pd.isna(val) else str(val)
@@ -566,7 +569,7 @@ def add_threshold_legend(slide, left_in=6.2, top_in=3.7, width_in=3.5, height_in
     lines = [
         "• CPI / SPI / BEI: Blue ≥ 1.05; Green 0.98–1.05; Yellow 0.95–0.98; Red < 0.95.",
         "• VAC/BAC: Blue ≥ +5%; Green +5% to −2%; Yellow −2% to −5%; Red < −5%.",
-        "• Manpower % Var (Actual/Demand): Green 90–105%; Yellow 85–90% or 105–110%; Red <85% or ≥110%.",
+        "• Manpower % Var: Green 90–105%; Yellow 85–90% or 105–110%; Red <85% or ≥110%.",
     ]
     for text in lines:
         p = tf.add_paragraph()
@@ -657,10 +660,10 @@ for program, path in cobra_files.items():
     add_rcca_box(slide1)
 
     # ---------------------------------------------------
-    # Slide 2 – Labor + Sub-Team Metrics + Manpower
+    # Slide 2 – Sub Team Labor & Program Manpower
     # ---------------------------------------------------
     slide2 = prs.slides.add_slide(blank_layout)
-    add_title(slide2, f"{program} EVMS Detail – Sub Team Performance")
+    add_title(slide2, f"{program} EVMS Detail – Sub Team Labor & Manpower")
 
     # Labor Hours Performance table
     top = 0.9
@@ -683,29 +686,18 @@ for program, path in cobra_files.items():
             cell.fill.solid()
             cell.fill.fore_color.rgb = rgb
 
-    # Sub-team EVMS metric table directly below labor table
-    top_metrics = top + labor_h + 0.1
-    metrics_tbl, metrics_h = add_simple_table(
-        slide2, metrics_sub,
-        left_in=0.5, top_in=top_metrics,
-        width_in=9.0
+    # Program Manpower table under labor table
+    top_mp = top + labor_h + 0.2
+    mp_label = slide2.shapes.add_textbox(
+        Inches(0.5), Inches(top_mp - 0.3),
+        Inches(3.0), Inches(0.3)
     )
+    mp_tf = mp_label.text_frame
+    mp_tf.text = "Program Manpower (FTE)"
+    mp_p = mp_tf.paragraphs[0]
+    mp_p.font.bold = True
+    mp_p.font.size = Pt(12)
 
-    # Color CPI/SPI/BEI cells
-    cols_m = list(metrics_sub.columns)
-    metric_cols = ["CPI CTD","CPI LSD","SPI CTD","SPI LSD","BEI CTD","BEI LSD"]
-    metric_indices = {c: cols_m.index(c) for c in metric_cols}
-    for i in range(len(metrics_sub)):
-        for name, j in metric_indices.items():
-            val = metrics_sub.iloc[i][name]
-            rgb = spi_cpi_color(val)
-            if rgb is not None:
-                cell = metrics_tbl.cell(i+1, j)
-                cell.fill.solid()
-                cell.fill.fore_color.rgb = rgb
-
-    # Program Manpower table below metrics
-    top_mp = top_metrics + metrics_h + 0.1
     mp_tbl, mp_h = add_simple_table(
         slide2, manpower_df,
         left_in=0.5, top_in=top_mp,
@@ -723,11 +715,43 @@ for program, path in cobra_files.items():
                 cell.fill.solid()
                 cell.fill.fore_color.rgb = rgb
 
-    # Comments box at bottom
-    bottom_top = top_mp + mp_h + 0.1
+    # Comments box at bottom of slide 2
+    bottom_top2 = top_mp + mp_h + 0.2
     add_rcca_box(slide2,
                  label="Comments / Root Cause & Corrective Actions",
-                 left_in=0.5, top_in=bottom_top, width_in=9.0, height_in=1.0)
+                 left_in=0.5, top_in=bottom_top2, width_in=9.0, height_in=1.0)
+
+    # ---------------------------------------------------
+    # Slide 3 – Sub Team CPI/SPI/BEI Metrics
+    # ---------------------------------------------------
+    slide3 = prs.slides.add_slide(blank_layout)
+    add_title(slide3, f"{program} EVMS Detail – Sub Team CPI / SPI / BEI Metrics")
+
+    top3 = 0.9
+    metrics_tbl, metrics_h = add_simple_table(
+        slide3, metrics_sub,
+        left_in=0.5, top_in=top3,
+        width_in=9.0
+    )
+
+    # Color CPI/SPI/BEI cells
+    cols_m = list(metrics_sub.columns)
+    metric_cols = ["CPI CTD","CPI LSD","SPI CTD","SPI LSD","BEI CTD","BEI LSD"]
+    metric_indices = {c: cols_m.index(c) for c in metric_cols}
+    for i in range(len(metrics_sub)):
+        for name, j in metric_indices.items():
+            val = metrics_sub.iloc[i][name]
+            rgb = spi_cpi_color(val)
+            if rgb is not None:
+                cell = metrics_tbl.cell(i+1, j)
+                cell.fill.solid()
+                cell.fill.fore_color.rgb = rgb
+
+    # Comments box on slide 3
+    bottom_top3 = top3 + metrics_h + 0.2
+    add_rcca_box(slide3,
+                 label="Comments / Root Cause & Corrective Actions",
+                 left_in=0.5, top_in=bottom_top3, width_in=9.0, height_in=1.0)
 
     # Save deck
     out_pptx = os.path.join(OUTPUT_DIR, f"{program}_EVMS_Deck.pptx")
