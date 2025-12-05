@@ -1,8 +1,9 @@
 # ============================================================
-# EVMS Deck per Program – 3 Slides
+# EVMS Deck per Program – 3 Slides + Excel per Program
 #   1) EVMS Trend Overview
 #   2) EVMS Detail – Sub Team Labor & Manpower
 #   3) EVMS Detail – Sub Team CPI/SPI Metrics
+#   + Excel file with all tables per program
 # ============================================================
 
 import os
@@ -44,14 +45,6 @@ ACCOUNTING_CLOSINGS = {
     (2025,12): 31,
 }
 
-HOURS_PER_FTE = 173.33  # approx 9/80 schedule monthly hours
-
-# Threshold colors from dashboard key
-COLOR_BLUE_LIGHT = RGBColor(142, 180, 227)
-COLOR_GREEN      = RGBColor( 51, 153, 102)
-COLOR_YELLOW     = RGBColor(255, 255, 153)
-COLOR_RED        = RGBColor(192,  80,  77)
-
 # ============================================================
 # SHARED HELPERS
 # ============================================================
@@ -86,13 +79,13 @@ def spi_cpi_color(x: float):
     if pd.isna(x):
         return None
     if x >= 1.05:
-        return COLOR_BLUE_LIGHT
+        return RGBColor(142, 180, 227)  # light blue
     elif x >= 0.98:
-        return COLOR_GREEN
+        return RGBColor( 51, 153, 102)  # green
     elif x >= 0.95:
-        return COLOR_YELLOW
+        return RGBColor(255, 255, 153)  # yellow
     else:
-        return COLOR_RED
+        return RGBColor(192,  80,  77)  # red
 
 def vac_color_from_ratio(r: float):
     """VAC/BAC thresholds."""
@@ -100,13 +93,13 @@ def vac_color_from_ratio(r: float):
         return None
     # ≥ +5% blue; +5%..−2% green; −2%..−5% yellow; < −5% red
     if r >= 0.05:
-        return COLOR_BLUE_LIGHT
+        return RGBColor(142, 180, 227)
     elif r >= -0.02:
-        return COLOR_GREEN
+        return RGBColor( 51, 153, 102)
     elif r >= -0.05:
-        return COLOR_YELLOW
+        return RGBColor(255, 255, 153)
     else:
-        return COLOR_RED
+        return RGBColor(192,  80,  77)
 
 def manpower_var_color(r: float):
     """Program manpower %Var thresholds based on Actual/Demand ratio."""
@@ -114,15 +107,15 @@ def manpower_var_color(r: float):
         return None
     # ≥110% red; 110–105 yellow; 105–90 green; 90–85 yellow; <85 red
     if r >= 1.10:
-        return COLOR_RED
+        return RGBColor(192,  80,  77)
     elif r >= 1.05:
-        return COLOR_YELLOW
+        return RGBColor(255, 255, 153)
     elif r >= 0.90:
-        return COLOR_GREEN
+        return RGBColor( 51, 153, 102)
     elif r >= 0.85:
-        return COLOR_YELLOW
+        return RGBColor(255, 255, 153)
     else:
-        return COLOR_RED
+        return RGBColor(192,  80,  77)
 
 def get_status_dates(dates: pd.Series):
     """Status dates from accounting calendar; fallback to last two EV dates."""
@@ -152,6 +145,15 @@ def get_row_on_or_before(evdf: pd.DataFrame, date: datetime):
     if sub.empty:
         return evdf.iloc[0]
     return sub.iloc[-1]
+
+def truncate_for_slide(df: pd.DataFrame, max_rows: int = 12) -> pd.DataFrame:
+    """
+    Truncate a long table for slide display while keeping full table for Excel.
+    Sorts by first column and keeps top N rows.
+    """
+    if len(df) <= max_rows:
+        return df
+    return df.sort_values(df.columns[0]).head(max_rows)
 
 # ============================================================
 # EVMS FROM COBRA
@@ -199,7 +201,7 @@ def compute_ev_timeseries(df: pd.DataFrame) -> pd.DataFrame:
     })
 
 # ============================================================
-# BEI FROM OPENPLAN PENSKE (program-level only)
+# BEI FROM OPENPLAN PENSKE (program-level only for slide 1)
 # ============================================================
 
 PENSKE = pd.read_excel(PENSKE_PATH)
@@ -336,9 +338,9 @@ def build_manpower_table(cobra: pd.DataFrame,
                          curr_date: datetime,
                          prev_date: datetime) -> pd.DataFrame:
     """
-    Program Manpower (FTE) – CTD based:
-      Demand FTE (CTD), Actual FTE (CTD), % Var,
-      Next Mo BCWS FTE, Next Mo ETC FTE
+    Program Manpower (Hours) – CTD based:
+      Demand Hours (CTD), Actual Hours (CTD), % Var,
+      Next Mo BCWS Hours, Next Mo ETC Hours
     """
     df = cobra.copy()
     df["DATE"] = pd.to_datetime(df["DATE"])
@@ -351,43 +353,43 @@ def build_manpower_table(cobra: pd.DataFrame,
     ).fillna(0)
 
     if pivot.empty:
-        return pd.DataFrame(columns=["Demand", "Actual", "% Var",
-                                     "Next Mo BCWS", "Next Mo ETC"])
+        return pd.DataFrame(columns=["Demand Hours", "Actual Hours", "% Var",
+                                     "Next Mo BCWS Hours", "Next Mo ETC Hours"])
 
     bcws_col, _, acwp_col, etc_col = map_cost_sets(pivot.columns)
     if bcws_col is None or acwp_col is None:
-        return pd.DataFrame(columns=["Demand", "Actual", "% Var",
-                                     "Next Mo BCWS", "Next Mo ETC"])
+        return pd.DataFrame(columns=["Demand Hours", "Actual Hours", "% Var",
+                                     "Next Mo BCWS Hours", "Next Mo ETC Hours"])
 
     demand_hrs = pivot[bcws_col]
     actual_hrs = pivot[acwp_col]
     etc_hrs    = pivot[etc_col] if (etc_col is not None and etc_col in pivot.columns) else pd.Series(0, index=pivot.index)
 
-    # CTD FTE at status month
-    cum_demand_fte = demand_hrs.cumsum() / HOURS_PER_FTE
-    cum_actual_fte = actual_hrs.cumsum() / HOURS_PER_FTE
+    # CTD Hours at status month
+    cum_demand_hrs = demand_hrs.cumsum()
+    cum_actual_hrs = actual_hrs.cumsum()
 
     status_period = pd.Period(curr_date, freq="M")
     next_period   = status_period + 1
 
-    demand = cum_demand_fte.get(status_period, np.nan)
-    actual = cum_actual_fte.get(status_period, np.nan)
+    demand = cum_demand_hrs.get(status_period, np.nan)
+    actual = cum_actual_hrs.get(status_period, np.nan)
 
     if demand is not None and not pd.isna(demand) and demand != 0:
         pct_var = actual / demand
     else:
         pct_var = np.nan
 
-    # Next month (non-CTD) BCWS & ETC in FTE
-    next_bcws_fte = (demand_hrs / HOURS_PER_FTE).get(next_period, np.nan)
-    next_etc_fte  = (etc_hrs    / HOURS_PER_FTE).get(next_period, np.nan)
+    # Next month (non-CTD) BCWS & ETC in Hours
+    next_bcws = demand_hrs.get(next_period, np.nan)
+    next_etc  = etc_hrs.get(next_period, np.nan)
 
     manpower_df = pd.DataFrame({
-        "Demand": [demand],
-        "Actual": [actual],
+        "Demand Hours": [demand],
+        "Actual Hours": [actual],
         "% Var": [pct_var],
-        "Next Mo BCWS": [next_bcws_fte],
-        "Next Mo ETC": [next_etc_fte],
+        "Next Mo BCWS Hours": [next_bcws],
+        "Next Mo ETC Hours": [next_etc],
     })
     return manpower_df
 
@@ -540,7 +542,7 @@ def add_threshold_legend(slide, left_in=6.2, top_in=3.7, width_in=3.5, height_in
         p.font.size = Pt(8)
 
 # ============================================================
-# MAIN LOOP – Build decks
+# MAIN LOOP – Build decks + Excel per program
 # ============================================================
 
 for program, path in cobra_files.items():
@@ -583,10 +585,23 @@ for program, path in cobra_files.items():
     img_path = os.path.join(OUTPUT_DIR, f"{program}_EVMS.png")
     fig.write_image(img_path, scale=3)
 
-    # Subteam tables & manpower
+    # Subteam tables & manpower (full versions for Excel)
     labor_df    = build_labor_table(cobra)
     metrics_sub = build_subteam_metric_table(cobra, curr_date, prev_date)
     manpower_df = build_manpower_table(cobra, curr_date, prev_date)
+
+    # Save Excel with all tables (full detail)
+    excel_path = os.path.join(OUTPUT_DIR, f"{program}_EVMS_Tables.xlsx")
+    with pd.ExcelWriter(excel_path, engine="xlsxwriter") as writer:
+        metrics_df.to_excel(writer, sheet_name="Program_EVMS_Metrics", index=False)
+        labor_df.to_excel(writer, sheet_name="SubTeam_Labor", index=False)
+        metrics_sub.to_excel(writer, sheet_name="SubTeam_CPI_SPI", index=False)
+        manpower_df.to_excel(writer, sheet_name="Program_Manpower", index=False)
+    print(f"  → Saved table workbook: {excel_path}")
+
+    # Truncated versions for slide readability
+    labor_for_slide   = truncate_for_slide(labor_df,   max_rows=12)
+    metrics_for_slide = truncate_for_slide(metrics_sub, max_rows=12)
 
     # --- PowerPoint deck per program ---
     prs = Presentation(THEME_PATH) if os.path.exists(THEME_PATH) else Presentation()
@@ -627,20 +642,20 @@ for program, path in cobra_files.items():
     slide2 = prs.slides.add_slide(blank_layout)
     add_title(slide2, f"{program} EVMS Detail – Sub Team Labor & Manpower")
 
-    # Labor Hours Performance table
+    # Labor Hours Performance table (truncated for slide)
     top = 0.9
     labor_tbl, labor_h = add_simple_table(
-        slide2, labor_df,
+        slide2, labor_for_slide,
         left_in=0.5, top_in=top,
         width_in=9.0
     )
 
-    # Color VAC cells by VAC/BAC
-    cols_labor = list(labor_df.columns)
+    # Color VAC cells by VAC/BAC (using truncated view)
+    cols_labor = list(labor_for_slide.columns)
     vac_idx = cols_labor.index("VAC")
-    for i in range(len(labor_df)):
-        vac = labor_df.iloc[i]["VAC"]
-        bac = labor_df.iloc[i]["BAC"]
+    for i in range(len(labor_for_slide)):
+        vac = labor_for_slide.iloc[i]["VAC"]
+        bac = labor_for_slide.iloc[i]["BAC"]
         ratio = vac / bac if (not pd.isna(bac) and bac != 0) else np.nan
         rgb = vac_color_from_ratio(ratio)
         if rgb is not None:
@@ -648,14 +663,14 @@ for program, path in cobra_files.items():
             cell.fill.solid()
             cell.fill.fore_color.rgb = rgb
 
-    # Program Manpower table under labor table (for every program)
+    # Program Manpower table under labor table (hours, not FTE)
     top_mp = top + labor_h + 0.2
     mp_label = slide2.shapes.add_textbox(
         Inches(0.5), Inches(top_mp - 0.3),
-        Inches(3.0), Inches(0.3)
+        Inches(4.0), Inches(0.3)
     )
     mp_tf = mp_label.text_frame
-    mp_tf.text = "Program Manpower (FTE)"
+    mp_tf.text = "Program Manpower (Hours)"
     mp_p = mp_tf.paragraphs[0]
     mp_p.font.bold = True
     mp_p.font.size = Pt(12)
@@ -663,7 +678,7 @@ for program, path in cobra_files.items():
     mp_tbl, mp_h = add_simple_table(
         slide2, manpower_df,
         left_in=0.5, top_in=top_mp,
-        width_in=6.0
+        width_in=7.0
     )
 
     # Color manpower % Var
@@ -691,18 +706,18 @@ for program, path in cobra_files.items():
 
     top3 = 0.9
     metrics_tbl, metrics_h = add_simple_table(
-        slide3, metrics_sub,
+        slide3, metrics_for_slide,
         left_in=0.5, top_in=top3,
         width_in=9.0
     )
 
     # Color CPI/SPI cells
-    cols_m = list(metrics_sub.columns)
+    cols_m = list(metrics_for_slide.columns)
     metric_cols = ["CPI CTD","CPI LSD","SPI CTD","SPI LSD"]
     metric_indices = {c: cols_m.index(c) for c in metric_cols}
-    for i in range(len(metrics_sub)):
+    for i in range(len(metrics_for_slide)):
         for name, j in metric_indices.items():
-            val = metrics_sub.iloc[i][name]
+            val = metrics_for_slide.iloc[i][name]
             rgb = spi_cpi_color(val)
             if rgb is not None:
                 cell = metrics_tbl.cell(i+1, j)
